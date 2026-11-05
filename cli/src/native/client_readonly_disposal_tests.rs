@@ -532,6 +532,7 @@ async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
     let frame = semantic_bounds_frame(&peer);
     let frames = [frame.clone()];
     let proof = SemanticFrameProof::for_test(&frames, &[], "readonly-disposal", 1, &peer.operation);
+    let opaque = HashSet::new();
     let geometry = peer
         .journal
         .scope(GeometrySnapshot::capture_semantic(
@@ -543,6 +544,7 @@ async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
                 policy: &ObservationFramePolicy::default(),
                 identity_scope: "readonly-disposal",
                 revision: 1,
+                opaque_frames: &opaque,
             },
             &peer.operation,
         ))

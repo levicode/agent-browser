@@ -745,6 +745,10 @@ pub struct GeometrySnapshot {
     clips: HashMap<String, Vec<Polygon>>,
     pub viewport: Viewport,
     semantic_frames: Option<SemanticFrameProof>,
+    /// Every frame the producing inventory proved and deliberately omitted:
+    /// policy/budget/hidden traversal omissions plus opaque `<object>`/`<embed>`
+    /// plugin subtrees. A revalidation must accept the exact same omissions.
+    excluded: HashSet<String>,
 }
 #[derive(Debug, Clone)]
 struct FrameInput {
@@ -950,7 +954,10 @@ async fn read_proofs(
         }
     }
     for tree in trees.values() {
-        if tree.keys().any(|id| !frames.contains_key(id)) {
+        if tree
+            .keys()
+            .any(|id| !frames.contains_key(id) && !excluded.contains(id))
+        {
             return Err(GeometryError::IncompleteInventory);
         }
     }
@@ -1122,6 +1129,11 @@ pub(crate) struct SemanticCaptureContext<'a> {
     pub(crate) policy: &'a ObservationFramePolicy,
     pub(crate) identity_scope: &'a str,
     pub(crate) revision: u64,
+    /// `<object>`/`<embed>` plugin subtree roots the verified inventory proved
+    /// and deliberately omitted. They stay native frames but are opaque author
+    /// content: never projected, masked, or read. Geometry accepts these exact
+    /// omissions instead of reporting an incomplete inventory.
+    pub(crate) opaque_frames: &'a HashSet<String>,
 }
 impl GeometrySnapshot {
     pub async fn capture(
@@ -1130,7 +1142,27 @@ impl GeometrySnapshot {
         frames: &[ObservationFrame],
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
-        Self::capture_impl(client, page_session, frames, None, operation).await
+        Self::capture_impl(
+            client,
+            page_session,
+            frames,
+            None,
+            &HashSet::new(),
+            operation,
+        )
+        .await
+    }
+    /// Inventory-derived reads pass the proven opaque plugin omissions. They are
+    /// not missing inventory: the frame inventory already proved and excluded
+    /// each `<object>`/`<embed>` subtree.
+    pub(crate) async fn capture_excluding_opaque(
+        client: &CdpClient,
+        page_session: &str,
+        frames: &[ObservationFrame],
+        opaque_frames: &HashSet<String>,
+        operation: &OperationLease,
+    ) -> Result<Self, GeometryError> {
+        Self::capture_impl(client, page_session, frames, None, opaque_frames, operation).await
     }
     /// Semantic-only omission requires the producer proof of the frozen policy,
     /// emitted document order/budget, and genuine hidden-owner evidence.
@@ -1147,6 +1179,7 @@ impl GeometrySnapshot {
             policy,
             identity_scope,
             revision,
+            opaque_frames,
         } = context;
         proof
             .validate_context(frames, policy, identity_scope, revision, operation)
@@ -1155,19 +1188,30 @@ impl GeometrySnapshot {
             .revalidate(client, operation)
             .await
             .map_err(hidden_proof_error)?;
-        Self::capture_impl(client, page_session, frames, Some(proof.clone()), operation).await
+        Self::capture_impl(
+            client,
+            page_session,
+            frames,
+            Some(proof.clone()),
+            opaque_frames,
+            operation,
+        )
+        .await
     }
     async fn capture_impl(
         client: &CdpClient,
         page_session: &str,
         frames: &[ObservationFrame],
         semantic_frames: Option<SemanticFrameProof>,
+        opaque_frames: &HashSet<String>,
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
-        let empty = HashSet::new();
-        let excluded = semantic_frames
-            .as_ref()
-            .map_or(&empty, SemanticFrameProof::excluded_frames);
+        // Policy/budget/hidden omissions plus the inventory's proven opaque
+        // plugin subtrees. Both are known frames, never missing inventory.
+        let mut excluded: HashSet<String> = opaque_frames.clone();
+        if let Some(proof) = &semantic_frames {
+            excluded.extend(proof.excluded_frames().iter().cloned());
+        }
         let inputs = frames
             .iter()
             .map(|f| FrameInput {
@@ -1180,7 +1224,7 @@ impl GeometrySnapshot {
             client,
             page_session,
             &inputs,
-            excluded,
+            &excluded,
             semantic_frames.as_ref(),
             operation,
         )
@@ -1243,6 +1287,7 @@ impl GeometrySnapshot {
             clips,
             viewport,
             semantic_frames,
+            excluded,
         })
     }
     pub async fn revalidate(
@@ -1271,16 +1316,11 @@ impl GeometrySnapshot {
                 .await
                 .map_err(hidden_proof_error)?;
         }
-        let empty = HashSet::new();
-        let excluded = self
-            .semantic_frames
-            .as_ref()
-            .map_or(&empty, SemanticFrameProof::excluded_frames);
         let (frames, sessions) = read_proofs(
             client,
             &self.page_session,
             &inputs,
-            excluded,
+            &self.excluded,
             self.semantic_frames.as_ref(),
             operation,
         )
@@ -2107,6 +2147,7 @@ mod tests {
             clips: HashMap::new(),
             viewport: viewport(),
             semantic_frames: None,
+            excluded: HashSet::new(),
         };
         let root = proof
             .frame_to_root_point("leaf", Point { x: 5., y: 7. })
@@ -2561,6 +2602,111 @@ mod tests {
             sender,
         )
     }
+    /// levicode/agent-browser#28: three `<object>` plugin documents are opaque
+    /// author content the frame inventory proves and omits. Geometry must accept
+    /// exactly those proven omissions; a real iframe left out of the inventory
+    /// stays a stale/missing inventory refusal, so iframe semantics do not loosen.
+    #[tokio::test]
+    async fn opaque_plugin_subtrees_are_proven_omissions_not_missing_inventory() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        for include_real_iframe in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let requests = log.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    requests.lock().unwrap().push(request.clone());
+                    let mut children = vec![
+                        json!({"frame":{"id":"obj-1","loaderId":"obj-doc-1","url":"about:blank","parentId":"root"}}),
+                        json!({"frame":{"id":"obj-2","loaderId":"obj-doc-2","url":"about:blank","parentId":"root"}}),
+                        json!({"frame":{"id":"obj-3","loaderId":"obj-doc-3","url":"about:blank","parentId":"root"}}),
+                    ];
+                    if include_real_iframe {
+                        children.push(json!({"frame":{"id":"child","loaderId":"child-doc","url":"https://synthetic.invalid/child","parentId":"root"}}));
+                    }
+                    let result = match request["method"].as_str().unwrap() {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"root","loaderId":"doc","url":"https://synthetic.invalid/"},"childFrames":children}})
+                        }
+                        "Page.getLayoutMetrics" => {
+                            json!({"cssVisualViewport":{"clientWidth":100,"clientHeight":80,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":100,"clientHeight":80}})
+                        }
+                        _ => json!({}),
+                    };
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let (operation, _cancel) = mock_operation();
+            let main = mock_frame();
+            let opaque: HashSet<String> = ["obj-1", "obj-2", "obj-3"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if include_real_iframe {
+                // A real iframe absent from the inventory is not a known omission.
+                assert_eq!(
+                    GeometrySnapshot::capture_excluding_opaque(
+                        &client,
+                        "page",
+                        std::slice::from_ref(&main),
+                        &opaque,
+                        &operation
+                    )
+                    .await
+                    .unwrap_err(),
+                    GeometryError::IncompleteInventory
+                );
+            } else {
+                // Before the fix the plugin documents read as missing inventory.
+                assert_eq!(
+                    GeometrySnapshot::capture(
+                        &client,
+                        "page",
+                        std::slice::from_ref(&main),
+                        &operation
+                    )
+                    .await
+                    .unwrap_err(),
+                    GeometryError::IncompleteInventory
+                );
+                let geometry = GeometrySnapshot::capture_excluding_opaque(
+                    &client,
+                    "page",
+                    std::slice::from_ref(&main),
+                    &opaque,
+                    &operation,
+                )
+                .await
+                .unwrap();
+                // A revalidation must reuse the same proven omissions.
+                geometry.revalidate(&client, &operation).await.unwrap();
+                assert!(
+                    !log.lock().unwrap().iter().any(|request| {
+                        matches!(
+                            request["method"].as_str(),
+                            Some("DOM.getFrameOwner" | "DOM.getBoxModel" | "DOM.resolveNode")
+                        )
+                    }),
+                    "opaque plugin documents are never read, resolved or measured"
+                );
+            }
+            server.abort();
+        }
+    }
     #[tokio::test]
     async fn semantic_exclusion_preserves_full_native_ownership_without_spatial_reads() {
         use futures_util::{SinkExt, StreamExt};
@@ -2673,6 +2819,7 @@ mod tests {
                 1,
                 &operation,
             );
+            let opaque = HashSet::new();
             let semantic = GeometrySnapshot::capture_semantic(
                 &client,
                 "page",
@@ -2682,6 +2829,7 @@ mod tests {
                     policy: &ObservationFramePolicy::default(),
                     identity_scope: "fixture",
                     revision: 1,
+                    opaque_frames: &opaque,
                 },
                 &operation,
             )

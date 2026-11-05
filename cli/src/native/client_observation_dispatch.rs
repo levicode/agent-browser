@@ -1557,7 +1557,7 @@ impl ObservationDispatch {
         retirement_fence: u64,
         cleanup: &AtomicBool,
         screenshot: Option<&ScreenshotFailureWitness>,
-    ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    ) -> Result<VerifiedFrameInventory, ProtocolError> {
         let mut reacquired = false;
         loop {
             self.check_initial_trace_owner(context, operation, retirement_fence)?;
@@ -1574,7 +1574,7 @@ impl ObservationDispatch {
                     {
                         return Err(ProtocolError::ScopeUnavailable);
                     }
-                    return Ok(inventory.frames);
+                    return Ok(inventory);
                 }
                 Err(failure) => {
                     if !failure.revision_only() {
@@ -1608,7 +1608,7 @@ impl ObservationDispatch {
         retirement_fence: u64,
         cleanup: &AtomicBool,
         screenshot: Option<&ScreenshotFailureWitness>,
-    ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    ) -> Result<VerifiedFrameInventory, ProtocolError> {
         #[cfg(test)]
         let initial_probe = self
             .initial_inventory_probe_for_test
@@ -1656,7 +1656,7 @@ impl ObservationDispatch {
                 // The original successful-read contract permits accounted
                 // readonly disposal debt; it never requires a release ACK here.
                 Self::clear_observe_continuation(capture);
-                return Ok(inventory.frames);
+                return Ok(inventory);
             }
             Err(failure) => failure,
         };
@@ -1729,7 +1729,7 @@ impl ObservationDispatch {
         // NEW readonly debt belongs to the accepted second sample, not to the
         // discarded first prefix. Its exact custody remains normally retained.
         Self::clear_observe_continuation(capture);
-        Ok(inventory.frames)
+        Ok(inventory)
     }
     /// Enrich an independently sealed tree without giving its result deadline to
     /// raw-pixel settlement. This future stays inside the original retained run,
@@ -2560,7 +2560,7 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
         screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
-        let frames = if matches!(&request, DispatchRequest::TraceSemantic(_))
+        let inventory = if matches!(&request, DispatchRequest::TraceSemantic(_))
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else if matches!(&request, DispatchRequest::Observe(_)) {
@@ -2568,6 +2568,8 @@ impl ObservationDispatch {
         } else {
             query_frames(&context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::InitialFrames)).as_ref()).await
         }.map_err(failure)?;
+        let frames = inventory.frames;
+        let opaque_frames = inventory.opaque_frames;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
                 Some(request.secure_field_selector.clone())
@@ -2577,6 +2579,7 @@ impl ObservationDispatch {
         let mut capture_context = CaptureContext {
             page: context.page,
             frames,
+            opaque_frames,
             inventory_complete: true,
         };
         let is_observe = matches!(&request, DispatchRequest::Observe(_));
@@ -2614,7 +2617,7 @@ impl ObservationDispatch {
             let frozen = if is_observe {
                 verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
             } else {
-                query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::ProtectedFrames)).as_ref()).await?
+                query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::ProtectedFrames)).as_ref()).await?.frames
             };
             same_frames(&capture_context.frames, &frozen)?;
             // Semantic capture proves which exact documents were projected,
@@ -2623,7 +2626,7 @@ impl ObservationDispatch {
             screenshot_stage(screenshot, ScreenshotStage::Geometry);
             if !matches!(&request, DispatchRequest::TraceSemantic(_))
                 && !matches!(&request, DispatchRequest::Observe(_)) {
-                geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
+                geometry = Some(GeometrySnapshot::capture_excluding_opaque(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &capture_context.opaque_frames, &operation).await.map_err(map_geometry)?);
             }
             match request {
                 DispatchRequest::ReadFields(_) => Err(ProtocolError::InvalidArguments),
@@ -2637,7 +2640,7 @@ impl ObservationDispatch {
                     screenshot_stage(screenshot, ScreenshotStage::SemanticMetadata);
                     let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
-                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision }, &operation).await.map_err(map_geometry)?);
+                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision, opaque_frames: &capture_context.opaque_frames }, &operation).await.map_err(map_geometry)?);
                     let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
@@ -2710,7 +2713,7 @@ impl ObservationDispatch {
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
                                 screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
-                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision }, &operation).await.map_err(map_geometry)?);
+                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision, opaque_frames: &capture_context.opaque_frames }, &operation).await.map_err(map_geometry)?);
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
@@ -2894,7 +2897,7 @@ impl ObservationDispatch {
         } else if is_observe {
             verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
-            query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::FinalFrames)).as_ref()).await
+            query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::FinalFrames)).as_ref()).await.map(|inventory| inventory.frames)
         }
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
@@ -3532,6 +3535,10 @@ async fn verified_frames_with_diagnostic(
 pub(crate) struct VerifiedFrameInventory {
     pub frames: Vec<ObservationFrame>,
     pub iframe_sessions: HashMap<String, String>,
+    /// `<object>`/`<embed>` plugin subtree roots proven and omitted by this same
+    /// inventory. They are native frames, but opaque author content: never read,
+    /// projected, or masked, and never evidence of a missing frame.
+    pub opaque_frames: HashSet<String>,
 }
 pub(crate) async fn verified_frame_inventory(
     page: &BrowserExecutionLease,
@@ -3682,7 +3689,9 @@ pub(crate) async fn selected_query_frames_for_test(
     operation: &OperationLease,
     partition: &super::client_enrollment::PageAcquisitionProof,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
-    query_frames(page, operation, None, None, Some(partition)).await
+    query_frames(page, operation, None, None, Some(partition))
+        .await
+        .map(|inventory| inventory.frames)
 }
 fn fixture_query_acquisition(request: &DispatchRequest) -> bool {
     matches!(request, DispatchRequest::Query(query) if query.purpose == QueryPurpose::Fixture)
@@ -3882,7 +3891,7 @@ async fn query_frames(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
     partition: Option<&super::client_enrollment::PageAcquisitionProof>,
-) -> Result<Vec<ObservationFrame>, ProtocolError> {
+) -> Result<VerifiedFrameInventory, ProtocolError> {
     frame_inventory_attempt_impl(
         page,
         operation,
@@ -3894,7 +3903,6 @@ async fn query_frames(
         None,
     )
     .await
-    .map(|inventory| inventory.frames)
     .map_err(|error| error.record(screenshot))
 }
 // Keep the original full-inventory application readiness/session proof even
@@ -4210,6 +4218,10 @@ async fn frame_inventory_attempt_impl(
     Ok(VerifiedFrameInventory {
         frames,
         iframe_sessions: mapping,
+        opaque_frames: enumerated
+            .opaque_frame_roots
+            .into_iter()
+            .collect::<HashSet<_>>(),
     })
 }
 /// Page roots and renderer roots are different identities. Merge exact native

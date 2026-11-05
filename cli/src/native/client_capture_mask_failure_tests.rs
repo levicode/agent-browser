@@ -363,6 +363,7 @@ async fn typed_independent_failure(reply: ProbeReply, sequence: u64) {
     let context = CaptureContext {
         page,
         frames,
+        opaque_frames: HashSet::new(),
         inventory_complete: true,
     };
     let mut journal = ProtectedReadJournal::begin(&context.page, &op).unwrap();

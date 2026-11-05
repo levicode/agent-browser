@@ -56,6 +56,10 @@ pub struct CaptureRequest {
 pub struct CaptureContext {
     pub page: BrowserExecutionLease,
     pub frames: Vec<ObservationFrame>,
+    /// `<object>`/`<embed>` plugin subtree roots from the same verified
+    /// inventory. They are opaque author content: not projected, not masked,
+    /// and not evidence of a missing frame.
+    pub opaque_frames: HashSet<String>,
     pub inventory_complete: bool,
 }
 pub struct MaskedCapture {
@@ -216,10 +220,11 @@ async fn capture_transaction(
             .await
             .map_err(protected_reason)?;
         geometry = Some(
-            GeometrySnapshot::capture(
+            GeometrySnapshot::capture_excluding_opaque(
                 &context.page.client,
                 &context.page.page_session_id,
                 &context.frames,
+                &context.opaque_frames,
                 &operation,
             )
             .await
@@ -444,6 +449,12 @@ async fn install_source_masks(
                 .get(index)
                 .and_then(Value::as_str)
                 .ok_or(CaptureReason::IncompleteFrames)?;
+            // A plugin document is opaque author content: the verified frame
+            // inventory proved it and deliberately omitted it. It is never
+            // inspected, so it contributes no mask proof and no secure node.
+            if context.opaque_frames.contains(id) {
+                continue;
+            }
             let owned = context
                 .frames
                 .iter()
@@ -895,6 +906,12 @@ async fn masks(
                 .get(index)
                 .and_then(Value::as_str)
                 .ok_or(CaptureReason::IncompleteFrames)?;
+            // A plugin document is opaque author content: the verified frame
+            // inventory proved it and deliberately omitted it. It is never
+            // inspected, so it contributes no mask proof and no secure node.
+            if context.opaque_frames.contains(id) {
+                continue;
+            }
             let owned = context
                 .frames
                 .iter()
@@ -1423,7 +1440,7 @@ mod tests {
             page.targets.acknowledge_enrollment().map_err(|e|format!("Primitive fixture inventory: {e:?}"))?;
             let operation_journal = owned_capture_journal(&mut owner, &mut page, &operation);
             let client = page.client.clone();
-            let context=CaptureContext{page,frames,inventory_complete:true};
+            let context=CaptureContext{page,frames,opaque_frames:HashSet::new(),inventory_complete:true};
             let mut journal=operation_journal.scope(async { ProtectedReadJournal::begin(&context.page,&operation) }).await.map_err(|e|format!("Journal: {e:?}"))?;
             let masked:Result<(),String>=async {
                 operation_journal.scope(journal.stabilize_animations()).await.map_err(|e|format!("Stabilization: {e:?}"))?;
@@ -1563,7 +1580,7 @@ mod tests {
                 page.targets.acknowledge_enrollment().map_err(|_|"Static inventory acknowledgement failed")?;
                 let journal = owned_capture_journal(&mut owner, &mut page, &operation);
                 let client = page.client.clone();
-                let captured=journal.scope(async { start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Capture task failed")?.map_err(|error|format!("Static protected capture failed: {error:?}"))?;
+                let captured=journal.scope(async { start_capture(CaptureContext{page,frames,opaque_frames:HashSet::new(),inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Capture task failed")?.map_err(|error|format!("Static protected capture failed: {error:?}"))?;
                 let rate=client.send_command("Animation.getPlaybackRate",Some(json!({})),Some(&session)).await?;
                 if rate["playbackRate"].as_f64()!=Some(0.75){return Err("Animation playback was not restored".into());}
                 let controls=client.send_command("Runtime.evaluate",Some(json!({"expression":"window.__maskFixture.input.value==='synthetic-mask-only' && window.__maskFixture.input.getAttribute('style')===window.__maskFixture.style","returnByValue":true})),Some(&session)).await?;

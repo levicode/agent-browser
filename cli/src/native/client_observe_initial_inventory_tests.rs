@@ -44,6 +44,7 @@ async fn acquire(
             witness,
         ))
         .await
+        .map(|inventory| inventory.frames)
 }
 fn no_publication_or_semantics(fixture: &Fixture) {
     no_protected_read(&fixture.log.lock().unwrap());

@@ -334,7 +334,7 @@ async fn chromium_pseudo_capture_preserves_public_pixels_and_refuses_secure_gene
             let client=page.client.clone();
             mark(PseudoStage::Capture);
             let captured=journal.scope(async {
-                start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"[data-protected]".into()},operation).await
+                start_capture(CaptureContext{page,frames,opaque_frames:HashSet::new(),inventory_complete:true},CaptureRequest{secure_field_selector:"[data-protected]".into()},operation).await
             }).await.map_err(|error|PseudoFailure::Join{cancelled:error.is_cancelled(),panicked:error.is_panic()})?;
             if secure {
                 match captured {

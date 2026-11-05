@@ -119,7 +119,7 @@ async fn chromium_capture_retirement_races_publish_no_pixels_and_keep_typed_reas
             page.targets.acknowledge_enrollment().map_err(|_|"Fixture enrollment failed")?;
             let identity=page.identity_scope.clone();
             let journal = super::tests::owned_capture_journal(&mut owner, &mut page, &operation);
-            let outcome=journal.scope(async { start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Retained capture task failed")?;
+            let outcome=journal.scope(async { start_capture(CaptureContext{page,frames,opaque_frames:HashSet::new(),inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Retained capture task failed")?;
             let failure=match outcome{Err(error)=>error,Ok(_)=>panic!("Retired capture returned pixels")};
             assert!(hook.reached.load(Ordering::SeqCst),"Race must occur after actual screenshot, not preflight");
             assert_eq!(failure.reason,if matches!(mode,Mode::Deadline){CaptureReason::Deadline}else{CaptureReason::StaleScope});assert_eq!(failure.identity_scope,identity);Ok::<(),String>(())
