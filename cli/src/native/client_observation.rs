@@ -1458,6 +1458,8 @@ async fn read_backend(
         lease,
         bounded,
         &acquisition_policy,
+        None,
+        None,
     )
     .await?
     .into_iter()
@@ -2635,6 +2637,14 @@ pub async fn observe(
                     })
             })
             .collect();
+        // One observation-owned frame inventory supplies every metadata batch's
+        // pseudo classification. It is read lazily by the first batch that
+        // actually resolves a pseudo receiver, and every read pseudo is
+        // revalidated once after the final batch.
+        let pseudos = PseudoObservation {
+            origins: std::sync::Mutex::new(None),
+            deferred: std::sync::Mutex::new(Vec::new()),
+        };
         let mut nodes = HashMap::new();
         for chunk in candidates.chunks(64) {
             let batch = semantic_capture_stage!(
@@ -2651,6 +2661,7 @@ pub async fn observe(
                     lease,
                     true,
                     &security,
+                    &pseudos,
                 )
                 .await
             )?;
@@ -2666,6 +2677,19 @@ pub async fn observe(
                 nodes.insert(id, node);
             }
         }
+        // A single fresh inventory proves every pseudo read in this document
+        // after the final batch, instead of re-reading the same tree per batch.
+        let deferred = pseudos
+            .deferred
+            .lock()
+            .map_err(|_| ObservationError::BackendFailure)?
+            .clone();
+        semantic_capture_stage!(
+            witness,
+            Metadata,
+            frame_kind,
+            revalidate_deferred_pseudos(client, frame, &deferred, lease).await
+        )?;
         // Publish this proof only after revalidating the exact parent loader.
         // The key is the native owner backend ID, never a selector/name match.
         semantic_capture_stage!(
@@ -3872,7 +3896,7 @@ async fn evaluate_query_diagnostic_inner(
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security).await?);
+            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None).await?);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
     witness.stage(Stage::QueryWorld);
@@ -3917,7 +3941,7 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::MetadataConfirm);
             let mut confirmed = Vec::new();
             for chunk in ax_nodes.chunks(64) {
-                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security).await?);
+                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None).await?);
             }
             for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
             if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
@@ -4028,6 +4052,42 @@ fn verified_pseudo_origin(
     }
     Ok(origin.backend)
 }
+// One fresh frame inventory plus one describe per read pseudo. This proves the
+// exact pseudo/origin mapping for the complete observation after its final
+// metadata batch; it changes no identity, policy or refusal semantics.
+async fn revalidate_deferred_pseudos(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    deferred: &[(i64, i64)],
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    if deferred.is_empty() {
+        return Ok(());
+    }
+    let current = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
+    for (backend, origin) in deferred {
+        let fresh = current
+            .get(backend)
+            .ok_or(ObservationError::StaleReference)?;
+        let described = command(
+            client,
+            &frame.binding.session,
+            "DOM.describeNode",
+            json!({"backendNodeId":backend,"depth":0}),
+            lease,
+        )
+        .await?;
+        let node = &described["node"];
+        if node["backendNodeId"].as_i64() != Some(*backend)
+            || node["nodeType"] != 1
+            || node["pseudoType"].as_str() != Some(fresh.pseudo_type.as_str())
+            || fresh.backend != *origin
+        {
+            return Err(ObservationError::StaleReference);
+        }
+    }
+    Ok(())
+}
 fn readonly_pseudo_metadata(data: &Value, ax: &AXNode) -> Value {
     if data.get("__nativeStatus").is_some() {
         return data.clone();
@@ -4091,60 +4151,61 @@ fn metadata_receiver_focus(
 // This is untrusted page semantics only, never identity or security authority.
 // Omitting executionContextId selects the native node document's MAIN world:
 // Blink core/inspector/resolve_node.cc ResolveNode, ToScriptStateForMainWorld.
-const MAIN_ONCLICK_HINT: &str = "function() { return typeof this.onclick === 'function'; }";
-const EXACT_HINT_RECEIVER: &str = "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document; }";
+// Observing an inline receiver reads its author onclick hint. A batch applies
+// the same exact-receiver, side-effect-restricted reads to one candidate set in
+// one native call instead of seven renderer round trips per candidate.
+const MAIN_ONCLICK_HINT_BATCH: &str = "function(...nodes) { return nodes.map(function(node) { return typeof node.onclick === 'function'; }); }";
+const EXACT_HINT_RECEIVER_BATCH: &str = "function(...nodes) { const p=Node.prototype; const connected=Object.getOwnPropertyDescriptor(p,'isConnected').get; const owner=Object.getOwnPropertyDescriptor(p,'ownerDocument').get; return nodes.map(function(node) { try { return connected.call(node) === true && (node === document || owner.call(node) === document); } catch (_) { return false; } }); }";
 
-async fn hint_boolean(
+fn hint_batch_arguments(objects: &[String]) -> Value {
+    Value::Array(
+        objects
+            .iter()
+            .map(|object| json!({"objectId":object}))
+            .collect(),
+    )
+}
+
+async fn hint_booleans(
     client: &CdpClient,
     session: &str,
-    object: &str,
-    function: &str,
+    receivers: &[String],
+    function: &'static str,
     group: &str,
     lease: &OperationLease,
-) -> Result<bool, ObservationError> {
+) -> Result<Vec<bool>, ObservationError> {
+    let receiver = receivers.first().ok_or(ObservationError::BackendFailure)?;
     let reply = command(
         client,
         session,
         "Runtime.callFunctionOn",
         json!({
-            "objectId":object,"functionDeclaration":function,
-            "throwOnSideEffect":true,"returnByValue":true,"objectGroup":group
+            "objectId":receiver,
+            "functionDeclaration":function,
+            "arguments":hint_batch_arguments(receivers),
+            "throwOnSideEffect":true,
+            "returnByValue":true,
+            "objectGroup":group
         }),
         lease,
     )
     .await?;
-    let mut result = if reply.get("exceptionDetails").is_some()
-        || reply["result"]["type"] != "boolean"
+    if reply.get("exceptionDetails").is_some()
+        || reply["result"]["type"] != "object"
         || reply["result"].get("objectId").is_some()
     {
-        Err(ObservationError::BackendFailure)
-    } else {
-        reply["result"]["value"]
-            .as_bool()
-            .ok_or(ObservationError::BackendFailure)
-    };
-    // Unexpected object/exception handles need cleanup even on refused replies.
-    let mut handles = std::collections::HashSet::new();
-    for handle in [
-        reply["result"]["objectId"].as_str(),
-        reply["exceptionDetails"]["exception"]["objectId"].as_str(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if handle != object && handles.insert(handle) {
-            // Managed hint replies were acquired into this exact native group.
-            // Its outer owner releases all auxiliary handles even on refusal;
-            // do not queue a raw objectId release that could race a later read.
-            let grouped = client.debt_ledger().is_some()
-                && client_debt::OperationJournalHandle::current().is_some()
-                && native_owned_group(group, lease.sequence);
-            if !grouped {
-                result = settle_owner_object(client, session, handle, result).await;
-            }
-        }
+        return Err(ObservationError::BackendFailure);
     }
-    result
+    let values = reply["result"]["value"]
+        .as_array()
+        .ok_or(ObservationError::BackendFailure)?;
+    if values.len() != receivers.len() {
+        return Err(ObservationError::BackendFailure);
+    }
+    values
+        .iter()
+        .map(|value| value.as_bool().ok_or(ObservationError::BackendFailure))
+        .collect()
 }
 
 fn collect_hint_results<T>(
@@ -4180,79 +4241,136 @@ fn collect_hint_results<T>(
     }
 }
 
-async fn main_onclick_hint(
+async fn main_onclick_hints(
     client: &CdpClient,
     frame: &ObservationFrame,
-    backend: i64,
-    isolated_object: &str,
+    candidates: Vec<(usize, i64, String)>,
     lease: &OperationLease,
-) -> Result<bool, ObservationError> {
+) -> Result<Vec<(usize, bool)>, ObservationError> {
     // No group has been acquired yet: expired admissions need no cleanup.
     check(lease)?;
     let session = &frame.binding.session;
     let group = client
-        .readonly_group_instance(&format!("native-onclick-{}-{backend}", lease.sequence))
+        .readonly_group_instance(&format!("native-onclick-{}-batch", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
     let capture = client_debt::ReadonlyGroupCapture::new(&group);
     let result = capture
         .scope(async {
             validate_frame(client, frame, lease).await?;
-            if !hint_boolean(
+            let isolated = candidates
+                .iter()
+                .map(|(_, _, object)| object.clone())
+                .collect::<Vec<_>>();
+            if !hint_booleans(
                 client,
                 session,
-                isolated_object,
-                EXACT_HINT_RECEIVER,
+                &isolated,
+                EXACT_HINT_RECEIVER_BATCH,
                 &group,
                 lease,
             )
             .await?
+            .into_iter()
+            .all(|exact| exact)
             {
                 return Err(ObservationError::StaleReference);
             }
-            let resolved = command(
-                client,
-                session,
-                "DOM.resolveNode",
-                json!({"backendNodeId":backend,"objectGroup":group}),
-                lease,
-            )
-            .await?;
-            if resolved["object"]["type"] != "object" || resolved["object"]["subtype"] != "node" {
-                return Err(ObservationError::BackendFailure);
+            // Bounded batches keep the native command pool within its existing
+            // concurrency bound while draining every started read.
+            let mut resolved = Vec::with_capacity(candidates.len());
+            for chunk in candidates.chunks(16) {
+                let futures = chunk
+                    .iter()
+                    .map(|(_, backend, _)| {
+                        let backend = *backend;
+                        let group = group.clone();
+                        async move {
+                            let resolved = command(
+                                client,
+                                session,
+                                "DOM.resolveNode",
+                                json!({"backendNodeId":backend,"objectGroup":group}),
+                                lease,
+                            )
+                            .await?;
+                            if resolved["object"]["type"] != "object"
+                                || resolved["object"]["subtype"] != "node"
+                            {
+                                return Err(ObservationError::BackendFailure);
+                            }
+                            resolved["object"]["objectId"]
+                                .as_str()
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_owned)
+                                .ok_or(ObservationError::BackendFailure)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                resolved.extend(futures_util::future::join_all(futures).await);
             }
-            let object = resolved["object"]["objectId"]
-                .as_str()
-                .filter(|id| !id.is_empty())
-                .ok_or(ObservationError::BackendFailure)?;
-            let described = command(
-                client,
-                session,
-                "DOM.describeNode",
-                json!({"objectId":object,"depth":0}),
-                lease,
-            )
-            .await?;
-            if described["node"]["backendNodeId"].as_i64() != Some(backend)
-                || described["node"]["nodeType"] != 1
+            let objects = collect_hint_results(resolved)?;
+            let mut described = Vec::with_capacity(candidates.len());
+            for chunk in candidates
+                .iter()
+                .zip(&objects)
+                .collect::<Vec<_>>()
+                .chunks(16)
             {
-                return Err(ObservationError::StaleReference);
+                let futures = chunk
+                    .iter()
+                    .map(|((_, backend, _), object)| {
+                        let backend = *backend;
+                        let object = (*object).clone();
+                        async move {
+                            let described = command(
+                                client,
+                                session,
+                                "DOM.describeNode",
+                                json!({"objectId":object,"depth":0}),
+                                lease,
+                            )
+                            .await?;
+                            if described["node"]["backendNodeId"].as_i64() != Some(backend)
+                                || described["node"]["nodeType"] != 1
+                            {
+                                return Err(ObservationError::StaleReference);
+                            }
+                            Ok(())
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                described.extend(futures_util::future::join_all(futures).await);
             }
-            let hint =
-                hint_boolean(client, session, object, MAIN_ONCLICK_HINT, &group, lease).await?;
-            if !hint_boolean(
+            collect_hint_results(described)?;
+            let hints = hint_booleans(
                 client,
                 session,
-                isolated_object,
-                EXACT_HINT_RECEIVER,
+                &objects,
+                MAIN_ONCLICK_HINT_BATCH,
+                &group,
+                lease,
+            )
+            .await?;
+            if !hint_booleans(
+                client,
+                session,
+                &isolated,
+                EXACT_HINT_RECEIVER_BATCH,
                 &group,
                 lease,
             )
             .await?
+            .into_iter()
+            .all(|exact| exact)
             {
                 return Err(ObservationError::StaleReference);
             }
             validate_frame(client, frame, lease).await?;
-            Ok(hint)
+            Ok(candidates
+                .iter()
+                .map(|(index, _, _)| *index)
+                .zip(hints)
+                .collect())
         })
         .await;
     #[cfg(test)]
@@ -4263,6 +4381,15 @@ async fn main_onclick_hint(
     settle_captured_object_group(client, session, &group, result, lease, &capture).await
 }
 
+/// Observation-lifetime pseudo evidence. One frame inventory supplies every
+/// batch's receiver classification, and every read pseudo is revalidated once
+/// after the final batch rather than once per batch.
+struct PseudoObservation {
+    // Lazy: the frame inventory is read once, on the first batch that actually
+    // classified a pseudo receiver; a page without pseudos reads nothing extra.
+    origins: std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>,
+    deferred: std::sync::Mutex<Vec<(i64, i64)>>,
+}
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
 async fn read_batch(
     client: &CdpClient,
@@ -4274,6 +4401,7 @@ async fn read_batch(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
+    pseudos: &PseudoObservation,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
     read_batch_with_refs(
         client,
@@ -4285,6 +4413,8 @@ async fn read_batch(
         lease,
         bounded,
         acquisition_policy,
+        Some(&pseudos.origins),
+        Some(&pseudos.deferred),
     )
     .await
 }
@@ -4299,6 +4429,8 @@ async fn read_batch_with_refs(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
+    pseudo_inventory: Option<&std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>>,
+    deferred_pseudos: Option<&std::sync::Mutex<Vec<(i64, i64)>>>,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
     use futures_util::{stream, StreamExt};
     if nodes.is_empty() {
@@ -4333,7 +4465,11 @@ async fn read_batch_with_refs(
         let resolved=collect_hint_results(resolved)?;
         metadata_stage!(PseudoInventory);
         let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
-        let origins=if has_pseudo{pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?}else{HashMap::new()};
+        // The observation owns the frame inventory. It is acquired lazily on the
+        // first read pseudo so a page without pseudos reads nothing extra, and
+        // every later batch reuses it instead of re-reading the whole DOM.
+        let cached=if has_pseudo{pseudo_inventory.and_then(|inventory|inventory.lock().ok().and_then(|origins|origins.clone()))}else{None};
+        let origins=if has_pseudo{match cached{Some(origins)=>origins,None=>{let fresh=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;if let Some(inventory)=pseudo_inventory{*inventory.lock().map_err(|_|ObservationError::BackendFailure)?=Some(fresh.clone());}fresh}}}else{HashMap::new()};
         metadata_stage!(ReceiverIdentity);
         let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
         for (ax,value) in nodes.iter().zip(&resolved){
@@ -4381,23 +4517,50 @@ async fn read_batch_with_refs(
                 hint_candidates.push((index,backend,objects[index].clone()));
             }
         }
-        let hints: Vec<Result<(usize,bool),ObservationError>> = stream::iter(hint_candidates.into_iter()
-            .map(|(index,backend,object)| async move {
-                Ok::<_,ObservationError>((index,main_onclick_hint(client,frame,backend,&object,lease).await?))
-            })).buffered(16).collect().await;
-        // Drain every started helper before propagating failure: dropping an
-        // in-flight helper would skip its mandatory object-group cleanup.
-        let hints = collect_hint_results(hints)?;
+        // One native batch proves every hinted receiver, reads every main-world
+        // onclick hint and re-proves the receivers. A per-node sequence would
+        // pay seven renderer round trips for each hinted inline element.
+        let hints = if hint_candidates.is_empty() {
+            Vec::new()
+        } else {
+            main_onclick_hints(client, frame, hint_candidates, lease).await?
+        };
         for (index,hint) in hints { if hint { values[index]["author"]["action"]=json!(true); } }
         metadata_stage!(PseudoRevalidation);
-        let policy=if has_pseudo{Some(security_inventory(client,frame,options,lease).await?)}else{None};
+        // An observation-supplied inventory already proves this document's
+        // secure ancestry and labels; the per-batch inventory would re-read the
+        // same tree without adding receiver identity evidence.
+        let owned_policy;
+        let policy: Option<&SecurityInventory> = if has_pseudo {
+            match pseudo_inventory {
+                Some(_) => Some(acquisition_policy),
+                None => {
+                    owned_policy = Some(security_inventory(client,frame,options,lease).await?);
+                    owned_policy.as_ref()
+                }
+            }
+        } else {
+            None
+        };
         if has_pseudo {
-            let current=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;
-            for ((ax,remote),origin) in nodes.iter().zip(&resolved).zip(&pseudo) {
-                if let Some(origin)=origin {
-                    let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
-                    let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
-                    if verified_pseudo_origin(&remote["object"],&described,backend,&current)?!=*origin{return Err(ObservationError::StaleReference);}
+            if let Some(deferred) = deferred_pseudos {
+                // Revalidation joins every read pseudo after the final batch;
+                // one fresh inventory then proves the whole observation.
+                let mut deferred = deferred.lock().map_err(|_| ObservationError::BackendFailure)?;
+                for ((ax,_),origin) in nodes.iter().zip(&resolved).zip(&pseudo) {
+                    if let Some(origin)=origin {
+                        let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+                        deferred.push((backend,*origin));
+                    }
+                }
+            } else {
+                let current=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;
+                for ((ax,remote),origin) in nodes.iter().zip(&resolved).zip(&pseudo) {
+                    if let Some(origin)=origin {
+                        let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+                        let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
+                        if verified_pseudo_origin(&remote["object"],&described,backend,&current)?!=*origin{return Err(ObservationError::StaleReference);}
+                    }
                 }
             }
         }
@@ -4410,7 +4573,7 @@ async fn read_batch_with_refs(
                 Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded),
                 None=>project_node_with_refs(frame,ax.backend_d_o_m_node_id.unwrap(),ax,None,revision,&readonly,bounded),
             }?;
-            if let (Some(origin),Some(policy))=(origin,&policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
+            if let (Some(origin),Some(policy))=(origin,policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
             Ok(node)
         }).collect()
     }).await;
@@ -11131,100 +11294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn onclick_sibling_failure_drains_held_resolution_and_cleanup() {
-        use futures_util::{stream, SinkExt, StreamExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            let mut held = None;
-            let mut pending_failure = None;
-            let mut released = 0;
-            while let Some(Ok(message)) = socket.next().await {
-                let Ok(text) = message.to_text() else {
-                    continue;
-                };
-                let request: Value = serde_json::from_str(text).unwrap();
-                let result = match request["method"].as_str().unwrap() {
-                    "Page.getFrameTree" => {
-                        json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
-                    }
-                    "DOM.resolveNode" => {
-                        if request["params"]["backendNodeId"] == 43 {
-                            held = Some(request["id"].clone());
-                            if let Some(id) = pending_failure.take() {
-                                socket
-                                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                                        json!({"id":id,"result":{"exceptionDetails":{}}})
-                                            .to_string(),
-                                    ))
-                                    .await
-                                    .unwrap();
-                            }
-                            continue;
-                        }
-                        json!({"object":{"type":"object","subtype":"node","objectId":"main-42"}})
-                    }
-                    "DOM.describeNode" => {
-                        json!({"node":{"nodeType":1,"backendNodeId":if request["params"]["objectId"]=="main-42"{42}else{43}}})
-                    }
-                    "Runtime.callFunctionOn" => {
-                        if request["params"]["objectId"] == "main-42" {
-                            if held.is_none() {
-                                pending_failure = Some(request["id"].clone());
-                                continue;
-                            }
-                            json!({"exceptionDetails":{}})
-                        } else {
-                            json!({"result":{"type":"boolean","value":true}})
-                        }
-                    }
-                    "Runtime.releaseObjectGroup" => {
-                        released += 1;
-                        if released == 1 {
-                            let id = held.take().expect("sibling resolution must be in flight");
-                            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":id,"result":{"object":{"type":"object","subtype":"node","objectId":"main-43"}}}).to_string())).await.unwrap();
-                        }
-                        json!({})
-                    }
-                    method => panic!("unexpected sibling command {method}"),
-                };
-                socket
-                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                        json!({"id":request["id"],"result":result}).to_string(),
-                    ))
-                    .await
-                    .unwrap();
-                if released == 2 {
-                    break;
-                }
-            }
-            assert_eq!(released, 2);
-        });
-        let client = CdpClient::connect(&url).await.unwrap();
-        let (lease, _sender) = lease();
-        let frame = frame();
-        let results = stream::iter(
-            [42, 43]
-                .into_iter()
-                .map(|backend| main_onclick_hint(&client, &frame, backend, "isolated", &lease)),
-        )
-        .buffered(16)
-        .collect::<Vec<_>>()
-        .await;
-        assert_eq!(
-            collect_hint_results(results),
-            Err(ObservationError::BackendFailure)
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn main_onclick_hint_is_boolean_only_exact_and_always_cleans_up() {
+    async fn onclick_hint_batch_reads_exact_receivers_and_cleans_up_once() {
         use futures_util::{SinkExt, StreamExt};
         for mode in [
             "true",
@@ -11234,6 +11304,7 @@ mod tests {
             "unsupported",
             "receiver",
             "loader",
+            "receiver-after",
             "cleanup",
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11241,8 +11312,8 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let mut reads = 0;
-                let mut handles = Vec::new();
+                let mut receiver_reads = 0;
+                let mut hint_reads = 0;
                 while let Some(Ok(message)) = socket.next().await {
                     let Ok(text) = message.to_text() else {
                         continue;
@@ -11254,6 +11325,44 @@ mod tests {
                     let result = match method {
                         "Page.getFrameTree" => {
                             json!({"frameTree":{"frame":{"id":"main","loaderId":if mode=="loader"{"retired"}else{"doc"}}}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            assert_eq!(request["params"]["throwOnSideEffect"], true);
+                            assert_eq!(request["params"]["returnByValue"], true);
+                            let function =
+                                request["params"]["functionDeclaration"].as_str().unwrap();
+                            if function == EXACT_HINT_RECEIVER_BATCH {
+                                assert_eq!(request["params"]["objectId"], "isolated-node");
+                                assert_eq!(
+                                    request["params"]["arguments"],
+                                    json!([{"objectId":"isolated-node"}])
+                                );
+                                receiver_reads += 1;
+                                json!({"result":{"type":"object","value":[mode!="receiver-after"||receiver_reads==1]}})
+                            } else {
+                                assert_eq!(function, MAIN_ONCLICK_HINT_BATCH);
+                                assert_eq!(request["params"]["objectId"], "main-node");
+                                assert_eq!(
+                                    request["params"]["arguments"],
+                                    json!([{"objectId":"main-node"}])
+                                );
+                                hint_reads += 1;
+                                match mode {
+                                    "exception" => {
+                                        json!({"exceptionDetails":{"exception":{"objectId":"exception-handle"}}})
+                                    }
+                                    "shape" => {
+                                        json!({"result":{"type":"object","objectId":"result-handle","value":[true]}})
+                                    }
+                                    "unsupported" => {
+                                        error = true;
+                                        json!({})
+                                    }
+                                    _ => {
+                                        json!({"result":{"type":"object","value":[mode!="false"]}})
+                                    }
+                                }
+                            }
                         }
                         "DOM.resolveNode" => {
                             assert_eq!(request["params"]["backendNodeId"], 42);
@@ -11267,42 +11376,6 @@ mod tests {
                         "DOM.describeNode" => {
                             assert_eq!(request["params"]["objectId"], "main-node");
                             json!({"node":{"backendNodeId":if mode=="receiver"{43}else{42},"nodeType":1}})
-                        }
-                        "Runtime.callFunctionOn" => {
-                            assert_eq!(request["params"]["throwOnSideEffect"], true);
-                            assert_eq!(request["params"]["returnByValue"], true);
-                            if request["params"]["objectId"] == "isolated-node" {
-                                assert_eq!(
-                                    request["params"]["functionDeclaration"],
-                                    EXACT_HINT_RECEIVER
-                                );
-                                json!({"result":{"type":"boolean","value":true}})
-                            } else {
-                                reads += 1;
-                                assert_eq!(request["params"]["objectId"], "main-node");
-                                assert_eq!(
-                                    request["params"]["functionDeclaration"],
-                                    MAIN_ONCLICK_HINT
-                                );
-                                match mode {
-                                    "exception" => {
-                                        json!({"exceptionDetails":{"exception":{"objectId":"exception-handle"}}})
-                                    }
-                                    "shape" => {
-                                        json!({"result":{"type":"object","objectId":"result-handle","value":true}})
-                                    }
-                                    "unsupported" => {
-                                        error = true;
-                                        json!({})
-                                    }
-                                    _ => json!({"result":{"type":"boolean","value":mode!="false"}}),
-                                }
-                            }
-                        }
-                        "Runtime.releaseObject" => {
-                            handles
-                                .push(request["params"]["objectId"].as_str().unwrap().to_owned());
-                            json!({})
                         }
                         "Runtime.releaseObjectGroup" => {
                             error = mode == "cleanup";
@@ -11326,29 +11399,31 @@ mod tests {
                     }
                 }
                 assert_eq!(
-                    reads,
-                    if matches!(mode, "loader" | "receiver") {
-                        0
-                    } else {
-                        1
+                    receiver_reads,
+                    match mode {
+                        "loader" => 0,
+                        "receiver" | "unsupported" | "exception" | "shape" => 1,
+                        _ => 2,
                     }
                 );
                 assert_eq!(
-                    handles,
+                    hint_reads,
                     match mode {
-                        "exception" => vec!["exception-handle"],
-                        "shape" => vec!["result-handle"],
-                        _ => vec![],
+                        "loader" | "receiver" => 0,
+                        _ => 1,
                     }
                 );
             });
             let client = CdpClient::connect(&url).await.unwrap();
             let (lease, _sender) = lease();
-            let result = main_onclick_hint(&client, &frame(), 42, "isolated-node", &lease).await;
+            let candidates = vec![(0usize, 42i64, "isolated-node".to_owned())];
+            let result = main_onclick_hints(&client, &frame(), candidates, &lease).await;
             match mode {
-                "true" => assert_eq!(result, Ok(true)),
-                "false" => assert_eq!(result, Ok(false)),
-                "receiver" | "loader" => assert_eq!(result, Err(ObservationError::StaleReference)),
+                "true" => assert_eq!(result, Ok(vec![(0, true)])),
+                "false" => assert_eq!(result, Ok(vec![(0, false)])),
+                "receiver" | "loader" | "receiver-after" => {
+                    assert_eq!(result, Err(ObservationError::StaleReference))
+                }
                 "cleanup" => assert_eq!(
                     result,
                     Err(ObservationError::CleanupFailed { primary: None })
@@ -11357,6 +11432,86 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn onclick_hint_batch_drains_held_sibling_resolution_before_cleanup() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut released = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let result = match method {
+                    "Page.getFrameTree" => {
+                        json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        json!({"result":{"type":"object","value":[true,true]}})
+                    }
+                    "DOM.resolveNode" => {
+                        let backend = request["params"]["backendNodeId"].as_i64().unwrap();
+                        json!({"object":{"type":"object","subtype":"node","objectId":format!("main-{backend}")}})
+                    }
+                    "DOM.describeNode" => {
+                        if request["params"]["objectId"] == "main-43" {
+                            // The started sibling describe must still be awaited
+                            // before the native group cleanup can be submitted.
+                            let id = request["id"].clone();
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            socket
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    json!({"id":id,"result":{"node":{"nodeType":1,"backendNodeId":43}}})
+                                        .to_string(),
+                                ))
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                        json!({"node":{"nodeType":1,"backendNodeId":42}})
+                    }
+                    "Runtime.releaseObjectGroup" => {
+                        released += 1;
+                        json!({})
+                    }
+                    method => panic!("unexpected sibling command {method}"),
+                };
+                let response = if method == "DOM.describeNode" {
+                    json!({"id":request["id"],"error":{"code":-32602,"message":"refused"}})
+                } else {
+                    json!({"id":request["id"],"result":result})
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        response.to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if released == 1 {
+                    break;
+                }
+            }
+            assert_eq!(released, 1);
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let (lease, _sender) = lease();
+        let candidates = vec![
+            (0usize, 42i64, "isolated".to_owned()),
+            (1usize, 43i64, "isolated".to_owned()),
+        ];
+        let result = main_onclick_hints(&client, &frame(), candidates, &lease).await;
+        assert_eq!(result, Err(ObservationError::BackendFailure));
+        tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -11418,11 +11573,11 @@ mod tests {
         let mut refs = observed_refs();
         let one = ax("first", 42, &[]);
         let two = ax("second", 43, &[]);
-        let nodes = read_batch(
+        let nodes = read_batch_with_refs(
             &client,
             &frame(),
             &[&one, &two],
-            &mut refs,
+            Some(&mut refs),
             1,
             &ObservationOptions::default(),
             &lease,
@@ -11432,6 +11587,8 @@ mod tests {
                 focused_backend: Some(43),
                 ..Default::default()
             },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -12261,6 +12418,180 @@ mod tests {
         ));
     }
     #[tokio::test]
+    async fn observation_pseudo_inventory_reuses_one_frame_inventory_across_batches() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut documents = 0;
+            let mut frames = 0;
+            let mut batches = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.createIsolatedWorld" => json!({"executionContextId":17}),
+                    "Page.getFrameTree" => {
+                        frames += 1;
+                        json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
+                    }
+                    "DOM.getDocument" => {
+                        documents += 1;
+                        json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":2,"pseudoElements":[{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}]}]}})
+                    }
+                    "DOM.resolveNode" => {
+                        let backend = request["params"]["backendNodeId"].as_i64().unwrap();
+                        if backend == 3 {
+                            json!({"object":{"type":"object","className":"CSSPseudoElement","objectId":"pseudo-3"}})
+                        } else {
+                            json!({"object":{"type":"object","subtype":"node","objectId":format!("node-{backend}")}})
+                        }
+                    }
+                    "DOM.describeNode" => {
+                        json!({"node":{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}})
+                    }
+                    "Runtime.callFunctionOn" => json!({"result":{"value":[metadata()]}}),
+                    "Runtime.releaseObjectGroup" => {
+                        batches += 1;
+                        json!({})
+                    }
+                    method => panic!("unexpected pseudo inventory command {method}"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if batches == 3 {
+                    break;
+                }
+            }
+            assert_eq!(
+                documents, 1,
+                "the frame inventory must be read once, not once per pseudo batch"
+            );
+            assert_eq!(frames, 1, "the lazy inventory acquires one frame loader");
+            assert_eq!(batches, 3);
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let (lease, _sender) = lease();
+        let mut refs = observed_refs();
+        let pseudos = PseudoObservation {
+            origins: std::sync::Mutex::new(None),
+            deferred: std::sync::Mutex::new(Vec::new()),
+        };
+        let options = ObservationOptions::default();
+        let policy = SecurityInventory::default();
+        let first = ax("first", 42, &[]);
+        read_batch(
+            &client,
+            &frame(),
+            &[&first],
+            &mut refs,
+            1,
+            &options,
+            &lease,
+            true,
+            &policy,
+            &pseudos,
+        )
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let pseudo = ax("pseudo", 3, &[]);
+            read_batch(
+                &client,
+                &frame(),
+                &[&pseudo],
+                &mut refs,
+                1,
+                &options,
+                &lease,
+                true,
+                &policy,
+                &pseudos,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            pseudos.deferred.lock().unwrap().as_slice(),
+            &[(3, 2), (3, 2)],
+            "every read pseudo must be deferred to the observation-wide proof"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_pseudo_revalidation_reads_one_frame_inventory_and_refuses_change() {
+        use futures_util::{SinkExt, StreamExt};
+        for (mode, expected) in [
+            ("unchanged", Ok(())),
+            ("changed-origin", Err(ObservationError::StaleReference)),
+            ("wrong-type", Err(ObservationError::StaleReference)),
+            ("missing", Err(ObservationError::StaleReference)),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut documents = 0;
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
+                        }
+                        "DOM.getDocument" => {
+                            documents += 1;
+                            if mode == "missing" {
+                                json!({"root":{"nodeType":9,"backendNodeId":1,"children":[]}})
+                            } else {
+                                json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":if mode=="changed-origin"{4}else{2},"pseudoElements":[{"nodeType":1,"backendNodeId":3,"pseudoType":if mode=="wrong-type"{"before"}else{"marker"}}]}]}})
+                            }
+                        }
+                        "DOM.describeNode" => {
+                            json!({"node":{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}})
+                        }
+                        method => panic!("unexpected pseudo revalidation command {method}"),
+                    };
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    if (mode == "missing" && method == "DOM.getDocument")
+                        || (mode != "missing" && method == "DOM.describeNode")
+                    {
+                        break;
+                    }
+                }
+                assert_eq!(documents, 1, "one fresh frame inventory per observation");
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let (lease, _sender) = lease();
+            let result = revalidate_deferred_pseudos(&client, &frame(), &[(3, 2)], &lease).await;
+            assert_eq!(result, expected, "{mode}");
+            drop(client);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn pseudo_metadata_uses_verified_origin_without_rebinding_and_rejects_late_change() {
         use futures_util::{SinkExt, StreamExt};
         for mode in [
@@ -12339,16 +12670,18 @@ mod tests {
             let (op, _sender) = lease();
             let mut refs = observed_refs();
             let node = ax("marker", 3, &[]);
-            let result = read_batch(
+            let result = read_batch_with_refs(
                 &client,
                 &frame(),
                 &[&node],
-                &mut refs,
+                Some(&mut refs),
                 1,
                 &ObservationOptions::default(),
                 &op,
                 true,
                 &SecurityInventory::default(),
+                None,
+                None,
             )
             .await;
             if mode == "valid" || mode == "secure" {
