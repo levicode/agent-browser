@@ -1274,16 +1274,16 @@ impl ClientNetwork {
         params: &Value,
         sink: &ClientEventSink,
     ) -> Result<(), ProtocolError> {
-        let native_bytes = match self
+        // The source decides whether Chrome bytes stay on this host. Neither
+        // source stages the body in BlobStore, so no byte reservation is taken.
+        if self
             .download_source
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .as_ref()
+            .is_none()
         {
-            Some(DownloadSource::Local(_)) => true,
-            Some(DownloadSource::Provider(_)) => false,
-            None => return Err(ProtocolError::UnsupportedCapability),
-        };
+            return Err(ProtocolError::UnsupportedCapability);
+        }
         let guid = required_string(params, "guid")?;
         if !safe_basename(guid) {
             return Err(ProtocolError::InvalidArguments);
@@ -1300,17 +1300,6 @@ impl ClientNetwork {
         if downloads.len() >= 128 || downloads.contains_key(guid) {
             return Err(ProtocolError::CapacityExceeded);
         }
-        // Provider bytes never enter BlobStore: the caller reads them remotely.
-        // Entry and observed download-size limits still apply to both sources.
-        let reservation = if native_bytes {
-            Some(
-                self.blobs
-                    .reserve_producer(self.scope.clone())
-                    .map_err(producer_error)?,
-            )
-        } else {
-            None
-        };
         let (handle, resource) = self.new_resource()?;
         downloads.insert(
             guid.into(),
@@ -1320,7 +1309,6 @@ impl ClientNetwork {
                 completed: false,
                 terminal_started: false,
                 published,
-                reservation,
             },
         );
         if !published {
@@ -1331,10 +1319,20 @@ impl ClientNetwork {
     async fn download_finished(&self, params: Value) -> Result<(), ProtocolError> {
         let guid = required_string(&params, "guid")?;
         let state = required_string(&params, "state")?;
-        let oversized = params
-            .get("receivedBytes")
-            .and_then(Value::as_f64)
-            .is_some_and(|size| size > self.blobs.producer_limit() as f64);
+        let source = self
+            .download_source
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .clone()
+            .ok_or(ProtocolError::UnsupportedCapability)?;
+        // Provider bytes stay on the remote host, so the observed-size refusal
+        // is unchanged there. A native-local download streams from the file
+        // Chrome wrote and is no longer bounded by the single-blob byte limit.
+        let oversized = matches!(source, DownloadSource::Provider(_))
+            && params
+                .get("receivedBytes")
+                .and_then(Value::as_f64)
+                .is_some_and(|size| size > self.blobs.producer_limit() as f64);
         if oversized {
             let context = self
                 .download_context
@@ -1383,56 +1381,16 @@ impl ClientNetwork {
         if state == "canceled" {
             return self.finish_download(&handle, Err(ProtocolError::BrowserFailure));
         }
-        let source = self
-            .download_source
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .clone()
-            .ok_or(ProtocolError::UnsupportedCapability)?;
         match source {
-            DownloadSource::Provider(_) => {
-                self.finish_download(&handle, Ok(format!("provider:{guid}")))
-            }
+            DownloadSource::Provider(_) => self.finish_download(
+                &handle,
+                Ok(ResourceValue::ProviderDownload(guid.to_owned())),
+            ),
             DownloadSource::Local(directory) => {
-                let result = async {
-                    let producer = self
-                        .downloads
-                        .lock()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?
-                        .get_mut(guid)
-                        .and_then(|entry| entry.reservation.take())
-                        .ok_or(ProtocolError::CapacityExceeded)?;
-                    let limit = self.blobs.producer_limit();
-                    let basename = guid.to_owned();
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    {
-                        let mut readers = self
-                            .blocking_reads
-                            .lock()
-                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                        while let Some(result) = readers.try_join_next() {
-                            if result.is_err() {
-                                return Err(ProtocolError::CleanupFailed);
-                            }
-                        }
-                        if readers.len() >= 2 {
-                            return Err(ProtocolError::CapacityExceeded);
-                        }
-                        readers.spawn_blocking(move || {
-                            let bytes = read_owned_download(&directory, &basename, limit);
-                            let _ = sender.send((producer, bytes));
-                        });
-                    }
-                    let (producer, bytes) =
-                        receiver.await.map_err(|_| ProtocolError::BrowserFailure)?;
-                    let bytes = bytes?;
-                    self.check()?;
-                    self.blobs
-                        .finish_producer(producer, bytes)
-                        .map(|blob| blob.handle)
-                        .map_err(producer_error)
-                }
-                .await;
+                // Open before publication: the caller's first chunk cannot race
+                // a replaced path, and the retained descriptor pins the inode.
+                let result = LocalDownload::open(&directory, guid)
+                    .map(|download| ResourceValue::LocalDownload(Arc::new(download)));
                 self.finish_download(&handle, result)
             }
         }
@@ -1440,19 +1398,8 @@ impl ClientNetwork {
     fn finish_download(
         &self,
         handle: &str,
-        result: Result<String, ProtocolError>,
+        result: Result<ResourceValue, ProtocolError>,
     ) -> Result<(), ProtocolError> {
-        if result.is_err() {
-            if let Some(entry) = self
-                .downloads
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                .values_mut()
-                .find(|entry| entry.handle == handle)
-            {
-                entry.reservation.take();
-            }
-        }
         self.finish_resource(handle, result)?;
         let published = self
             .downloads
@@ -1491,13 +1438,13 @@ impl ClientNetwork {
                 return Err(ProtocolError::Cancelled);
             }
             if let Some(result) = receiver.borrow().clone() {
-                let value = result?;
-                return if value.starts_with("provider:") {
-                    Ok(
+                return match result? {
+                    ResourceValue::ProviderDownload(_) => Ok(
                         json!({"identityScope":self.scope.identity_scope,"source":"provider","basename":guid}),
-                    )
-                } else {
-                    Ok(json!({"identityScope":self.scope.identity_scope,"source":"local"}))
+                    ),
+                    ResourceValue::Blob(_) | ResourceValue::LocalDownload(_) => {
+                        Ok(json!({"identityScope":self.scope.identity_scope,"source":"local"}))
+                    }
                 };
             }
             tokio::select! { _=tokio::time::sleep_until(operation.deadline.into())=>return Err(ProtocolError::DeadlineExceeded), _=cancellation.changed()=>return Err(ProtocolError::Cancelled), result=receiver.changed()=> { result.map_err(|_|ProtocolError::ScopeUnavailable)?; } }
@@ -1533,14 +1480,23 @@ impl ClientNetwork {
         }
         if event.method == "Browser.downloadProgress" {
             let guid = required_string(&event.params, "guid")?;
+            // The observed-size refusal only governs provider bytes, which stay
+            // remote. A local download streams from Chrome's file at any size.
+            let provider_bytes = self
+                .download_source
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                .as_ref()
+                .is_some_and(|source| matches!(source, DownloadSource::Provider(_)));
             let terminal = matches!(
                 event.params.get("state").and_then(Value::as_str),
                 Some("completed" | "canceled")
-            ) || event
-                .params
-                .get("receivedBytes")
-                .and_then(Value::as_f64)
-                .is_some_and(|size| size > self.blobs.producer_limit() as f64);
+            ) || (provider_bytes
+                && event
+                    .params
+                    .get("receivedBytes")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|size| size > self.blobs.producer_limit() as f64));
             if !terminal {
                 return Ok(());
             }
@@ -2794,29 +2750,22 @@ impl ClientNetwork {
     fn finish_resource(
         &self,
         handle: &str,
-        result: Result<String, ProtocolError>,
+        result: Result<ResourceValue, ProtocolError>,
     ) -> Result<(), ProtocolError> {
         let resources = self
             .resources
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if self.sealed.load(Ordering::Acquire) {
-            if let Ok(blob) = result {
-                if !blob.starts_with("provider:") {
-                    let _ = self.blobs.release(&self.scope, &blob);
-                }
+            if let Ok(value) = &result {
+                let _ = value.release_backing(&self.blobs, &self.scope);
             }
             return Err(ProtocolError::StaleScope);
         }
         if let Some(resource) = resources.get(handle) {
             resource.completed.send_replace(Some(result));
-        } else if let Ok(blob) = result {
-            if blob.starts_with("provider:") {
-                return Ok(());
-            }
-            self.blobs
-                .release(&self.scope, &blob)
-                .map_err(|_| ProtocolError::CleanupFailed)?;
+        } else if let Ok(value) = &result {
+            return value.release_backing(&self.blobs, &self.scope);
         }
         Ok(())
     }
@@ -2845,7 +2794,7 @@ impl ClientNetwork {
                 return Err(ProtocolError::Cancelled);
             }
             if let Some(result) = completion.borrow().clone() {
-                return self.read_body(&result?, offset, max_bytes);
+                return self.read_value(&result?, offset, max_bytes);
             }
             tokio::select! {
                 _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
@@ -2879,12 +2828,8 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if let Some(resource) = resources.get(handle) {
             let completed = resource.completed.borrow().clone();
-            if let Some(Ok(blob)) = completed {
-                if !blob.starts_with("provider:") {
-                    self.blobs
-                        .release(&self.scope, &blob)
-                        .map_err(|_| ProtocolError::CleanupFailed)?;
-                }
+            if let Some(Ok(value)) = completed {
+                value.release_backing(&self.blobs, &self.scope)?;
             }
             resource
                 .completed
@@ -3016,7 +2961,7 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::CleanupFailed)?;
         // A missing/failed response body is a resource error, not evidence that
         // the browser context itself has unknown mutation effects.
-        self.finish_resource(&handle, result)
+        self.finish_resource(&handle, result.map(ResourceValue::Blob))
     }
 
     pub fn pending_callbacks(&self) -> Result<usize, ProtocolError> {
@@ -3112,15 +3057,11 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .values()
         {
-            if let Some(Ok(blob)) = resource
+            if let Some(Ok(value)) = resource
                 .completed
                 .send_replace(Some(Err(ProtocolError::StaleScope)))
             {
-                if !blob.starts_with("provider:") {
-                    self.blobs
-                        .release(&self.scope, &blob)
-                        .map_err(|_| ProtocolError::CleanupFailed)?;
-                }
+                value.release_backing(&self.blobs, &self.scope)?;
             }
         }
         self.aliases
@@ -3130,6 +3071,21 @@ impl ClientNetwork {
         self.app_events.clear()
     }
 
+    /// Routes a completed resource to its backing store. Provider downloads are
+    /// read by the owning remote client, so a native chunk read refuses them
+    /// exactly as the previous provider-handle form did.
+    fn read_value(
+        &self,
+        value: &ResourceValue,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<BlobChunk, ProtocolError> {
+        match value {
+            ResourceValue::Blob(handle) => self.read_body(handle, offset, max_bytes),
+            ResourceValue::LocalDownload(download) => download.read_chunk(offset, max_bytes),
+            ResourceValue::ProviderDownload(_) => Err(ProtocolError::InvalidArguments),
+        }
+    }
     pub fn read_body(
         &self,
         handle: &str,
@@ -3700,7 +3656,173 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Protoco
 }
 
 struct BodyResource {
-    completed: tokio::sync::watch::Sender<Option<Result<String, ProtocolError>>>,
+    completed: tokio::sync::watch::Sender<Option<Result<ResourceValue, ProtocolError>>>,
+}
+
+/// A completed resource body. Network responses and evaluate payloads stay in
+/// `BlobStore`; a native-owned download streams from the file Chrome wrote, so
+/// its size is bounded by disk rather than the single-blob byte reservation.
+#[derive(Clone)]
+enum ResourceValue {
+    Blob(String),
+    ProviderDownload(String),
+    LocalDownload(Arc<LocalDownload>),
+}
+impl ResourceValue {
+    /// Releases the backing resource exactly once. Provider bytes are owned by
+    /// the remote reader and local files by the native download directory.
+    fn release_backing(&self, blobs: &BlobStore, scope: &BlobScope) -> Result<(), ProtocolError> {
+        match self {
+            Self::Blob(handle) => blobs
+                .release(scope, handle)
+                .map_err(|_| ProtocolError::CleanupFailed),
+            Self::LocalDownload(download) => download.remove(),
+            Self::ProviderDownload(_) => Ok(()),
+        }
+    }
+}
+impl PartialEq for ResourceValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Blob(left), Self::Blob(right))
+            | (Self::ProviderDownload(left), Self::ProviderDownload(right)) => left == right,
+            (Self::LocalDownload(left), Self::LocalDownload(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+impl std::fmt::Debug for ResourceValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Blob(handle) => formatter.debug_tuple("Blob").field(handle).finish(),
+            Self::ProviderDownload(basename) => formatter
+                .debug_tuple("ProviderDownload")
+                .field(basename)
+                .finish(),
+            Self::LocalDownload(download) => formatter
+                .debug_struct("LocalDownload")
+                .field("path", &download.path)
+                .field("size", &download.size)
+                .finish(),
+        }
+    }
+}
+
+/// Native-owned download bytes retained on disk. The file is opened once with
+/// no symlink following and kept open until release, so a replaced path cannot
+/// redirect a read. Every chunk stays bounded by `MAX_CHUNK_BYTES`; no whole
+/// body is copied into memory or charged against the blob byte budget.
+struct LocalDownload {
+    file: Mutex<Option<std::fs::File>>,
+    path: std::path::PathBuf,
+    size: usize,
+}
+impl LocalDownload {
+    fn open(directory: &std::path::Path, basename: &str) -> Result<Self, ProtocolError> {
+        if !safe_basename(basename) {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let path = directory.join(basename);
+        if std::fs::symlink_metadata(&path)
+            .map_err(|_| ProtocolError::BrowserFailure)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| ProtocolError::BrowserFailure)?;
+        let metadata = file.metadata().map_err(|_| ProtocolError::BrowserFailure)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+            {
+                return Err(ProtocolError::PolicyDenied);
+            }
+        }
+        if !metadata.is_file() {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        let size = usize::try_from(metadata.len()).map_err(|_| ProtocolError::CapacityExceeded)?;
+        Ok(Self {
+            file: Mutex::new(Some(file)),
+            path,
+            size,
+        })
+    }
+    fn read_chunk(&self, offset: usize, max_bytes: usize) -> Result<BlobChunk, ProtocolError> {
+        if max_bytes == 0 || max_bytes > MAX_CHUNK_BYTES || offset > self.size {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if offset == self.size {
+            return Ok(BlobChunk {
+                base64: String::new(),
+                next_offset: offset,
+                eof: true,
+            });
+        }
+        let end = offset.saturating_add(max_bytes).min(self.size);
+        let mut bytes = vec![0u8; end - offset];
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let file = file.as_ref().ok_or(ProtocolError::StaleScope)?;
+        let read =
+            read_at(file, &mut bytes, offset as u64).map_err(|_| ProtocolError::BrowserFailure)?;
+        if read != bytes.len() {
+            return Err(ProtocolError::BrowserFailure);
+        }
+        Ok(BlobChunk {
+            base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            next_offset: end,
+            eof: end == self.size,
+        })
+    }
+    fn remove(&self) -> Result<(), ProtocolError> {
+        // Drop the native file handle before unlinking so Windows can remove it
+        // even while a reader still holds the shared resource value.
+        let file = self
+            .file
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .take();
+        drop(file);
+        match std::fs::remove_file(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result.map_err(|_| ProtocolError::CleanupFailed),
+        }
+    }
+}
+fn read_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buffer, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buffer, offset)
+    }
 }
 
 /// A caller dropping its retained setup task cannot certify a lost ACK.
@@ -3727,7 +3849,6 @@ struct DownloadEntry {
     completed: bool,
     terminal_started: bool,
     published: bool,
-    reservation: Option<BlobProducer>,
 }
 fn safe_basename(value: &str) -> bool {
     !value.is_empty()
@@ -3736,63 +3857,6 @@ fn safe_basename(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
-fn read_owned_download(
-    directory: &std::path::Path,
-    basename: &str,
-    limit: usize,
-) -> Result<Vec<u8>, ProtocolError> {
-    use std::io::Read;
-    if !safe_basename(basename) {
-        return Err(ProtocolError::InvalidArguments);
-    }
-    let path = directory.join(basename);
-    if std::fs::symlink_metadata(&path)
-        .map_err(|_| ProtocolError::BrowserFailure)?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(ProtocolError::PolicyDenied);
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options
-        .open(&path)
-        .map_err(|_| ProtocolError::BrowserFailure)?;
-    let metadata = file.metadata().map_err(|_| ProtocolError::BrowserFailure)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Err(ProtocolError::PolicyDenied);
-        }
-    }
-    if !metadata.is_file() || metadata.len() > limit as u64 {
-        return Err(ProtocolError::CapacityExceeded);
-    }
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ProtocolError::BrowserFailure)?;
-    if bytes.len() > limit {
-        return Err(ProtocolError::CapacityExceeded);
-    }
-    std::fs::remove_file(&path).map_err(|_| ProtocolError::CleanupFailed)?;
-    Ok(bytes)
-}
-
 struct TokenCleanup<'a> {
     network: &'a ClientNetwork,
     token: String,
@@ -4353,7 +4417,10 @@ mod bridge_tests {
             "Network.getResponseBody"
         );
         assert!(commands.try_recv().is_err());
-        let blob = resource.completed.borrow().clone().unwrap().unwrap();
+        let ResourceValue::Blob(blob) = resource.completed.borrow().clone().unwrap().unwrap()
+        else {
+            panic!("response body must complete into a blob");
+        };
         let bytes = network.blobs.read(&network.scope, &blob, 0, 32).unwrap();
         assert_eq!(bytes, b"synthetic-response");
         network.release_body(&handle).unwrap();
@@ -5902,7 +5969,7 @@ mod bridge_tests {
         let blob = blobs.insert_sealed(network.scope.clone(), b"abc").unwrap();
         let (handle, resource) = network.new_resource().unwrap();
         network
-            .finish_resource(&handle, Ok(blob.handle.clone()))
+            .finish_resource(&handle, Ok(ResourceValue::Blob(blob.handle.clone())))
             .unwrap();
         network.downloads.lock().unwrap().insert(
             "guid".into(),
@@ -5912,7 +5979,6 @@ mod bridge_tests {
                 completed: true,
                 terminal_started: true,
                 published: true,
-                reservation: None,
             },
         );
         blobs
@@ -6299,36 +6365,230 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    async fn local_downloads_keep_the_existing_native_byte_reservation_bound() {
-        let (network, mut events, _, server) = fixture().await;
+    async fn local_download_streams_past_the_blob_limit_without_charging_native_bytes() {
+        let (mut network, mut events, _commands, server) = fixture().await;
+        let blobs = Arc::new(
+            BlobStore::new(super::super::client_blobs::BlobLimits {
+                max_blob_bytes: 32,
+                max_total_bytes: 64,
+                max_handles: 8,
+            })
+            .unwrap(),
+        );
+        blobs.activate_scope(network.scope.clone()).unwrap();
+        Arc::get_mut(&mut network).unwrap().blobs = blobs.clone();
         let directory = tempfile::tempdir().unwrap();
-        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(
-            std::fs::canonicalize(directory.path()).unwrap(),
-        ));
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
         *network.download_context.lock().unwrap() = Some("owned-context".into());
         network.download_ready.store(true, Ordering::Release);
         network.subscribe_downloads().unwrap();
-        let mut handles = Vec::new();
-        for index in 0..2 {
-            network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":format!("local-{index}"),"frameId":"owned-frame","suggestedFilename":"small.bin"}) }).unwrap();
-            let (_, event, _) = next_event(&mut events).await;
-            handles.push(event["handle"].as_str().unwrap().to_owned());
-        }
-        assert_eq!(network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":"local-over-limit","frameId":"owned-frame","suggestedFilename":"small.bin"}) }), Err(ProtocolError::CapacityExceeded));
-        assert_eq!(network.downloads.lock().unwrap().len(), 2);
-        assert_eq!(network.resources.lock().unwrap().len(), 2);
-        for handle in handles {
-            network.release_body(&handle).unwrap();
-        }
-        let first = network
-            .blobs
-            .reserve_producer(network.scope.clone())
+        // The single-blob limit here is 32 bytes; this body is one byte larger.
+        std::fs::write(canonical.join("stream-guid"), vec![7u8; 33]).unwrap();
+        network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"stream-guid","frameId":"owned-frame","suggestedFilename":"large.bin"})}).unwrap();
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap().to_owned();
+        network
+            .event(&CdpEvent {
+                method: "Browser.downloadProgress".into(),
+                session_id: None,
+                params: json!({"guid":"stream-guid","state":"completed","receivedBytes":33}),
+            })
             .unwrap();
-        let second = network
-            .blobs
-            .reserve_producer(network.scope.clone())
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        // No producer reservation was charged by the download: the whole
+        // two-producer byte budget is still available while it streams.
+        let first = blobs.reserve_producer(network.scope.clone()).unwrap();
+        let second = blobs.reserve_producer(network.scope.clone()).unwrap();
+        let metadata = network
+            .download_metadata(&handle, &operation)
+            .await
             .unwrap();
+        assert_eq!(metadata["source"], "local");
+        let mut bytes = Vec::new();
+        let mut offset = 0;
+        loop {
+            let chunk = network
+                .read_resource(&handle, offset, 8, &operation)
+                .await
+                .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(chunk.base64)
+                .unwrap();
+            bytes.extend_from_slice(&decoded);
+            assert_eq!(chunk.next_offset, offset + decoded.len());
+            offset = chunk.next_offset;
+            if chunk.eof {
+                break;
+            }
+        }
+        assert_eq!(bytes, vec![7u8; 33]);
+        network.release_body(&handle).unwrap();
+        assert!(!canonical.join("stream-guid").exists());
         drop((first, second));
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_download_streams_one_byte_past_the_default_blob_limit() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        let size = network.blobs.producer_limit() + 1;
+        let file = std::fs::File::create(canonical.join("large-guid")).unwrap();
+        file.set_len(size as u64).unwrap();
+        drop(file);
+        network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"large-guid","frameId":"owned-frame","suggestedFilename":"large.bin"})}).unwrap();
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap().to_owned();
+        network
+            .event(&CdpEvent {
+                method: "Browser.downloadProgress".into(),
+                session_id: None,
+                params: json!({"guid":"large-guid","state":"completed","receivedBytes":size}),
+            })
+            .unwrap();
+        let operation = network.broker.admit(1, 1, 20000).unwrap();
+        assert_eq!(
+            network
+                .download_metadata(&handle, &operation)
+                .await
+                .unwrap()["source"],
+            "local"
+        );
+        let mut offset = 0;
+        let mut chunks = 0;
+        loop {
+            let chunk = network
+                .read_resource(&handle, offset, 256 * 1024, &operation)
+                .await
+                .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(chunk.base64)
+                .unwrap();
+            assert_eq!(chunk.next_offset, offset + decoded.len());
+            offset = chunk.next_offset;
+            chunks += 1;
+            if chunk.eof {
+                break;
+            }
+        }
+        assert_eq!(offset, size);
+        assert!(chunks > 1);
+        network.release_body(&handle).unwrap();
+        assert!(!canonical.join("large-guid").exists());
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_download_refuses_a_symlinked_body() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        std::fs::write(canonical.join("outside.bin"), b"secret").unwrap();
+        std::os::unix::fs::symlink(canonical.join("outside.bin"), canonical.join("linked-guid"))
+            .unwrap();
+        network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"linked-guid","frameId":"owned-frame","suggestedFilename":"linked.bin"})}).unwrap();
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap();
+        network
+            .event(&CdpEvent {
+                method: "Browser.downloadProgress".into(),
+                session_id: None,
+                params: json!({"guid":"linked-guid","state":"completed","receivedBytes":6}),
+            })
+            .unwrap();
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        assert_eq!(
+            network
+                .download_metadata(handle, &operation)
+                .await
+                .unwrap_err(),
+            ProtocolError::PolicyDenied
+        );
+        network.release_body(handle).unwrap();
+        assert!(network.check().is_ok());
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_download_reads_exact_offsets_and_eof() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        std::fs::write(canonical.join("chunk-guid"), b"abcde").unwrap();
+        network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"chunk-guid","frameId":"owned-frame","suggestedFilename":"chunks.bin"})}).unwrap();
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap();
+        network
+            .event(&CdpEvent {
+                method: "Browser.downloadProgress".into(),
+                session_id: None,
+                params: json!({"guid":"chunk-guid","state":"completed","receivedBytes":5}),
+            })
+            .unwrap();
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        let first = network
+            .read_resource(handle, 0, 3, &operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(first.base64)
+                .unwrap(),
+            b"abc"
+        );
+        assert_eq!((first.next_offset, first.eof), (3, false));
+        let second = network
+            .read_resource(handle, 3, 3, &operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(second.base64)
+                .unwrap(),
+            b"de"
+        );
+        assert_eq!((second.next_offset, second.eof), (5, true));
+        assert_eq!(
+            network
+                .read_resource(handle, 6, 3, &operation)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidArguments
+        );
+        assert_eq!(
+            network
+                .read_resource(handle, 0, 0, &operation)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidArguments
+        );
+        network.release_body(handle).unwrap();
+        assert_eq!(
+            network
+                .read_resource(handle, 0, 3, &operation)
+                .await
+                .unwrap_err(),
+            ProtocolError::InvalidArguments
+        );
+        assert!(!canonical.join("chunk-guid").exists());
         network.close().await.unwrap();
         server.abort();
     }
@@ -6368,8 +6628,11 @@ mod bridge_tests {
                 .unwrap(),
             b"downloaded"
         );
-        assert!(!canonical.join("synthetic-guid").exists());
+        assert!(bytes.eof);
+        // The native-owned file stays readable until the caller releases it.
+        assert!(canonical.join("synthetic-guid").exists());
         network.release_body(handle).unwrap();
+        assert!(!canonical.join("synthetic-guid").exists());
         network.close().await.unwrap();
         server.abort();
     }
