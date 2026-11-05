@@ -4116,24 +4116,35 @@ async fn frame_inventory_attempt_impl(
         .await?;
         trees.push((target.session_id.clone(), target.kind == "page", tree));
     }
-    let lineage = page_lineage(&trees, &page.page_session_id)?;
-    let mapping = lineage.iframe_sessions;
-    let frames = if readonly_disposal {
+    let mut lineage = page_lineage(&trees, &page.page_session_id)?;
+    let enumerated = if readonly_disposal {
         observation::enumerate_semantic_frames(
             &page.client,
             &page.page_session_id,
-            &mapping,
+            &lineage.iframe_sessions,
             operation,
         )
         .await
     } else {
-        observation::enumerate_frames(&page.client, &page.page_session_id, &mapping, operation)
-            .await
+        observation::enumerate_frames_with_opaque(
+            &page.client,
+            &page.page_session_id,
+            &lineage.iframe_sessions,
+            operation,
+        )
+        .await
     }
     .map_err(|error| match cleanup {
         Some(cleanup) => observation_error_with_cleanup(error, cleanup),
         None => observation_error(error),
     })?;
+    // The plugin documents are opaque: the inventory omits them and everything
+    // only reachable through them, so the author lineage must omit the same
+    // subtrees before the two are compared. Native parent edges and renderer
+    // ownership were already proven above, over the complete tree.
+    lineage = author_lineage(lineage, &enumerated.opaque_frame_roots);
+    let frames = enumerated.frames;
+    let mapping = lineage.iframe_sessions;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
         return Err(ProtocolError::StaleScope.into());
@@ -4317,6 +4328,62 @@ fn page_lineage(
             })
             .collect(),
     })
+}
+/// `<object>`/`<embed>` child documents are opaque plugin content, not author
+/// document inventory. The semantic inventory omits each plugin document and
+/// everything reachable only through it, so the author lineage drops the same
+/// subtrees before the two are compared. This does not relax the native checks:
+/// `page_lineage` already proved every parent edge and renderer ownership over
+/// the complete tree, and a genuinely raced frame still shows up as a count
+/// mismatch. Ownership is unaffected for the frames that remain: an omitted
+/// subtree can no longer own an author frame, because the inventory never
+/// traversed it either.
+fn author_lineage(lineage: PageLineage, opaque_frame_roots: &[String]) -> PageLineage {
+    if opaque_frame_roots.is_empty() {
+        return lineage;
+    }
+    let opaque = opaque_frame_roots
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let omitted = lineage
+        .parents
+        .keys()
+        .filter(|id| {
+            let mut current = Some(id.as_str());
+            let mut depth = 0usize;
+            while let Some(candidate) = current {
+                depth += 1;
+                if depth > 256 {
+                    return false;
+                }
+                if opaque.contains(candidate) {
+                    return true;
+                }
+                current = lineage
+                    .parents
+                    .get(candidate)
+                    .and_then(|parent| parent.as_deref());
+            }
+            false
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    if omitted.is_empty() {
+        return lineage;
+    }
+    PageLineage {
+        iframe_sessions: lineage
+            .iframe_sessions
+            .into_iter()
+            .filter(|(id, _)| !omitted.contains(id))
+            .collect(),
+        parents: lineage
+            .parents
+            .into_iter()
+            .filter(|(id, _)| !omitted.contains(id))
+            .collect(),
+    }
 }
 fn main_frame(frames: &[ObservationFrame]) -> Result<&ObservationFrame, ProtocolError> {
     let mut roots = frames
