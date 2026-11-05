@@ -46,7 +46,9 @@ fn selector_compilation_preserves_the_wire_and_retained_source() {
 
 #[test]
 fn capture_refusal_survives_nested_scopes_filters_unions_and_frames() {
-    let invalid = json!({"kind":"selector","selector":"*css=article >> text=Hello"});
+    // A single non-final capture is now a rewrite, so the remaining capture
+    // refusal in every nested scope is the two-capture rule.
+    let invalid = json!({"kind":"selector","selector":"*css=article >> *css=span"});
     let valid = json!({"kind":"selector","selector":"section"});
     for value in [
         invalid.clone(),
@@ -54,7 +56,7 @@ fn capture_refusal_survives_nested_scopes_filters_unions_and_frames() {
         json!({"kind":"filter","source":valid,"has":invalid}),
         json!({"kind":"union","left":valid,"right":invalid}),
         json!({"kind":"frame","selector":"iframe","source":invalid}),
-        json!({"kind":"frame","selector":"*css=div >> iframe","source":valid}),
+        json!({"kind":"frame","selector":"*css=div >> *css=iframe","source":valid}),
         json!({"kind":"query","query":{"kind":"text","value":{"kind":"string","value":"Hello","exact":true}},"scope":invalid}),
     ] {
         let expression = serde_json::from_value(value).unwrap();
@@ -89,10 +91,45 @@ fn malformed_protocol_arguments_are_not_relabelled_as_user_selectors() {
     let expression = LocatorExpression::Selector {
         selector: "internal:role=button".into(),
     };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
     assert_eq!(
-        validate_expression(&expression, 0),
-        Err(ObservationError::UnsupportedCapability)
+        compile_selector_expression(&expression).unwrap()["nativeParts"],
+        json!([{"engine": "internal:role", "body": "button"}])
     );
+}
+
+#[test]
+fn non_final_capture_compiles_its_position_for_the_renderer() {
+    let expression = LocatorExpression::Selector {
+        selector: "*css=section >> text=Alpha >> css=span".into(),
+    };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
+    let compiled = compile_selector_expression(&expression).unwrap();
+    assert_eq!(compiled["nativeCapture"], json!(0));
+    assert_eq!(
+        compiled["nativeParts"],
+        json!([
+            {"engine": "css", "body": "section"},
+            {"engine": "text", "body": "Alpha"},
+            {"engine": "css", "body": "span"},
+        ])
+    );
+    // A final capture keeps the position too; the renderer's rewrite is then a
+    // no-op prefix. A selector without a capture carries no such field.
+    let expression = LocatorExpression::Selector {
+        selector: "css=section >> *css=span".into(),
+    };
+    assert_eq!(
+        compile_selector_expression(&expression).unwrap()["nativeCapture"],
+        json!(1)
+    );
+    let expression = LocatorExpression::Selector {
+        selector: "css=section >> css=span".into(),
+    };
+    assert!(compile_selector_expression(&expression)
+        .unwrap()
+        .get("nativeCapture")
+        .is_none());
 }
 
 #[test]
@@ -231,17 +268,23 @@ fn visible_engine_compiles_inside_the_existing_chain() {
         let compiled = compile_selector_expression(&expression).unwrap();
         assert!(compiled["nativeParts"].is_array(), "{selector}");
     }
-    // Capture placement and final-only rules are unchanged.
-    for selector in ["*visible=true >> css=div", "div >> *visible=true >> nth=0"] {
-        let expression = LocatorExpression::Selector {
-            selector: selector.into(),
-        };
-        assert_eq!(
-            validate_expression(&expression, 0),
-            Err(ObservationError::InvalidLocator),
-            "{selector}"
-        );
-    }
+    // A non-final capture is the pinned rewrite, not a placement refusal; the
+    // nth-with-capture rule is unchanged.
+    let expression = LocatorExpression::Selector {
+        selector: "*visible=true >> css=div".into(),
+    };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
+    assert_eq!(
+        compile_selector_expression(&expression).unwrap()["nativeCapture"],
+        json!(0)
+    );
+    let expression = LocatorExpression::Selector {
+        selector: "div >> *visible=true >> nth=0".into(),
+    };
+    assert_eq!(
+        validate_expression(&expression, 0),
+        Err(ObservationError::InvalidLocator)
+    );
 }
 
 #[test]
@@ -319,11 +362,21 @@ fn trailing_chain_syntax_is_backend_failure_not_capture_invalid_locator() {
         compile_selector_expression(&expression),
         Err(ObservationError::BackendFailure)
     ));
+    // A capture before the last part belongs to the renderer's rewrite and is
+    // not the trailing-syntax failure class.
     let capture = LocatorExpression::Selector {
         selector: "*css=ul >> li".into(),
     };
+    assert_eq!(validate_expression(&capture, 0), Ok(false));
     assert_eq!(
-        validate_expression(&capture, 0),
+        compile_selector_expression(&capture).unwrap()["nativeCapture"],
+        json!(0)
+    );
+    let repeated = LocatorExpression::Selector {
+        selector: "*css=ul >> *css=li".into(),
+    };
+    assert_eq!(
+        validate_expression(&repeated, 0),
         Err(ObservationError::InvalidLocator)
     );
 }

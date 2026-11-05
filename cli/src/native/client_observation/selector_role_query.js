@@ -1249,7 +1249,7 @@ function roleMatchesAttributePart(value, attr) {
   return false;
 }
 
-function roleQuery(scope, options) {
+function roleQuery(scope, options, internal) {
   const result = [];
   const match = (element) => {
     matcherStep();
@@ -1264,11 +1264,13 @@ function roleQuery(scope, options) {
     if (options.name !== undefined) {
       const accessibleName = roleNormalizeWhiteSpace(roleGetElementAccessibleNameText(element, !!options.includeHidden));
       if (typeof options.name === "string") options.name = roleNormalizeWhiteSpace(options.name);
+      if (internal && !options.nameExact && options.nameOp === "=") options.nameOp = "*=";
       if (!roleMatchesAttributePart(accessibleName, { name: "", jsonPath: [], op: options.nameOp || "=", value: options.name, caseSensitive: !!options.nameExact })) return;
     }
     if (options.description !== undefined) {
       const accessibleDescription = roleNormalizeWhiteSpace(roleGetElementAccessibleDescription(element, !!options.includeHidden));
       if (typeof options.description === "string") options.description = roleNormalizeWhiteSpace(options.description);
+      if (internal && !options.descriptionExact && options.descriptionOp === "=") options.descriptionOp = "*=";
       if (!roleMatchesAttributePart(accessibleDescription, { name: "", jsonPath: [], op: options.descriptionOp || "=", value: options.description, caseSensitive: !!options.descriptionExact })) return;
     }
     result.push(element);
@@ -1292,14 +1294,14 @@ function roleQuery(scope, options) {
   return result;
 }
 
-function roleQueryAll(scope, body) {
+function roleQueryAll(scope, body, internal = false) {
   const parsed = roleParseAttributeSelector(body);
   const role = parsed.name.toLowerCase();
   if (!role) throw invalidSelector;
   const options = roleValidateAttributes(parsed.attributes, role);
   roleBeginCaches();
   try {
-    return roleQuery(scope, options);
+    return roleQuery(scope, options, internal);
   } finally {
     roleEndCaches();
   }

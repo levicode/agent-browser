@@ -1,5 +1,6 @@
 // Selector chain execution stays inside the existing isolated query realm.
-// The parser has validated engines, positions and capture placement before CDP.
+// The parser has validated engines and positions before CDP; the entry point
+// applies the pinned capture rewrite before this chain runs.
 const invalidSelector = {};
 // Native XPath syntax DOMExceptions are engine errors on the original public route.
 const rawXPathSelectorError = {};
@@ -100,12 +101,110 @@ function selectChain(parts, scope, root, depth = 0) {
     }
     // Playwright's role engine is a descendant query over the current root:
     // it never returns the root itself, descends through open shadow roots in
-    // document order, and filters by ARIA role, states, hidden and name.
-    if (part.engine === 'role') {
+    // document order, and filters by ARIA role, states, hidden and name. The
+    // internal projection of the same engine lowercases a non-exact `=` name
+    // to a substring match.
+    if (part.engine === 'role' || part.engine === 'internal:role') {
       const found = new Set();
       for (const current of roots) {
         matcherStep();
-        for (const element of roleQueryAll(current, part.body)) found.add(element);
+        for (const element of roleQueryAll(current, part.body, part.engine === 'internal:role')) found.add(element);
+      }
+      roots = [...found];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
+    // Playwright's internal:text engine is the text engine with shadow search
+    // and the internal JSON-unquoted matcher: only an element whose own
+    // normalized text matches is returned, never one matched by a descendant.
+    if (part.engine === 'internal:text') {
+      const found = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const element of selectRawText(current, part.body, false, allowed, true)) found.add(element);
+      }
+      roots = [...found];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
+    // Playwright's has-text/has-not-text are root predicates over the current
+    // element's full normalized text: the root is kept or dropped in place.
+    if (part.engine === 'internal:has-text' || part.engine === 'internal:has-not-text') {
+      let matcher;
+      try { ({ matcher } = compileSelectorTextMatcher(part.body, true)); }
+      catch (error) { if (error === matcherLimit) throw error; throw rawTextSelectorError; }
+      const keepWhenMatched = part.engine === 'internal:has-text';
+      roots = roots.filter(root => {
+        matcherStep();
+        if (root.nodeType !== 1) return false;
+        const facts = rawTextFacts(root);
+        // Protected/unknown text is neither a proven match nor a proven
+        // absence, so neither the positive nor the negated engine admits it.
+        if (facts === null) return false;
+        return matcher(facts) === keepWhenMatched;
+      });
+      continue;
+    }
+    // Playwright's internal:label is a descendant query filtering each element
+    // by its associated label texts (aria-labelledby, aria-label, <label>).
+    if (part.engine === 'internal:label') {
+      let matcher;
+      try { ({ matcher } = compileSelectorTextMatcher(part.body, true)); }
+      catch (error) { if (error === matcherLimit) throw error; throw rawTextSelectorError; }
+      const found = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const index of selectChain([{ engine: 'css', body: '*' }], [...allowed], current)) {
+          const element = elements[index];
+          matcherStep();
+          if (rawElementLabels(element).some(facts => facts !== null && matcher(facts))) found.add(element);
+        }
+      }
+      roots = [...found];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
+    // Playwright's internal:attr is a named attribute selector over the typed
+    // body: query `[name]` across this root's open shadow tree, then filter by
+    // the parsed operator/value. The body is data, never interpolated code.
+    if (part.engine === 'internal:attr') {
+      const parsed = roleParseAttributeSelector(part.body);
+      if (parsed.name || parsed.attributes.length !== 1) throw invalidSelector;
+      const attribute = parsed.attributes[0];
+      const matcher = rawAttributeMatcher(attribute, invalidSelector);
+      const found = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const index of selectChain([{ engine: 'css', body: '[' + attribute.name + ']' }], [...allowed], current)) {
+          const element = elements[index];
+          matcherStep();
+          if (matcher(element.getAttribute(attribute.name))) found.add(element);
+        }
+      }
+      roots = [...found];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
+    // Playwright's internal:testid splits a comma-joined attribute name list,
+    // queries every named attribute and keeps an element when any value matches.
+    if (part.engine === 'internal:testid') {
+      const parsed = roleParseAttributeSelector(part.body);
+      if (parsed.name || parsed.attributes.length !== 1) throw invalidSelector;
+      const attribute = parsed.attributes[0];
+      const names = attribute.name.split(',');
+      const matcher = rawAttributeMatcher(attribute, invalidSelector);
+      const css = names.map(name => '[' + name + ']').join(',');
+      const found = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const index of selectChain([{ engine: 'css', body: css }], [...allowed], current)) {
+          const element = elements[index];
+          matcherStep();
+          if (names.some(name => {
+            const actual = element.getAttribute(name);
+            return actual !== null && matcher(actual);
+          })) found.add(element);
+        }
       }
       roots = [...found];
       if (roots.length > 100000) throw matcherLimit;

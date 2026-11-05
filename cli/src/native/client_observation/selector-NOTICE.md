@@ -13,7 +13,7 @@ The source was read from the pinned `playwright-core@1.64.1` development depende
 
 `75d1d55b9c31acbb40f9c63f6f1d93db593d73164d96330649f1d82d2fa16001`
 
-The Rust port keeps named-engine detection, quoted text and XPath detection, escapes, chain boundaries, and capture parsing. Native validation adds a 65,536-byte input limit, a 256-part limit, final-only capture, the pinned nth-with-capture refusal, and an explicit engine allowlist. CSS, css:light, XPath, xpath:light, nth, the attribute engines below, and `visible` are implemented; the bounded raw `text`/`text:light` slice below is also implemented. Positions retain Playwright's JavaScript Number and Array.slice coercion. Other known Playwright engines return unsupported-capability rather than being interpreted as CSS. This is not a copy of the Playwright browser runtime.
+The Rust port keeps named-engine detection, quoted text and XPath detection, escapes, chain boundaries, and capture parsing. Native validation adds a 65,536-byte input limit, a 256-part limit, a single capture whose position the renderer uses for the pinned rewrite, the pinned nth-with-capture refusal, and an explicit engine allowlist. CSS, css:light, XPath, xpath:light, nth, the attribute engines below, and `visible` are implemented; the bounded raw `text`/`text:light` slice below is also implemented. Positions retain Playwright's JavaScript Number and Array.slice coercion. Other known Playwright engines return unsupported-capability rather than being interpreted as CSS. This is not a copy of the Playwright browser runtime.
 
 `selector_query.js` is the native chain interpreter. Its CSS calls use browser CSS semantics, not Playwright's custom CSS evaluator. Playwright-only pseudo-classes and cross-shadow CSS combinators remain separate compatibility work. CSS chain steps search open roots; XPath does not pierce shadow roots. Neither crosses a closed root.
 
@@ -58,7 +58,7 @@ The pinned helpers this depends on, each hashed through the line before the next
 - Every other element needs `checkVisibility()` (called with no arguments, so content-visibility and flat-tree state participate) and a computed `visibility` of `visible`, then a client rect with positive width and height. `opacity` is ignored.
 - Zero-area boxes are invisible. `content-visibility: hidden` boxes that still have a positive rect are visible in Chromium, matching the pinned implementation rather than a semantic "hidden" reading.
 
-This is Playwright rendering visibility, not the E2E reader's semantic `hidden` state and not the native `renderVisible` observation helper. It reads no input value, attribute, accessible name or closed-root inventory, and every root check charges the existing `matcherStep` budget. The `display: contents` walk reuses that same budget and adds the existing 256-level depth bound, so a pathological nesting chain is refused as a resource limit where Playwright would recurse without one. A final-only capture (`*visible=true` as the last part) stays a no-op, which is also what Playwright's capture rewrite produces when the capture is at the last part.
+This is Playwright rendering visibility, not the E2E reader's semantic `hidden` state and not the native `renderVisible` observation helper. It reads no input value, attribute, accessible name or closed-root inventory, and every root check charges the existing `matcherStep` budget. The `display: contents` walk reuses that same budget and adds the existing 256-level depth bound, so a pathological nesting chain is refused as a resource limit where Playwright would recurse without one. A final capture (`*visible=true` as the last part) stays a no-op prefix, which is also what Playwright's capture rewrite produces when the capture is at the last part; a non-final capture becomes the prefix plus an `internal:has` tail (see the #33 section).
 
 ### Root matching in a chain
 
@@ -86,7 +86,7 @@ Three consequences are reproduced:
 
 Native ordering: the rule runs after the engine allowlist because an engine this adapter does not implement must keep returning unsupported-capability rather than being relabelled as an invalid locator. For a selector containing only implemented engines the result matches pinned Playwright exactly: `INVALID_LOCATOR`. A chain that mixes an unimplemented engine with `nth` plus a capture is still refused, only under the adapter's own classification.
 
-Capture placement itself is unchanged. The adapter still requires the single capture to be the final part, which is stricter than pinned Playwright's capture rewrite; that bounded-subset difference is recorded in the provenance summary above and is not widened here.
+Capture placement is no longer final-only. A capture before the last part is accepted and rewritten in the renderer exactly as pinned `InjectedScript.querySelectorAll` does; the single-capture and nth-with-capture refusals above are unchanged. The #33 section records the rewrite, its bounded nested-capture difference and the source segment hash.
 
 This change affects the negotiated E2E session adapter. It does not change the legacy CLI or MCP selector parser, so their command help is unchanged.
 
@@ -126,7 +126,7 @@ Preserve selector-css-NOTICE with the full installed upstream Microsoft/Puppetee
 - `domUtils.ts` through the line before `roleUtils.ts`: `5e3019d0d9457029e663cec92c24884ea83bbc7c2c8d8fb76e6e871104718557`
 - `normalizeWhiteSpace` through the line before `normalizeEscapedRegexQuotes`: `6676d7a20fc579904a9d7eeaffcc0125beaf08ed654beda0fc187a87039d8109`
 
-The engine is registered by Playwright as `role` with `internal=false`: a name string is matched exactly after whitespace normalization unless the `i` flag or a regular expression says otherwise, and only `internal:role` lowers `=` to a substring test. The native adapter implements the public `role` engine; `internal:role` stays an unsupported capability.
+The engine is registered by Playwright as `role` with `internal=false`: a name string is matched exactly after whitespace normalization unless the `i` flag or a regular expression says otherwise, and only `internal:role` lowers `=` to a substring test. The native adapter implements the public `role` engine; the `internal:role` projection is implemented in the #33 section below.
 
 ### Parsed form and typed body
 
@@ -152,4 +152,47 @@ The accessible-name computation is the pinned `getTextAlternativeInternal` graph
 - Accessible-name acquisition refuses text and editable values under an existing secure field or a protected ancestor (the same policy `matcherText` already enforces). Playwright would read them. A page that puts a password value or protected text inside a name-bearing element can therefore disagree; the ledger fixture contains no such case and no private value is newly authorized.
 - Recursion is bounded by the existing matcher work budget and a 256-level structural depth; a pathological tree is a resource limit where Playwright has no such bound.
 - The role engine runs only in the existing isolated query realm over already-issued elements; it creates no frame, root, closed-shadow or value authority.
-- `role` is a plain leaf in the existing private raw-chain compiler (`rawInternalPlainEngines`). It is not an `internal:` composition engine, so `internal:role` stays an unsupported capability while a nested `internal:has="role=…"` compiles like any other supported leaf.
+- `role` is a plain leaf in the existing private raw-chain compiler (`rawInternalPlainEngines`). It is not an `internal:` composition engine, so a nested `internal:has="role=…"` compiles like any other supported leaf; the separate `internal:role` engine is documented in the #33 section below.
+
+## Raw internal leaf engines and capture (original gate e2e#33)
+
+The pinned Playwright 1.64.1 matrix registers seven raw engines the adapter still refused after the role port: `internal:text`, `internal:has-text`, `internal:has-not-text`, `internal:label`, `internal:attr`, `internal:testid` and `internal:role`. They are now admitted as plain chain leaves in `selector.rs`, compiled by `selector_internal_query.js` and matched inside the existing isolated query realm. `internal:role` reuses `selector_role_query.js` with the pinned `internal=true` argument. Each function below is the pinned injected source; hashes are SHA-256 over the decoded source segment in the installed `lib/coreBundle.js` (the bundle stores one injected string with escaped newlines), from the named symbol through the line before the next named symbol. The text helpers read facts from the existing `matcherText`/`rawTextFacts` policy, not a second acquisition.
+
+- `_createTextEngine(shadow, internal)` through `_createInternalHasTextEngine`: `bb4fe25898f424c2eb51b74997a7e603dfd6bf62a9efaace2aea76df3dabe4d7`
+- `_createInternalHasTextEngine` through `_createInternalHasNotTextEngine`: `d177ca61581f43a52d912a34d52847dbb9b6ac231b12e1b1b58b86dc0d5fe58c`
+- `_createInternalHasNotTextEngine` through `_createInternalLabelEngine`: `71b15aef5d6796a4b778681f6a52af15937665892cae4eec23f381be96279f40`
+- `_createInternalLabelEngine` through `_createNamedAttributeEngine`: `4a963d7ad3657f224a9f38508064943b5ee7c89d084b51470fa8d46a88261b3e`
+- `_createNamedAttributeEngine` through `_createTestIdEngine`: `a43bd66ec3756075c35b73adb5ba725bcbf4411dfb9358786d4de547c9b88c06`
+- `_createTestIdEngine` through `_createDescribeEngine`: `f1248877424e4a5f4824fe96a224b4763d585f34ad78e078a5b9c24e7f7d8e10`
+- `createTextMatcher` through `ExpectedTextMatcher`: `897515f0eb7990576a9f0f7372fd94515f54bf5a15f317990a0f2a50f3cb1fff`
+- `elementText` through `elementMatchesText`: `4146c43e3ef802e1eafa5c93fdc505b60f5b259a54191b4b88962ca0682982eb`
+- `elementMatchesText` through `getElementLabels`: `bcbe4eeb26ce57fc8ce11c40857c5d09322a5f79e1ba739a4898ea09f55b23e0`
+- `getElementLabels` through the role engine marker: `9d24aba4376b702201f6811dc420a8ff3e61bfbc7eb32452796448c631a8d5fc`
+- `createAttributeMatcher` through `cssUnquote`: `56d777027b64c7fc3d8be5dd1e2bbca7a40cf4604699903228e35426b3ea1d82`
+- `InjectedScript.querySelectorAll` capture branch through `_queryEngineAll`: `b477351e23818ef6475907a217f974eeb202bfffb42e2ec753f02121ab483fe7`
+
+### Engines
+
+- `internal:text` is `_createTextEngine(true, true)`: shadow-piercing search, internal JSON unquoting (`"body"`, `"body"i`, `"body"s`, `'body'`), lax normalized substring or strict normalized equality, and a "self" match only. An element whose own text does not match is not reported just because a descendant matches; a lax engine also never reports an ancestor whose descendant matches. The chain root is appended before the shadow-piercing `*` traversal, exactly as the pinned engine does.
+- `internal:has-text` and `internal:has-not-text` are root predicates over the same text facts: a non-Element root never matches, the matcher is internal, and the root is kept or dropped in place. Protected/unknown text is neither a proven match nor a proven absence, so neither direction admits the root; Playwright would read it. No value or text authority is added.
+- `internal:label` is a shadow-piercing descendant query keeping elements whose label facts match: `aria-labelledby` refs (resolved in the enclosing shadow root or document), then a non-empty `aria-label`, then the native `labels` list for labelable controls. Label text comes from the same bounded text facts, and a protected label is unavailable rather than invented.
+- `internal:attr` parses the pinned typed attribute body `[name=value]` (quoted, unquoted, regexp, `i`/`s` flags, `true`/`false`), queries `[name]` across open shadow roots and filters with `createAttributeMatcher`: a regexp tests the value, a case-sensitive part compares it, and every other part is a case-insensitive substring test. The body is data and is never interpolated into CSS or code. A truthy-only part (`[title]`) gives that matcher no string value and is refused as an invalid locator.
+- `internal:testid` uses the same typed body, splits the attribute name on commas like `splitTestIdAttributeNames`, queries every named attribute in one CSS list and keeps an element when any present value matches.
+- `internal:role` is the same ARIA role engine as `role=` with the pinned internal-only rewrite: a non-exact `name`/`description` part using `=` becomes `*=` before matching. A quoted exact name stays exact, so `internal:role=button[name="Save"]` and `role=button[name="Save"]` agree while `internal:role=button[name="av"i]` is a substring test and `role=button[name="av"i]` is not.
+
+### Capture rewrite
+
+Pinned `InjectedScript.querySelectorAll` rewrites every capture before engine dispatch. A capture that is not the last part is not a separate engine: the captured part ends the prefix, and the authored tail becomes an `internal:has` body. The parser now retains the position (`Parsed.capture`, serialized as `nativeCapture`) instead of refusing a non-final capture; the renderer applies the rewrite in `rawSelectorEntryParts` before the chain in both the ordinary and public-projection entry. Consequences:
+
+- Only one capture is legal, final or not. Two captures remain an invalid locator.
+- Any top-level `nth` with a capture is refused before the rewrite, as pinned; the position of the capture does not matter.
+- A final capture is a no-op prefix, so `*css=li` and `css=li` still agree.
+- The tail is serialized back to authored `engine=body` source for the adapter's JSON `internal:has` compiler. A tail that itself contains a capture stays an unsupported capability; that is a bounded difference with no matrix case.
+
+### Bounded differences
+
+- Empty internal bodies keep the shared local refusal (`internal:text=` is `INVALID_LOCATOR` here where Playwright's empty lax text would match everything). This is not part of the #33 ledger and is not widened here; the raw `text=` empty-body boundary is #30 and remains separate.
+- Protected text is never admitted through `internal:has-not-text`, and protected label text is treated as unavailable.
+- `internal:control`, `_react`, `_vue`, the layout engines and nested captures remain unsupported capabilities, exactly as before.
+- Descendant ordering reuses the existing shadow-aware chain traversal (light tree, then each open shadow root), the same order the raw text slice and attribute engines already rely on; closed roots are never entered.
+- The engines run only in the existing isolated query realm over already-issued elements. No frame, root, closed-shadow or value authority is created; the existing matcher work budget and depth bounds apply.

@@ -20,10 +20,25 @@ pub(super) enum ParseError {
     Limit,
 }
 
+/// One parsed chain and the position of its single capture, if any.
+/// Playwright rewrites a capture before the last part into the captured prefix
+/// plus an `internal:has` tail; the renderer needs the position, not a rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Parsed<'a> {
+    pub parts: Vec<Part<'a>>,
+    pub capture: Option<usize>,
+}
+
 /// Parse Playwright chain boundaries, then validate the native engine subset.
 /// Quotes and backslash escapes protect `>>`; a raw text engine's apostrophe
 /// is not a string opener after its body has started, as in Playwright.
+#[cfg(test)]
 pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
+    parse_with_capture(selector).map(|parsed| parsed.parts)
+}
+
+/// The same parse, retaining the capture position for the capture rewrite.
+pub(super) fn parse_with_capture(selector: &str) -> Result<Parsed<'_>, ParseError> {
     if selector.len() > 65_536 {
         return Err(ParseError::Limit);
     }
@@ -62,9 +77,6 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
         return Err(ParseError::TrailingSyntax);
     }
     append(&selector[start..], &mut parts, &mut capture)?;
-    if capture.is_some_and(|index| index + 1 != parts.len()) {
-        return Err(ParseError::Invalid);
-    }
     for part in &parts {
         match part.engine {
             "css" | "css:light" | "xpath" | "xpath:light" | "text" | "text:light" => {}
@@ -75,6 +87,16 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             // Nested bodies remain authored JSON for the bounded private renderer compiler.
             "internal:has" | "internal:has-not" | "internal:and" | "internal:or"
             | "internal:chain" => {}
+            // Playwright's raw internal engines stay authored source here and
+            // are parsed/matched by the bounded renderer. `internal:role` is
+            // the same role engine with the internal name/description rewrite.
+            "internal:text"
+            | "internal:has-text"
+            | "internal:has-not-text"
+            | "internal:label"
+            | "internal:attr"
+            | "internal:testid"
+            | "internal:role" => {}
             // Playwright 1.64.1 attribute engines read one exact attribute
             // value and differ only in whether they pierce open shadow roots.
             // The body stays authored source: no unquoting or unescaping.
@@ -92,20 +114,7 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             "role" => {}
             // These Playwright engines are not CSS. Never pass their source
             // to Element.matches or silently reinterpret their semantics.
-            "_react"
-            | "_vue"
-            | "internal:has-text"
-            | "internal:has-not-text"
-            | "internal:role"
-            | "internal:text"
-            | "internal:label"
-            | "internal:attr"
-            | "internal:testid"
-            | "internal:control"
-            | "left-of"
-            | "right-of"
-            | "above"
-            | "below"
+            "_react" | "_vue" | "internal:control" | "left-of" | "right-of" | "above" | "below"
             | "near" => return Err(ParseError::Unsupported),
             _ => return Err(ParseError::Invalid),
         }
@@ -127,7 +136,7 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
     if capture.is_some() && parts.iter().any(|part| part.engine == "nth") {
         return Err(ParseError::Invalid);
     }
-    Ok(parts)
+    Ok(Parsed { parts, capture })
 }
 
 // JavaScript String.trim and /\s/ differ from Rust's Unicode whitespace:
@@ -250,14 +259,32 @@ mod tests {
     }
 
     #[test]
-    fn capture_is_rejected_before_unsupported_engine_classification() {
-        for selector in [
-            "*css=article >> text=Hello",
-            "css=ul >> *css=li >> nth=0",
-            "*css=ul >> *css=li",
+    fn capture_placement_is_a_renderer_rewrite_not_a_parse_rule() {
+        // Playwright accepts a capture before the last part and rewrites it to
+        // the captured prefix plus internal:has; parsing keeps the position.
+        for (selector, capture) in [
+            ("*css=article >> text=Hello", 0),
+            ("*css=li >> css=span", 0),
+            ("css=section >> *text=Alpha >> css=span", 1),
+            ("*visible=true >> css=div", 0),
         ] {
-            assert_eq!(parse(selector), Err(ParseError::Invalid));
+            assert_eq!(
+                parse_with_capture(selector).unwrap().capture,
+                Some(capture),
+                "{selector}"
+            );
         }
+        // Only one capture is legal, and `nth` still refuses any capture.
+        assert_eq!(parse("*css=ul >> *css=li"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("css=ul >> *css=li >> nth=0"),
+            Err(ParseError::Invalid)
+        );
+        // Unsupported engines keep their own classification, capture or not.
+        assert_eq!(
+            parse("*css=article >> _react=x"),
+            Err(ParseError::Unsupported)
+        );
         assert!(parse("*").is_ok());
         assert!(parse("css=*").is_ok());
     }
@@ -286,7 +313,6 @@ mod tests {
             assert_eq!(parse(selector), Err(ParseError::TrailingSyntax));
         }
         for selector in [
-            "*css=ul >> li",
             "*css=ul >>",
             ">> div",
             "div >> >> span",
@@ -295,6 +321,11 @@ mod tests {
         ] {
             assert_eq!(parse(selector), Err(ParseError::Invalid));
         }
+        // A capture before the final part is legal and keeps its position.
+        assert_eq!(
+            parse_with_capture("*css=ul >> li").unwrap().capture,
+            Some(0)
+        );
         assert!(parse("css=[data-x='a >>']").is_ok());
         let chain = |count| {
             std::iter::repeat_n("div", count)
@@ -389,7 +420,60 @@ mod tests {
             parse(r#"css=section >> internal:has={"selector":"css=#a"}"#).unwrap()[1].body,
             r#"{"selector":"css=#a"}"#
         );
-        assert_eq!(parse("internal:role=button"), Err(ParseError::Unsupported));
+        assert_eq!(
+            parse("internal:role=button[name=\"Save\"]").unwrap()[0].engine,
+            "internal:role"
+        );
+    }
+
+    #[test]
+    fn raw_internal_leaf_engines_keep_authored_bodies_for_the_renderer() {
+        for (selector, engine, body) in [
+            (r#"internal:text="Alpha""#, "internal:text", r#""Alpha""#),
+            (
+                r#"internal:has-text="alpha"i"#,
+                "internal:has-text",
+                r#""alpha"i"#,
+            ),
+            (
+                r#"internal:has-not-text="beta""#,
+                "internal:has-not-text",
+                r#""beta""#,
+            ),
+            (
+                r#"internal:label="Alpha label""#,
+                "internal:label",
+                r#""Alpha label""#,
+            ),
+            (
+                r#"internal:attr=[title="Alpha"i]"#,
+                "internal:attr",
+                r#"[title="Alpha"i]"#,
+            ),
+            (
+                r#"internal:testid=[data-testid="x"s]"#,
+                "internal:testid",
+                r#"[data-testid="x"s]"#,
+            ),
+            (
+                r#"internal:role=button[name="Save"]"#,
+                "internal:role",
+                r#"button[name="Save"]"#,
+            ),
+        ] {
+            assert_eq!(
+                parse(selector).unwrap()[0],
+                Part { engine, body },
+                "{selector}"
+            );
+        }
+        // The shared empty-body refusal and the remaining unsupported engines
+        // are unchanged; they are not part of the internal leaf increment.
+        assert_eq!(parse("internal:text="), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("internal:control=enter-frame"),
+            Err(ParseError::Unsupported)
+        );
     }
 
     #[test]
@@ -414,7 +498,13 @@ mod tests {
                 body: "Alpha"
             }
         );
-        assert_eq!(parse("internal:text=Alpha"), Err(ParseError::Unsupported));
+        assert_eq!(
+            parse(r#"internal:text="Alpha""#).unwrap()[0],
+            Part {
+                engine: "internal:text",
+                body: r#""Alpha""#
+            }
+        );
         assert_eq!(parse("_vue=button"), Err(ParseError::Unsupported));
     }
 
@@ -511,10 +601,15 @@ mod tests {
     }
 
     #[test]
-    fn visible_engine_keeps_final_capture_and_chain_boundaries() {
+    fn visible_engine_keeps_capture_and_chain_boundaries() {
         assert!(parse("*visible=true").is_ok());
         assert!(parse("div >> *visible=false").is_ok());
-        assert_eq!(parse("*visible=true >> css=div"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse_with_capture("*visible=true >> css=div")
+                .unwrap()
+                .capture,
+            Some(0)
+        );
         assert_eq!(
             parse("div >> *visible=true >> nth=0"),
             Err(ParseError::Invalid)
@@ -529,13 +624,15 @@ mod tests {
 
     #[test]
     fn attribute_engines_still_reject_capture_inputs_and_foreign_engines() {
-        // Capture placement is independent of the engine, so the existing
-        // final-only rule keeps applying to attribute parts.
+        // Capture placement is independent of the engine: a non-final capture
+        // is legal and only the single-capture and nth rules still apply.
         assert!(parse("*data-testid=row").is_ok());
         assert!(parse("css=div >> *data-testid:light=row").is_ok());
         assert_eq!(
-            parse("*data-testid=row >> css=div"),
-            Err(ParseError::Invalid)
+            parse_with_capture("*data-testid=row >> css=div")
+                .unwrap()
+                .capture,
+            Some(0)
         );
         assert_eq!(
             parse("data-testid=row >> *css=div >> nth=0"),
@@ -604,14 +701,18 @@ mod tests {
         ] {
             assert!(parse(selector).is_ok(), "{selector}");
         }
-        // The existing final-only rule and the single-capture rule still
-        // reject their own inputs.
-        assert_eq!(parse("*css=li >> css=div"), Err(ParseError::Invalid));
-        assert_eq!(parse("*css=a >> *css=b"), Err(ParseError::Invalid));
+        // A single non-final capture is legal; two captures are not.
         assert_eq!(
-            parse("css=div >> *css=span >> css=b"),
-            Err(ParseError::Invalid)
+            parse_with_capture("*css=li >> css=div").unwrap().capture,
+            Some(0)
         );
+        assert_eq!(
+            parse_with_capture("css=div >> *css=span >> css=b")
+                .unwrap()
+                .capture,
+            Some(1)
+        );
+        assert_eq!(parse("*css=a >> *css=b"), Err(ParseError::Invalid));
     }
 
     #[test]
