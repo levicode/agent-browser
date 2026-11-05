@@ -1671,3 +1671,125 @@ async fn chromium_raw_internal_engines_and_non_final_capture() {
     browser.close().await.unwrap();
     result.unwrap();
 }
+
+/// The raw `text=` engine with an empty body against a real Chromium page.
+/// The pinned createTextMatcher turns `text=` into the lax empty substring and
+/// a lax text query keeps only elements that match as `self`, so the frozen
+/// e2e#55 oracle records an ordered match set and no error. These cases pin the
+/// same acceptance, the self/selfAndChildren rule, open-shadow order, closed
+/// root exclusion and the light public-deprecation boundary inside the native
+/// repository.
+#[tokio::test]
+#[ignore = "hosted Chromium: raw text empty body acceptance, leaf rule and shadow order"]
+async fn chromium_raw_text_empty_body_matches_lax_self_elements() {
+    async fn matched(
+        browser: &BrowserManager,
+        frames: &[ObservationFrame],
+        refs: &mut RefMap,
+        op: &OperationLease,
+        selector: &str,
+    ) -> Result<Vec<String>, ObservationError> {
+        let options: QueryOptions = serde_json::from_value(json!({
+            "expression": {"kind": "selector", "selector": selector}
+        }))
+        .unwrap();
+        let result = query(&browser.client, frames, refs, "raw-text", 1, &options, op).await?;
+        Ok(result
+            .nodes
+            .into_iter()
+            .map(|node| node.test_id.unwrap_or_default())
+            .collect())
+    }
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let session = browser.active_session_id()?;
+        evaluate_on(
+            &browser.client,
+            session,
+            r#"(() => {
+                document.body.innerHTML = [
+                    '<p data-testid="p-alpha">Alpha Beta</p>',
+                    '<div data-testid="d-wrap">Alpha <span data-testid="s-beta">Beta</span></div>',
+                    '<p data-testid="p-empty"></p>',
+                    '<input data-testid="i-button" type="button" value="Alpha Button">',
+                    '<input data-testid="i-text" type="text" value="Alpha Field">',
+                    '<ul data-testid="list"><li data-testid="li-1">Alpha one</li><li data-testid="li-2">Beta two</li></ul>',
+                    '<div data-testid="div-visible">Alpha visible</div>',
+                    '<div data-testid="div-hidden" style="display:none">Alpha hidden</div>',
+                    '<div data-testid="shadow-host"></div>',
+                    '<div data-testid="closed-host"></div>',
+                ].join('');
+                const open = document.querySelector('[data-testid="shadow-host"]').attachShadow({ mode: 'open' });
+                open.innerHTML = '<p data-testid="shadow-p"></p><button data-testid="shadow-btn">Shadow Save</button>';
+                const closed = document.querySelector('[data-testid="closed-host"]').attachShadow({ mode: 'closed' });
+                closed.innerHTML = '<p data-testid="closed-p">Closed Alpha</p>';
+                return true;
+            })()"#,
+        )
+        .await?;
+        let (op, _tx) = operation();
+        let inventory = frames(&browser, &op).await;
+        let mut refs = RefMap::new();
+        let leaf_order = [
+            "p-alpha",
+            "s-beta",
+            "p-empty",
+            "i-button",
+            "i-text",
+            "li-1",
+            "li-2",
+            "div-visible",
+            "div-hidden",
+            "closed-host",
+            "shadow-p",
+            "shadow-btn",
+        ];
+        let cases: &[(&str, &[&str])] = &[
+            // An empty lax body matches every element whose own text fact
+            // matches and whose child elements or open shadow root do not.
+            // Hidden and empty elements still match; the shadow host itself
+            // does not, because its open shadow root also matches.
+            ("text=", &leaf_order),
+            ("text=   ", &leaf_order),
+            // The engine returns matches, not an error, when the scope holds
+            // nothing: no match is a normal empty result.
+            ("text=nothing-in-this-page", &[]),
+            // A chain root is not returned as a lax selfAndChildren match, and
+            // its descendant search keeps the same order.
+            ("css=div[data-testid=\"d-wrap\"] >> text=", &["s-beta"]),
+            (
+                "css=div[data-testid=\"shadow-host\"] >> text=",
+                &["shadow-p", "shadow-btn"],
+            ),
+            ("text= >> nth=0", &["p-alpha"]),
+        ];
+        for (selector, expected) in cases {
+            let actual = matched(&browser, &inventory, &mut refs, &op, selector)
+                .await
+                .map_err(|error| format!("{selector}: {error:?}"))?;
+            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+            assert_eq!(actual, expected, "{selector}");
+        }
+        // text:light is the same engine over the light tree, so the empty body
+        // parses; the unchanged public :light deprecation check still refuses
+        // the projection once it would match, exactly as the original entry
+        // refused a matching text:light selector.
+        assert_eq!(
+            matched(
+                &browser,
+                &inventory,
+                &mut refs,
+                &op,
+                "text:light="
+            )
+            .await,
+            Err(ObservationError::BackendFailure)
+        );
+        Ok::<(), String>(())
+    }
+    .await;
+    browser.close().await.unwrap();
+    result.unwrap();
+}

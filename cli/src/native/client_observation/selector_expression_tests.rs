@@ -234,6 +234,44 @@ fn attribute_engines_compile_inside_the_existing_chain() {
 }
 
 #[test]
+fn raw_text_empty_body_compiles_through_every_scope() {
+    // Playwright's raw text engine accepts an empty body: createTextMatcher
+    // turns it into the lax empty substring, so it is a real query and not a
+    // malformed selector. The authored body reaches the renderer unchanged.
+    for selector in ["text=", "text:light=", "css=li >> text=", "text=   "] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert_eq!(validate_expression(&expression, 0), Ok(false), "{selector}");
+        let compiled = compile_selector_expression(&expression).unwrap();
+        assert_eq!(compiled["selector"], selector);
+        let parts = compiled["nativeParts"].as_array().unwrap();
+        let text = parts
+            .iter()
+            .find(|part| part["engine"] == "text" || part["engine"] == "text:light")
+            .unwrap_or_else(|| panic!("{selector} kept no text part"));
+        assert_eq!(text["body"], "", "{selector}");
+    }
+    let empty = json!({"kind":"selector","selector":"text="});
+    let valid = json!({"kind":"selector","selector":"section"});
+    for value in [
+        json!({"kind":"index","index":0,"source":empty}),
+        json!({"kind":"filter","source":valid,"has":empty}),
+        json!({"kind":"union","left":valid,"right":empty}),
+        json!({"kind":"frame","selector":"text=","source":valid}),
+        json!({"kind":"query","query":{"kind":"text","value":{"kind":"string","value":"Hello","exact":true}},"scope":empty}),
+    ] {
+        let expression = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            validate_expression(&expression, 0),
+            Ok(false),
+            "empty text body must stay legal inside nested scopes"
+        );
+        assert!(compile_selector_expression(&expression).is_ok());
+    }
+}
+
+#[test]
 fn visible_engine_compiles_inside_the_existing_chain() {
     let source = r#"main >> visible=true >> visible=false >> nth=0"#;
     let expression = LocatorExpression::Selector {
