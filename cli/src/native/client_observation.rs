@@ -3316,6 +3316,7 @@ const MATCH_QUERY: &str = concat!(
  }
 "#,
     include_str!("client_observation/selector_query.js"),
+    include_str!("client_observation/selector_role_query.js"),
     include_str!("client_observation/selector_text_matcher.js"),
     include_str!("client_observation/selector_text_query.js"),
     include_str!("client_observation/selector_internal_query.js"),

@@ -85,10 +85,14 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             // string "true", so `visible=`, `visible=false` and `visible=TRUE`
             // are all "not visible". The empty body is therefore legal.
             "visible" => {}
+            // Playwright's role engine is a typed attribute body over the
+            // authored ARIA role, states and accessible name. The body stays
+            // authored source; the renderer parses and validates it exactly as
+            // the pinned `parseAttributeSelector(..., true)` does.
+            "role" => {}
             // These Playwright engines are not CSS. Never pass their source
             // to Element.matches or silently reinterpret their semantics.
-            "role"
-            | "_react"
+            "_react"
             | "_vue"
             | "internal:has-text"
             | "internal:has-not-text"
@@ -356,7 +360,14 @@ mod tests {
                 body: "\"hello >> there\""
             }
         );
-        assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
+        assert_eq!(
+            parse("role=button[name=\"Save\"][disabled]").unwrap()[0],
+            Part {
+                engine: "role",
+                body: "button[name=\"Save\"][disabled]"
+            }
+        );
+        assert_eq!(parse("_react=button"), Err(ParseError::Unsupported));
         assert_eq!(parse("not-an-engine=button"), Err(ParseError::Invalid));
     }
 
@@ -404,7 +415,7 @@ mod tests {
             }
         );
         assert_eq!(parse("internal:text=Alpha"), Err(ParseError::Unsupported));
-        assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
+        assert_eq!(parse("_vue=button"), Err(ParseError::Unsupported));
     }
 
     #[test]
@@ -534,7 +545,7 @@ mod tests {
             parse("data-testid=row >> css=div >> *nth=0 >> css=div"),
             Err(ParseError::Invalid)
         );
-        assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
+        assert_eq!(parse("_react=button"), Err(ParseError::Unsupported));
         assert_eq!(parse("data-k=row"), Err(ParseError::Invalid));
     }
 
@@ -622,9 +633,11 @@ mod tests {
         assert!(parse("text=nth >> *css=div").is_ok());
         // Unsupported and unknown engines keep their existing classification
         // instead of being relabelled by the new capture rule.
+        // `role` is implemented, so the parsed chain reaches the nth+capture
+        // refusal instead of the engine allowlist.
         assert_eq!(
             parse("css=li >> nth=0 >> role=button >> *css=div"),
-            Err(ParseError::Unsupported)
+            Err(ParseError::Invalid)
         );
         assert_eq!(
             parse("css=li >> nth=0 >> text=Hello >> *css=div"),

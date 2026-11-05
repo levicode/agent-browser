@@ -97,7 +97,7 @@ This change affects the negotiated E2E session adapter. It does not change the l
 
 No new value/read authority: full text remains `matcherText`, with the existing secure/protected subtree refusal, no closed-root discovery and no editable value reads. Immediate facts read only direct text nodes after successful full-text policy checks and charge the existing per-root1MiB/aggregate8MiB/work/depth budgets. Noneditable submit/button/reset labels reuse the already acquired full text, not a second value read. A protected/unknown parent is not proof that ordinary descendants fail; lax pruning is only applied to a proven nonmatch. Raw text matcher syntax failures have a private opaque sentinel mapped to backend failure, preserving original public engine failure without returning selector/error payloads. Structural selector errors remain distinct typed InvalidLocator.
 
-Limits remain explicit: empty raw bodies still follow existing local refusal pending a dedicated original/candidate boundary matrix; internal:text and other raw internal/role/extendedCSS engines remain unsupported. This six-observation slice does not close #30/#12, nor claim complete Unicode, malformedbody, nestedframe, security or resource-limit parity solely from source tests. Shared quote/capture/part limits remain in selector.rs; typed wire AST is unchanged. Actual public candidate acceptance is required after integration.
+Limits remain explicit: empty raw bodies still follow existing local refusal pending a dedicated original/candidate boundary matrix; internal:text and other raw internal/extendedCSS engines remain unsupported, and raw role is implemented in its own section below. This six-observation slice does not close #30/#12, nor claim complete Unicode, malformedbody, nestedframe, security or resource-limit parity solely from source tests. Shared quote/capture/part limits remain in selector.rs; typed wire AST is unchanged. Actual public candidate acceptance is required after integration.
 
 ### Bounded raw internal composition increment
 
@@ -114,3 +114,42 @@ The complete pinned CSS parser classifies every CSS part before DOM traversal. A
 The new owner adapter uses this MATCH_QUERY's selected document, issued Element inventory, native structural interfaces and shared work/character limits. Complete authorized light/open structure is proven before native CSS atoms; no query Element grants another root/frame/closed-shadow lease. Text/geometry/output require issued elements, protected text is unavailable through negation, and private values are never newly authorized. Unknown/missing DOM interfaces refuse except the explicit standard absence of shadowRoot on non-Elements. Syntax/invalid-engine-output is opaque backend failure; unavailable and resource-limit remain distinct. Fractional nth-match public taxonomy still needs original measurement, even though undefined output is now rejected as opaque engine failure, never admitted.
 
 Preserve selector-css-NOTICE with the full installed upstream Microsoft/Puppeteer notice and existing attribution. Generated source, source hashes, TS5.9.3/PW1.64.1 generators and pure tests are shipped. Production MATCH_QUERY DOM doubles and module source comparisons are not actual native/browser/public acceptance.
+
+## Raw role engine (original gate e2e#31)
+
+`selector_role_query.js` ports the pinned Playwright 1.64.1 raw `role=` engine. The parser accepts the engine name in `selector.rs`; the typed body stays authored source and is parsed in the renderer exactly like `parseAttributeSelector(body, true)`. The body parser, query, ARIA role computation, hidden rule, accessible name/description computation, state attributes and generated-content contribution are derived from these pinned modules. Hashes are SHA-256 of the injected source string carried by `lib/coreBundle.js`, each segment from the named start through the line before the named end:
+
+- `roleSelectorEngine.ts` through the line before `selectorEvaluator.ts`: `e7e2d574d5f66939343ca0ba40ffe3a1aededb4cbc1506fe219df51e07e6b7cd`
+- `roleUtils.ts` through the line before `ariaSnapshot.ts`: `53516eb98fe2f670364146bb29e9e88bae68b3a77bb254a5e0f2395eb34f8aca`
+- `parseAttributeSelector` through the line before `locatorGenerators.ts`: `8a8e4896d8e483131ec711dee37d181486138c0c68b6fbd8f79b25bcab213677`
+- `matchesAttributePart` through the line before `shouldSkipForTextMatching`: `24ec046319297747e7e10596efd9930667bab1ed4dffc72ab61ea7fa4b1da5c5`
+- `domUtils.ts` through the line before `roleUtils.ts`: `5e3019d0d9457029e663cec92c24884ea83bbc7c2c8d8fb76e6e871104718557`
+- `normalizeWhiteSpace` through the line before `normalizeEscapedRegexQuotes`: `6676d7a20fc579904a9d7eeaffcc0125beaf08ed654beda0fc187a87039d8109`
+
+The engine is registered by Playwright as `role` with `internal=false`: a name string is matched exactly after whitespace normalization unless the `i` flag or a regular expression says otherwise, and only `internal:role` lowers `=` to a substring test. The native adapter implements the public `role` engine; `internal:role` stays an unsupported capability.
+
+### Parsed form and typed body
+
+- `role=<name>` uses the pinned agent lowercase; an empty role name is an invalid locator.
+- The typed body accepts `[selected]`, `[checked]`, `[pressed]`, `[expanded]`, `[level=…]`, `[disabled]`, `[name=…]`, `[description=…]` and `[include-hidden]`, with the pinned `true`/`false`/`mixed` value and operator validation. Unknown attributes, unknown operators, a truthy `name`/`description`, a non-numeric level and a malformed quoted/regexp value are invalid locators, matching the pinned parser's refusals.
+- Quoted strings and regular expressions keep the pinned escaping and flag rules. The body is never interpolated into CSS or code.
+
+### ARIA matching and root rules
+
+- A role part is a descendant query over each current chain root, so `role=button` never returns the document, and `css=section >> role=button` searches inside each section only. This is the pinned "root" rule; Playwright 1.64.1 exposes no `root=` typed attribute, so none is accepted.
+- The query walks light descendants in document order and then each discovered open shadow root, recursively. A host's shadow root is searched even when the chain root is the host element (`css=[data-id=host] >> role=button`). Closed roots are never entered, and a match outside the issued inventory is not admitted.
+- Explicit `role` tokens are intersected with the pinned valid-role list, implicit roles come from the same tag map, and `none`/`presentation` resolve exactly as the pinned conflict rule.
+- With `include-hidden` absent, an element hidden from the accessibility tree (ignored tags, `display:none`, `visibility:hidden`, zero-area, `aria-hidden`, non-slotted shadow content, `display:contents`) does not match. `include-hidden=true` keeps it and also expands the name computation, as pinned.
+- States are read from the pinned native/ARIA rules: `selected`, `checked` (including `mixed` and indeterminate), `pressed`, `expanded`, native/ARIA `disabled`, and `level`. `description` reads `aria-describedby`, `aria-description` then `title`.
+
+### Accessible name
+
+The accessible-name computation is the pinned `getTextAlternativeInternal` graph: `aria-labelledby`, `aria-label`, associated labels, native input/fieldset/figure/table/svg/img alternatives, name from content with non-inline spacing, slot assignment, `aria-owns`, and generated `::before`/`::after` content. Generated content accepts only the token shapes the pinned parser accepts (strings and `attr(<ident>)` after an optional `/` alternative); any other token stream contributes nothing, which is the pinned result. Names are whitespace-normalized before comparison.
+
+### Bounded differences
+
+- This adapter targets Chromium only, so the pinned WebKit listbox-`option` visibility workaround is omitted, matching the existing `visible` engine note.
+- Accessible-name acquisition refuses text and editable values under an existing secure field or a protected ancestor (the same policy `matcherText` already enforces). Playwright would read them. A page that puts a password value or protected text inside a name-bearing element can therefore disagree; the ledger fixture contains no such case and no private value is newly authorized.
+- Recursion is bounded by the existing matcher work budget and a 256-level structural depth; a pathological tree is a resource limit where Playwright has no such bound.
+- The role engine runs only in the existing isolated query realm over already-issued elements; it creates no frame, root, closed-shadow or value authority.
+- `role` is a plain leaf in the existing private raw-chain compiler (`rawInternalPlainEngines`). It is not an `internal:` composition engine, so `internal:role` stays an unsupported capability while a nested `internal:has="role=…"` compiles like any other supported leaf.

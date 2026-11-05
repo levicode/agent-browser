@@ -7,7 +7,7 @@ const rawInternalSelectorUnsupported = {};
 const rawInternalEngines = new Set(['internal:has', 'internal:has-not', 'internal:and', 'internal:or', 'internal:chain']);
 const rawInternalCompiledParts = new WeakSet();
 const rawInternalCompiledCache = new WeakMap();
-const rawInternalPlainEngines = new Set(['css', 'css:light', 'xpath', 'xpath:light', 'nth', 'visible', 'text', 'text:light', 'id', 'id:light', 'data-testid', 'data-testid:light', 'data-test-id', 'data-test-id:light', 'data-test', 'data-test:light']);
+const rawInternalPlainEngines = new Set(['css', 'css:light', 'xpath', 'xpath:light', 'nth', 'visible', 'text', 'text:light', 'role', 'id', 'id:light', 'data-testid', 'data-testid:light', 'data-test-id', 'data-test-id:light', 'data-test', 'data-test:light']);
 function rawInternalCharge(source) {
   if (typeof source !== 'string') throw rawInternalSelectorError;
   let bytes = 0;
