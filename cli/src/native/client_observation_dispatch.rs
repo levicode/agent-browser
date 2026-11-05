@@ -105,6 +105,9 @@ struct ScreenshotFailureWitness {
     generation: u64,
     sequence: u64,
     state: Mutex<ScreenshotFailureState>,
+    started: std::time::Instant,
+    last: Mutex<std::time::Instant>,
+    phases: Mutex<Vec<(&'static str, u64)>>,
     #[cfg(test)]
     receipt_for_test: Option<Arc<Mutex<Option<ScreenshotFailureReceiptForTest>>>>,
 }
@@ -118,13 +121,16 @@ struct ScreenshotFailureState {
     prefix: Option<diagnostic::ObserveInitialPrefix>,
 }
 impl ScreenshotFailureWitness {
-    fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
+    fn new(request: &DispatchRequest, operation: &OperationLease, _enabled: bool) -> Option<Self> {
         let trace = matches!(request, DispatchRequest::TraceSemantic(_))
             || matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)
             || matches!(request, DispatchRequest::Observe(_));
-        (enabled && trace).then(|| Self {
+        trace.then(|| Self {
             generation: operation.generation,
             sequence: operation.sequence,
+            started: std::time::Instant::now(),
+            last: Mutex::new(std::time::Instant::now()),
+            phases: Mutex::new(Vec::new()),
             #[cfg(test)]
             receipt_for_test: None,
             state: Mutex::new(ScreenshotFailureState {
@@ -155,11 +161,29 @@ impl ScreenshotFailureWitness {
         }
     }
     fn enter(&self, stage: ScreenshotStage) {
+        if let Ok(mut last) = self.last.lock() {
+            let now = std::time::Instant::now();
+            let elapsed = now.saturating_duration_since(*last).as_micros() as u64;
+            *last = now;
+            if let Ok(mut phases) = self.phases.lock() {
+                phases.push((stage_name(stage), elapsed));
+            }
+        }
         if let Ok(mut state) = self.state.lock() {
             if state.first.is_none() {
                 state.stage = stage;
             }
         }
+    }
+    fn timing(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        if let Ok(phases) = self.phases.lock() {
+            for (name, micros) in phases.iter() {
+                let current = map.get(*name).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                map.insert((*name).to_owned(), serde_json::Value::from(current + micros));
+            }
+        }
+        serde_json::Value::Object(map)
     }
     fn failure(&self, error: &ProtocolError) {
         if let Ok(mut state) = self.state.lock() {
@@ -306,6 +330,43 @@ impl ScreenshotFailureWitness {
         })
     }
 }
+fn stage_name(stage: ScreenshotStage) -> &'static str {
+    match stage {
+        ScreenshotStage::PrepareScope => "prepare-scope",
+        ScreenshotStage::PreparePermit => "prepare-permit",
+        ScreenshotStage::PreparePolicy => "prepare-policy",
+        ScreenshotStage::PrepareOwner => "prepare-owner",
+        ScreenshotStage::PrepareFence => "prepare-fence",
+        ScreenshotStage::RunScope => "run-scope",
+        ScreenshotStage::DebtAdmission => "debt-admission",
+        ScreenshotStage::UiAdmission => "ui-admission",
+        ScreenshotStage::PublicationAdmission => "publication-admission",
+        ScreenshotStage::ProducerReservation => "producer-reservation",
+        ScreenshotStage::InitialFrames => "initial-frames",
+        ScreenshotStage::FrameInventoryFence => "frame-inventory-fence",
+        ScreenshotStage::ProtectedBarrier => "protected-barrier",
+        ScreenshotStage::AnimationStabilization => "animation-stabilization",
+        ScreenshotStage::ProtectedFrames => "protected-frames",
+        ScreenshotStage::Geometry => "geometry",
+        ScreenshotStage::TraceMetadata => "trace-metadata",
+        ScreenshotStage::SemanticViewport => "semantic-viewport",
+        ScreenshotStage::SemanticMetadata => "semantic-metadata",
+        ScreenshotStage::SemanticFrameGeometry => "semantic-frame-geometry",
+        ScreenshotStage::SemanticNodeGeometry => "semantic-node-geometry",
+        ScreenshotStage::SemanticDocumentRoot => "semantic-document-root",
+        ScreenshotStage::SemanticFinalViewport => "semantic-final-viewport",
+        ScreenshotStage::Capture => "capture",
+        ScreenshotStage::Restoration => "restoration",
+        ScreenshotStage::FinalGeometry => "final-geometry",
+        ScreenshotStage::FinalBarrier => "final-barrier",
+        ScreenshotStage::FinalScope => "final-scope",
+        ScreenshotStage::FinalFrames => "final-frames",
+        ScreenshotStage::FinalViewport => "final-viewport",
+        ScreenshotStage::BlobPublication => "blob-publication",
+        ScreenshotStage::Publication => "publication",
+    }
+}
+
 fn screenshot_stage(witness: Option<&ScreenshotFailureWitness>, stage: ScreenshotStage) {
     if let Some(witness) = witness {
         witness.enter(stage);
@@ -1120,6 +1181,7 @@ impl ObservationDispatch {
                 matches!(&request, DispatchRequest::Observe(request) if request.options.pixels);
             let diagnostic_generation = operation.generation;
             let diagnostic_sequence = operation.sequence;
+            let observation_request = matches!(&request, DispatchRequest::Observe(_) | DispatchRequest::TraceSemantic(_));
             let run = self.run(
                 context,
                 request,
@@ -1149,6 +1211,13 @@ impl ObservationDispatch {
                         .is_ok_and(|output| output.value.get("pixels").is_some()),
                     task_receipt.sealed.load(Ordering::Acquire),
                 );
+            }
+            if let Ok(output) = &mut output {
+                if observation_request {
+                    if let Some(witness) = screenshot.as_ref() {
+                        output.value["phases"] = witness.timing();
+                    }
+                }
             }
             if let Some(witness) = screenshot {
                 if let Err(failure) = &output {
