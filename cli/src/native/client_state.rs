@@ -9,12 +9,12 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_ORIGINS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
     InvalidInput,
+    CapacityExceeded,
     IncompleteInventory,
     UnsupportedValue,
     Cancelled,
@@ -59,10 +59,12 @@ fn cleanup_outcome<T>(
 struct CountingWriter {
     used: usize,
     limit: usize,
+    overflow: bool,
 }
 impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.limit.saturating_sub(self.used) {
+            self.overflow = true;
             return Err(io::Error::other("State size limit exceeded"));
         }
         self.used += bytes.len();
@@ -72,9 +74,20 @@ impl Write for CountingWriter {
         Ok(())
     }
 }
+fn size_error(writer: &CountingWriter) -> StateError {
+    if writer.overflow {
+        StateError::CapacityExceeded
+    } else {
+        StateError::InvalidInput
+    }
+}
 fn serialized_size(value: &impl Serialize, limit: usize) -> Result<usize, StateError> {
-    let mut writer = CountingWriter { used: 0, limit };
-    serde_json::to_writer(&mut writer, value).map_err(|_| StateError::InvalidInput)?;
+    let mut writer = CountingWriter {
+        used: 0,
+        limit,
+        overflow: false,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| size_error(&writer))?;
     Ok(writer.used)
 }
 struct StateSize {
@@ -101,13 +114,12 @@ impl StateSize {
         let mut writer = CountingWriter {
             used: self.used,
             limit: self.limit,
+            overflow: false,
         };
         if comma {
-            writer
-                .write_all(b",")
-                .map_err(|_| StateError::InvalidInput)?;
+            writer.write_all(b",").map_err(|_| size_error(&writer))?;
         }
-        serde_json::to_writer(&mut writer, value).map_err(|_| StateError::InvalidInput)?;
+        serde_json::to_writer(&mut writer, value).map_err(|_| size_error(&writer))?;
         self.used = writer.used;
         Ok(())
     }
@@ -306,7 +318,6 @@ pub(crate) fn validate_state(state: &NativeState) -> Result<(), StateError> {
     if state.version != 1 || state.origins.len() > MAX_ORIGINS {
         return Err(StateError::InvalidInput);
     }
-    serialized_size(state, MAX_STATE_BYTES)?;
     let mut origins = HashSet::new();
     for item in &state.origins {
         origin(&item.origin)?;
@@ -328,6 +339,15 @@ pub(crate) fn validate_state(state: &NativeState) -> Result<(), StateError> {
     Ok(())
 }
 
+/// Structural validation plus the serialized-size ceiling of the channel that
+/// will carry the state. Import uses the channel's existing blob limit, so a
+/// converted legacy payload cannot expand past what the transfer can publish.
+pub(crate) fn validate_state_within(state: &NativeState, limit: usize) -> Result<(), StateError> {
+    validate_state(state)?;
+    serialized_size(state, limit)?;
+    Ok(())
+}
+
 /// A synthetic, intercepted document with an origin but no application script.
 /// The lifecycle owner must classify all targets created during this exclusive
 /// transaction as bootstrap targets, never hand their requests to user routes.
@@ -345,11 +365,19 @@ impl Drop for PrivateSubscription<'_> {
     }
 }
 async fn close_bootstrap(context: &NativeStateContext<'_>, target: &str) -> Result<(), StateError> {
-    retire_native_bootstrap_target(
-        context.client,
-        context.targets,
-        target,
-        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    // A state bootstrap page is a synthetic native document. Its creation,
+    // navigation and retirement must never be recorded as an application
+    // mutation; otherwise a read-only export that fails after cleanup would be
+    // reported as an unknown outcome to the caller.
+    super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationObject,
+        false,
+        retire_native_bootstrap_target(
+            context.client,
+            context.targets,
+            target,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        ),
     )
     .await
 }
@@ -439,12 +467,16 @@ async fn bootstrap(
     // uncertainty for the lifecycle owner. An isolated replacement may be
     // disposed; a borrowed host context/page must never be closed to hide an
     // unknown temporary target. Borrowed failure quarantines our connection.
-    let created = command(
-        context.client,
-        None,
-        "Target.createTarget",
-        json!({"url":"about:blank","browserContextId":context.context_id}),
-        operation,
+    let created = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationObject,
+        false,
+        command(
+            context.client,
+            None,
+            "Target.createTarget",
+            json!({"url":"about:blank","browserContextId":context.context_id}),
+            operation,
+        ),
     )
     .await
     .map_err(|error| StateFailure {
@@ -464,83 +496,91 @@ async fn bootstrap(
             error: StateError::IncompleteInventory,
             cleanup_integrity_lost: true,
         })?;
-    let result: Result<Bootstrap, StateError> = async {
-        let info = command(context.client, None, "Target.getTargetInfo", json!({"targetId":target}), operation).await?;
-        let info = info.get("targetInfo").ok_or(StateError::BrowserFailure)?;
-        if info.get("targetId").and_then(Value::as_str) != Some(target.as_str()) { return Err(StateError::IncompleteInventory); }
-        reservation.acknowledge_native_created_target(info).map_err(|_|StateError::IncompleteInventory)?;
-        let mut cancellation=operation.cancellation.clone();
-        tokio::select! {
-            result=context.targets.wait_attached(&target)=>result.map_err(|_|StateError::IncompleteInventory)?,
-            _=cancellation.changed()=>return Err(StateError::Cancelled),
-            _=tokio::time::sleep_until(operation.deadline.into())=>return Err(StateError::Deadline),
-        }
-        reservation.claim(&target).map_err(|_|StateError::IncompleteInventory)?;
-        let attachment=context.targets.owned_target(&target).map_err(|_|StateError::IncompleteInventory)?;
-        if attachment.kind!="page" || attachment.purpose!=Some(TargetPurpose::StateBootstrap) {return Err(StateError::IncompleteInventory);}
-        let session=attachment.session_id;
-        if let Some(debt) = context.client.debt_ledger() {
-            if debt.initialization_deadline("Target.createTarget").is_some() {
-                debt.bind_state_bootstrap(&target, &session).map_err(|_| StateError::IncompleteInventory)?;
-            }
-        }
-        drop(reservation);
-        command(context.client, Some(&session), "Page.enable", json!({}), operation).await?;
-        command(context.client, Some(&session), "Page.setLifecycleEventsEnabled", json!({"enabled":true}), operation).await?;
-        command(context.client, Some(&session), "Network.enable", json!({}), operation).await?;
-        command(context.client, Some(&session), "Network.setBypassServiceWorker", json!({"bypass":true}), operation).await?;
-        // Session-private delivery is bounded; no unrelated tenant events enter
-        // this receiver. The native registry reserves this target to state IO.
-        let mut events = context.client.subscribe_session(&session);
-        let _subscription = PrivateSubscription { client: context.client, session: &session };
-        command(context.client, Some(&session), "Fetch.enable", json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]}), operation).await?;
-        context.targets.configured(&target).map_err(|_|StateError::IncompleteInventory)?;
-        let resume=tokio::select! {
-            result=context.targets.resume_permit(&target)=>result.map_err(|_|StateError::IncompleteInventory)?,
-            _=cancellation.changed()=>return Err(StateError::Cancelled),
-            _=tokio::time::sleep_until(operation.deadline.into())=>return Err(StateError::Deadline),
-        };
-        command(context.client,Some(&session),"Runtime.runIfWaitingForDebugger",json!({}),operation).await?;
-        resume.complete().map_err(|_|StateError::IncompleteInventory)?;
-        let url = format!("{origin}/__agent_browser_state_bootstrap__");
-        let navigate = command(context.client, Some(&session), "Page.navigate", json!({"url":url}), operation);
-        tokio::pin!(navigate);
-        let mut fulfilled = false;
-        let mut navigation: Option<Value> = None;
-        let mut loaded = HashSet::new();
-        let mut cancelled = operation.cancellation.clone();
-        let result = loop {
-            if let Some(result) = &navigation {
-                if result.get("errorText").is_some() { break Err(StateError::BrowserFailure); }
-                if result["loaderId"].as_str().is_some_and(|id| loaded.contains(id)) { break Ok(result.clone()); }
-            }
+    // Every command in this synthetic document is native setup, not an
+    // application mutation. A caller-visible failure must remain a clean
+    // non-dispatch even though a bootstrap page was created and navigated.
+    let result: Result<Bootstrap, StateError> = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationObject,
+        false,
+        async {
+            let info = command(context.client, None, "Target.getTargetInfo", json!({"targetId":target}), operation).await?;
+            let info = info.get("targetInfo").ok_or(StateError::BrowserFailure)?;
+            if info.get("targetId").and_then(Value::as_str) != Some(target.as_str()) { return Err(StateError::IncompleteInventory); }
+            reservation.acknowledge_native_created_target(info).map_err(|_|StateError::IncompleteInventory)?;
+            let mut cancellation=operation.cancellation.clone();
             tokio::select! {
-                result = &mut navigate, if navigation.is_none() => navigation = Some(result?),
-                _ = cancelled.changed() => break Err(StateError::Cancelled),
-                _ = tokio::time::sleep_until(operation.deadline.into()) => break Err(StateError::Deadline),
-                event = events.recv() => {
-                    let event = event.ok_or(StateError::BrowserFailure)?;
-                    if event.method == "Page.lifecycleEvent" && event.params["name"].as_str() == Some("DOMContentLoaded") {
-                        if let Some(loader) = event.params["loaderId"].as_str() { loaded.insert(loader.to_owned()); }
-                        continue;
-                    }
-                    if event.method != "Fetch.requestPaused" { continue; }
-                    let id = event.params["requestId"].as_str().ok_or(StateError::BrowserFailure)?;
-                    if fulfilled || event.params["request"]["url"].as_str() != Some(&url) || event.params["resourceType"].as_str() != Some("Document") {
-                        command(context.client, Some(&session), "Fetch.failRequest", json!({"requestId":id,"errorReason":"BlockedByClient"}), operation).await?;
-                        return Err(StateError::BrowserFailure);
-                    }
-                    command(context.client, Some(&session), "Fetch.fulfillRequest", json!({"requestId":id,"responseCode":200,"responseHeaders":[{"name":"Content-Type","value":"text/html"},{"name":"Content-Security-Policy","value":"default-src 'none'; script-src 'none'"}],"body":"PCFkb2N0eXBlIGh0bWw+PHRpdGxlPjwvdGl0bGU+"}), operation).await?;
-                    fulfilled = true;
+                result=context.targets.wait_attached(&target)=>result.map_err(|_|StateError::IncompleteInventory)?,
+                _=cancellation.changed()=>return Err(StateError::Cancelled),
+                _=tokio::time::sleep_until(operation.deadline.into())=>return Err(StateError::Deadline),
+            }
+            reservation.claim(&target).map_err(|_|StateError::IncompleteInventory)?;
+            let attachment=context.targets.owned_target(&target).map_err(|_|StateError::IncompleteInventory)?;
+            if attachment.kind!="page" || attachment.purpose!=Some(TargetPurpose::StateBootstrap) {return Err(StateError::IncompleteInventory);}
+            let session=attachment.session_id;
+            if let Some(debt) = context.client.debt_ledger() {
+                if debt.initialization_deadline("Target.createTarget").is_some() {
+                    debt.bind_state_bootstrap(&target, &session).map_err(|_| StateError::IncompleteInventory)?;
                 }
             }
-        }?;
-        context.client.unsubscribe_session(&session);
-        if !fulfilled || result.get("errorText").is_some() { return Err(StateError::BrowserFailure); }
-        // Fetch stays enabled until this target closes. No favicon or unexpected
-        // resource is ever allowed to escape to the real network.
-        Ok(Bootstrap { target: target.clone(), session: session.clone() })
-    }.await;
+            drop(reservation);
+            command(context.client, Some(&session), "Page.enable", json!({}), operation).await?;
+            command(context.client, Some(&session), "Page.setLifecycleEventsEnabled", json!({"enabled":true}), operation).await?;
+            command(context.client, Some(&session), "Network.enable", json!({}), operation).await?;
+            command(context.client, Some(&session), "Network.setBypassServiceWorker", json!({"bypass":true}), operation).await?;
+            // Session-private delivery is bounded; no unrelated tenant events enter
+            // this receiver. The native registry reserves this target to state IO.
+            let mut events = context.client.subscribe_session(&session);
+            let _subscription = PrivateSubscription { client: context.client, session: &session };
+            command(context.client, Some(&session), "Fetch.enable", json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]}), operation).await?;
+            context.targets.configured(&target).map_err(|_|StateError::IncompleteInventory)?;
+            let resume=tokio::select! {
+                result=context.targets.resume_permit(&target)=>result.map_err(|_|StateError::IncompleteInventory)?,
+                _=cancellation.changed()=>return Err(StateError::Cancelled),
+                _=tokio::time::sleep_until(operation.deadline.into())=>return Err(StateError::Deadline),
+            };
+            command(context.client,Some(&session),"Runtime.runIfWaitingForDebugger",json!({}),operation).await?;
+            resume.complete().map_err(|_|StateError::IncompleteInventory)?;
+            let url = format!("{origin}/__agent_browser_state_bootstrap__");
+            let navigate = command(context.client, Some(&session), "Page.navigate", json!({"url":url}), operation);
+            tokio::pin!(navigate);
+            let mut fulfilled = false;
+            let mut navigation: Option<Value> = None;
+            let mut loaded = HashSet::new();
+            let mut cancelled = operation.cancellation.clone();
+            let result = loop {
+                if let Some(result) = &navigation {
+                    if result.get("errorText").is_some() { break Err(StateError::BrowserFailure); }
+                    if result["loaderId"].as_str().is_some_and(|id| loaded.contains(id)) { break Ok(result.clone()); }
+                }
+                tokio::select! {
+                    result = &mut navigate, if navigation.is_none() => navigation = Some(result?),
+                    _ = cancelled.changed() => break Err(StateError::Cancelled),
+                    _ = tokio::time::sleep_until(operation.deadline.into()) => break Err(StateError::Deadline),
+                    event = events.recv() => {
+                        let event = event.ok_or(StateError::BrowserFailure)?;
+                        if event.method == "Page.lifecycleEvent" && event.params["name"].as_str() == Some("DOMContentLoaded") {
+                            if let Some(loader) = event.params["loaderId"].as_str() { loaded.insert(loader.to_owned()); }
+                            continue;
+                        }
+                        if event.method != "Fetch.requestPaused" { continue; }
+                        let id = event.params["requestId"].as_str().ok_or(StateError::BrowserFailure)?;
+                        if fulfilled || event.params["request"]["url"].as_str() != Some(&url) || event.params["resourceType"].as_str() != Some("Document") {
+                            command(context.client, Some(&session), "Fetch.failRequest", json!({"requestId":id,"errorReason":"BlockedByClient"}), operation).await?;
+                            return Err(StateError::BrowserFailure);
+                        }
+                        command(context.client, Some(&session), "Fetch.fulfillRequest", json!({"requestId":id,"responseCode":200,"responseHeaders":[{"name":"Content-Type","value":"text/html"},{"name":"Content-Security-Policy","value":"default-src 'none'; script-src 'none'"}],"body":"PCFkb2N0eXBlIGh0bWw+PHRpdGxlPjwvdGl0bGU+"}), operation).await?;
+                        fulfilled = true;
+                    }
+                }
+            }?;
+            context.client.unsubscribe_session(&session);
+            if !fulfilled || result.get("errorText").is_some() { return Err(StateError::BrowserFailure); }
+            // Fetch stays enabled until this target closes. No favicon or unexpected
+            // resource is ever allowed to escape to the real network.
+            Ok(Bootstrap { target: target.clone(), session: session.clone() })
+        },
+    )
+    .await;
     match result {
         Ok(page) => Ok(page),
         Err(error) => cleanup_outcome(Err(error), close_bootstrap(context, &target).await),
@@ -623,6 +663,7 @@ async fn evaluate(
 pub async fn export_state(
     context: &NativeStateContext<'_>,
     operation: &OperationLease,
+    limit: usize,
 ) -> Result<NativeState, StateFailure> {
     validate_context(context)?;
     let value = command(
@@ -636,7 +677,7 @@ pub async fn export_state(
     let source_cookies = value["cookies"]
         .as_array()
         .ok_or(StateError::BrowserFailure)?;
-    let mut size = StateSize::new(MAX_STATE_BYTES)?;
+    let mut size = StateSize::new(limit)?;
     for cookie in source_cookies {
         size.cookie(cookie)?;
         cookie_parameters(cookie)?;
@@ -649,7 +690,7 @@ pub async fn export_state(
         let result = evaluate(
             context,
             &page,
-            format!("({STATE_SCRIPT})('export', null)"),
+            format!("({STATE_SCRIPT})('export', {limit})"),
             true,
             operation,
         )
@@ -821,7 +862,7 @@ const STATE_SCRIPT: &str = r#"async function(mode, input) {
     result.indexedDb.push(saved);
    } finally { db.close(); }
   }
-  if(JSON.stringify(result).length>33554432)fail();return result;
+  if(!Number.isSafeInteger(input)||JSON.stringify(result).length>input)fail();return result;
  }
  if(mode!=='import'||!input||input.origin!==location.origin||!Array.isArray(input.localStorage)||!Array.isArray(input.indexedDb))fail();
  // Decode and validate the whole origin before its first persistent write.
@@ -849,7 +890,6 @@ const STATE_SCRIPT: &str = r#"async function(mode, input) {
 /// Import the former public engine envelope's DATA only. This is a validated
 /// format conversion, not a Playwright runtime or a relabelled native snapshot.
 pub fn convert_playwright_state(input: Value) -> Result<NativeState, StateError> {
-    serialized_size(&input, MAX_STATE_BYTES)?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Legacy {
@@ -1194,9 +1234,6 @@ impl LegacyGraph {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|_| StateError::InvalidInput)?;
-                if bytes.len() > MAX_STATE_BYTES {
-                    return Err(StateError::InvalidInput);
-                }
                 let buffer = self.tagged(json!({"t":"buffer","data":data}))?;
                 if tag == "ab" {
                     return Ok(buffer);
@@ -1341,7 +1378,7 @@ mod tests {
         budget.cookie(&cookie).unwrap();
         budget.origin(&first).unwrap();
         let before = budget.used;
-        assert_eq!(budget.origin(&second), Err(StateError::InvalidInput));
+        assert_eq!(budget.origin(&second), Err(StateError::CapacityExceeded));
         assert_eq!(budget.used, before);
         assert_eq!(budget.origins, 1);
         let mut budget = StateSize::new(exact).unwrap();
@@ -1353,7 +1390,7 @@ mod tests {
         assert_eq!(serialized_size(&state, exact).unwrap(), exact);
         assert_eq!(
             serialized_size(&state, exact - 1),
-            Err(StateError::InvalidInput)
+            Err(StateError::CapacityExceeded)
         );
 
         let cookies = NativeState {
@@ -1363,8 +1400,31 @@ mod tests {
         };
         let mut budget = StateSize::new(serde_json::to_vec(&cookies).unwrap().len() - 1).unwrap();
         budget.cookie(&cookie).unwrap();
-        assert_eq!(budget.cookie(&cookie), Err(StateError::InvalidInput));
+        assert_eq!(budget.cookie(&cookie), Err(StateError::CapacityExceeded));
         assert_eq!(budget.cookies, 1);
+    }
+    #[test]
+    fn state_origin_cap_remains_one_thousand_twenty_four() {
+        let mut origins: Vec<OriginState> = (0..=MAX_ORIGINS)
+            .map(|index| OriginState {
+                origin: format!("https://origin-{index}.invalid"),
+                local_storage: Vec::new(),
+                indexed_db: json!([]),
+            })
+            .collect();
+        let over = NativeState {
+            version: 1,
+            cookies: Vec::new(),
+            origins: origins.clone(),
+        };
+        assert_eq!(validate_state(&over), Err(StateError::InvalidInput));
+        origins.pop();
+        let capped = NativeState {
+            version: 1,
+            cookies: Vec::new(),
+            origins,
+        };
+        assert_eq!(validate_state(&capped), Ok(()));
     }
     #[tokio::test]
     async fn native_bootstrap_cleanup_retains_failed_ack_and_never_closes_host() {
@@ -1491,7 +1551,10 @@ mod tests {
             cancellation,
         };
         assert_eq!(
-            export_state(&context, &operation).await.err().unwrap(),
+            export_state(&context, &operation, 64 * 1024 * 1024)
+                .await
+                .err()
+                .unwrap(),
             StateFailure {
                 error: StateError::Deadline,
                 cleanup_integrity_lost: true
@@ -1816,6 +1879,7 @@ mod tests {
                             ..context
                         },
                         &operation,
+                        64 * 1024 * 1024,
                     )
                     .await
                 } else {

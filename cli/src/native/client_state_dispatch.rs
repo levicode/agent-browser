@@ -17,8 +17,6 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
-
 /// Supplied from lifecycle ownership, never decoded from a request. A nonempty
 /// context ID does not prove isolation: persistent default contexts have IDs.
 /// Persistent authority permits capture only, never replacement/import.
@@ -157,6 +155,7 @@ impl StateDispatchFailure {
         Self {
             error: match error {
                 StateError::InvalidInput => ProtocolError::InvalidArguments,
+                StateError::CapacityExceeded => ProtocolError::CapacityExceeded,
                 StateError::IncompleteInventory => ProtocolError::ScopeUnavailable,
                 StateError::UnsupportedValue => ProtocolError::UnsupportedCapability,
                 StateError::Cancelled => ProtocolError::Cancelled,
@@ -224,22 +223,21 @@ pub async fn capture_state(
     if scope.identity_scope != context.page.identity_scope {
         return Err(context.failure(ProtocolError::StaleScope));
     }
-    // The primitive may collect up to its fixed logical state limit. A
-    // smaller producer reservation cannot cover that collection, even if the
-    // eventual snapshot would happen to fit. Refuse before the first CDP call.
-    if blobs.producer_limit() < MAX_STATE_BYTES {
-        return Err(context.failure(ProtocolError::CapacityExceeded));
-    }
+    // The state body is bounded by the same blob channel that carries it.
+    // A producer reserves that channel's ceiling before any export RPC, and
+    // the serialized snapshot is written once into the published blob; the
+    // caller reads it in MAX_CHUNK_BYTES chunks through blob.read.
+    let limit = blobs.producer_limit();
     let producer = blobs
         .reserve_producer(scope.clone())
         .map_err(|error| context.failure(blob_error(error)))?;
-    let state = client_state::export_state(&context.context, operation)
+    let state = client_state::export_state(&context.context, operation, limit)
         .await
         .map_err(|error| context.capture_failure(error))?;
     context.check(operation)?;
     let mut writer = BoundedWriter {
         bytes: Vec::new(),
-        limit: MAX_STATE_BYTES,
+        limit,
     };
     serde_json::to_writer(&mut writer, &state)
         .map_err(|_| context.failure(ProtocolError::CapacityExceeded))?;
@@ -344,22 +342,30 @@ pub fn prepare_restore<'a>(
     let body = blobs
         .borrow_sealed(scope, &request.body_handle)
         .map_err(|error| failure(blob_error(error)))?;
-    if body.bytes().len() > MAX_STATE_BYTES {
-        return Err(failure(ProtocolError::CapacityExceeded));
-    }
     let StrictValue(value) = serde_json::from_slice(body.bytes())
         .map_err(|_| failure(ProtocolError::InvalidArguments))?;
+    // The sealed body already fits the blob channel; re-check the decoded
+    // (and possibly converted) state against the same ceiling so a legacy
+    // graph cannot expand past what the transfer can publish.
+    let limit = blobs.producer_limit();
     let state = match request.format {
         StateFormat::Native => {
             let state: NativeState = serde_json::from_value(value)
                 .map_err(|_| failure(ProtocolError::InvalidArguments))?;
-            client_state::validate_state(&state).map_err(|error| {
+            client_state::validate_state_within(&state, limit).map_err(|error| {
                 StateDispatchFailure::state(&scope.identity_scope, error, false)
             })?;
             state
         }
-        StateFormat::Playwright => client_state::convert_playwright_state(value)
-            .map_err(|error| StateDispatchFailure::state(&scope.identity_scope, error, false))?,
+        StateFormat::Playwright => {
+            let state = client_state::convert_playwright_state(value).map_err(|error| {
+                StateDispatchFailure::state(&scope.identity_scope, error, false)
+            })?;
+            client_state::validate_state_within(&state, limit).map_err(|error| {
+                StateDispatchFailure::state(&scope.identity_scope, error, false)
+            })?;
+            state
+        }
     };
     check_scope(scope, operation).map_err(failure)?;
     Ok(PreparedRestore {
@@ -713,6 +719,7 @@ mod tests {
         page: BrowserExecutionLease,
         ui: Arc<UiGate>,
         log: Arc<Mutex<Vec<String>>>,
+        cookie_bytes: Arc<std::sync::atomic::AtomicUsize>,
         poison_on_capture: Arc<std::sync::atomic::AtomicBool>,
         reject_bootstrap_create: Arc<std::sync::atomic::AtomicBool>,
         server: tokio::task::JoinHandle<()>,
@@ -727,10 +734,19 @@ mod tests {
             Self::named(fail_import, "scope").await
         }
         async fn named(fail_import: bool, identity_scope: &str) -> Self {
+            Self::with_cookie_bytes(fail_import, identity_scope, 0).await
+        }
+        async fn with_cookie_bytes(
+            fail_import: bool,
+            identity_scope: &str,
+            cookie_bytes: usize,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let log = Arc::new(Mutex::new(Vec::new()));
             let commands = log.clone();
+            let cookie_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(cookie_bytes));
+            let capture_cookie_bytes = cookie_bytes.clone();
             let poison_on_capture = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let poison = poison_on_capture.clone();
             let reject_bootstrap_create = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -755,7 +771,13 @@ mod tests {
                                 if poison.load(std::sync::atomic::Ordering::SeqCst) {
                                     event_targets.seal();
                                 }
-                                json!({"cookies":[]})
+                                let bytes =
+                                    capture_cookie_bytes.load(std::sync::atomic::Ordering::SeqCst);
+                                if bytes == 0 {
+                                    json!({"cookies":[]})
+                                } else {
+                                    json!({"cookies":[{"name":"synthetic","value":"x".repeat(bytes),"domain":"fixture.invalid","path":"/"}]})
+                                }
                             }
                             "Storage.setCookies" => json!({}),
                             _ => panic!("Unexpected synthetic CDP method"),
@@ -785,6 +807,7 @@ mod tests {
                     targets,
                 },
                 ui: Arc::new(UiGate::default()),
+                cookie_bytes,
                 log,
                 poison_on_capture,
                 reject_bootstrap_create,
@@ -823,7 +846,15 @@ mod tests {
         let (_cancel, op) = operation();
         let permit = harness.exclusive(&op).await;
         let context = harness.captured(&permit);
-        let too_small = store();
+        // A channel that cannot hold even the empty state is refused after
+        // cookies are read; no blob is published.
+        let too_small = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 8,
+            max_handles: 8,
+        })
+        .unwrap();
+        too_small.activate_scope(scope()).unwrap();
         assert_eq!(
             capture_state(&context, &too_small, &scope(), &op)
                 .await
@@ -832,16 +863,11 @@ mod tests {
                 .error,
             ProtocolError::CapacityExceeded
         );
-        assert!(harness.log.lock().unwrap().is_empty());
-        // Reservation accounting only: no 32 MiB buffer or payload allocated.
-        let blobs = BlobStore::new(BlobLimits {
-            max_blob_bytes: MAX_STATE_BYTES,
-            max_total_bytes: MAX_STATE_BYTES,
-            max_handles: 8,
-        })
-        .unwrap();
-        blobs.activate_scope(scope()).unwrap();
-        let occupied = blobs.insert_sealed(scope(), b"synthetic").unwrap();
+        assert_eq!(*harness.log.lock().unwrap(), ["Storage.getCookies"]);
+        harness.log.lock().unwrap().clear();
+        // A full channel refuses the reservation before the first CDP call.
+        let blobs = store();
+        let occupied = blobs.insert_sealed(scope(), &[0u8; 4096]).unwrap();
         assert_eq!(
             capture_state(&context, &blobs, &scope(), &op)
                 .await
@@ -871,6 +897,97 @@ mod tests {
             json!({"version":1,"cookies":[],"origins":[]})
         );
         blobs.release(&scope(), &captured.blob.handle).unwrap();
+    }
+    #[tokio::test]
+    async fn capture_and_restore_transfer_state_above_the_former_32_mib_clamp() {
+        const STATE_BYTES: usize = 32 * 1024 * 1024 + 1024;
+        let harness = Harness::with_cookie_bytes(false, "scope", STATE_BYTES).await;
+        let (_cancel, mut op) = operation();
+        // Serializing, hashing and parsing 32 MiB in a debug test build can
+        // take longer than the harness's ordinary five-second lease.
+        op.deadline = Instant::now() + std::time::Duration::from_secs(120);
+        let permit = harness.exclusive(&op).await;
+        let context = harness.captured(&permit);
+        let blobs = BlobStore::new(BlobLimits {
+            max_blob_bytes: 64 * 1024 * 1024,
+            max_total_bytes: 128 * 1024 * 1024,
+            max_handles: 8,
+        })
+        .unwrap();
+        blobs.activate_scope(scope()).unwrap();
+        let captured = capture_state(&context, &blobs, &scope(), &op)
+            .await
+            .unwrap();
+        assert!(captured.blob.size > 32 * 1024 * 1024);
+        let lease = blobs
+            .borrow_sealed(&scope(), &captured.blob.handle)
+            .unwrap();
+        let state: NativeState = serde_json::from_slice(lease.bytes()).unwrap();
+        assert_eq!(
+            state.cookies[0]["value"].as_str().unwrap().len(),
+            STATE_BYTES
+        );
+        drop(lease);
+        // The sealed restore body is read through the same blob channel, so an
+        // input above the former 32 MiB state clamp is accepted and consumed.
+        let prepared = prepare_restore(
+            &blobs,
+            &scope(),
+            &request(&captured.blob.handle, NATIVE_FORMAT),
+            &op,
+        )
+        .unwrap();
+        let accepted = prepared.accept(&op).unwrap();
+        assert_eq!(accepted.origins().count(), 0);
+        assert_eq!(
+            blobs.release(&scope(), &captured.blob.handle),
+            Err(BlobError::Missing)
+        );
+    }
+    #[tokio::test]
+    async fn synthetic_state_bootstrap_is_not_an_application_mutation() {
+        let harness = Harness::new(false).await;
+        let (_cancel, op) = operation();
+        let permit = harness.exclusive(&op).await;
+        let origins = ["https://fixture.invalid".to_owned()];
+        let context = CapturedStateContext::new(
+            &harness.page,
+            &harness.ui,
+            &permit,
+            harness.native(&origins, true),
+            StateContextKind::Isolated,
+        )
+        .unwrap();
+        harness
+            .reject_bootstrap_create
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        harness
+            .page
+            .client
+            .install_debt_ledger(ledger.clone())
+            .unwrap();
+        let journal = ledger
+            .operation(
+                super::super::client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&op).unwrap();
+        let blobs = store();
+        let failure = journal
+            .scope(capture_state(&context, &blobs, &scope(), &op))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::BrowserFailure);
+        // The synthetic bootstrap target was created, navigated and retired,
+        // but a failed read-only export must settle as not-dispatched.
+        assert!(!journal.snapshot().mutation_dispatched);
+        assert!(blobs.reserve_producer(scope()).is_ok());
     }
     #[tokio::test]
     async fn capture_requires_exclusive_exact_gate_complete_context() {
@@ -978,23 +1095,7 @@ mod tests {
             StateContextKind::Persistent,
         )
         .unwrap();
-        // Even borrowed capture reserves the full shared logical-state budget
-        // before any export RPC. This is accounting, not a large allocation.
-        assert_eq!(
-            capture_state(&context, &store(), &scope(), &op)
-                .await
-                .unwrap_err()
-                .error,
-            ProtocolError::CapacityExceeded
-        );
-        assert!(harness.log.lock().unwrap().is_empty());
-        let blobs = BlobStore::new(BlobLimits {
-            max_blob_bytes: MAX_STATE_BYTES,
-            max_total_bytes: MAX_STATE_BYTES,
-            max_handles: 8,
-        })
-        .unwrap();
-        blobs.activate_scope(scope()).unwrap();
+        let blobs = store();
         let captured = capture_state(&context, &blobs, &scope(), &op)
             .await
             .unwrap();
@@ -1035,13 +1136,7 @@ mod tests {
             harness
                 .reject_bootstrap_create
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let blobs = BlobStore::new(BlobLimits {
-                max_blob_bytes: MAX_STATE_BYTES,
-                max_total_bytes: MAX_STATE_BYTES,
-                max_handles: 8,
-            })
-            .unwrap();
-            blobs.activate_scope(scope()).unwrap();
+            let blobs = store();
             let failure = capture_state(&context, &blobs, &scope(), &op)
                 .await
                 .unwrap_err();
@@ -1209,13 +1304,7 @@ mod tests {
         harness
             .poison_on_capture
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let blobs = BlobStore::new(BlobLimits {
-            max_blob_bytes: MAX_STATE_BYTES,
-            max_total_bytes: MAX_STATE_BYTES,
-            max_handles: 8,
-        })
-        .unwrap();
-        blobs.activate_scope(scope()).unwrap();
+        let blobs = store();
         let failure = capture_state(&context, &blobs, &scope(), &op)
             .await
             .err()
