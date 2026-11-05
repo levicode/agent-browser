@@ -1808,10 +1808,11 @@ impl ObservationDispatch {
                 .await?;
                 same_frames(&context.frames, &frames)?;
                 screenshot_stage(screenshot, ScreenshotStage::Geometry);
-                let geometry = GeometrySnapshot::capture(
+                let geometry = observe_geometry_snapshot(
                     &context.page.client,
                     &context.page.page_session_id,
                     &frames,
+                    &context.opaque_frames,
                     &pixel_operation,
                 )
                 .await
@@ -3214,7 +3215,7 @@ async fn fresh_fallback<'a>(
         journal.stabilize_animations().await.map_err(protected_error)?;
         let frozen = verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup)).await?;
         same_frames(&context.frames, &frozen)?;
-        geometry = Some(GeometrySnapshot::capture(&context.page.client, &context.page.page_session_id, &frozen, operation).await.map_err(geometry_error)?);
+        geometry = Some(observe_geometry_snapshot(&context.page.client, &context.page.page_session_id, &frozen, &context.opaque_frames, operation).await.map_err(geometry_error)?);
         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
         let root = minimal_document(&context.page, &frozen, refs, operation).await?;
         let viewport_ref = {
@@ -4406,6 +4407,27 @@ fn main_frame(frames: &[ObservationFrame]) -> Result<&ObservationFrame, Protocol
         return Err(ProtocolError::BrowserFailure);
     }
     Ok(root)
+}
+/// Pixel-only geometry for an inventory-derived capture. The semantic inventory
+/// proves and omits `<object>`/`<embed>` plugin subtrees; geometry must be told
+/// about those exact proven omissions. Without them the plugin frames read as
+/// missing inventory, so an otherwise successful semantic read is refused
+/// during its optional pixel enrichment.
+async fn observe_geometry_snapshot(
+    client: &super::cdp::client::CdpClient,
+    page_session: &str,
+    frames: &[ObservationFrame],
+    opaque_frames: &HashSet<String>,
+    operation: &OperationLease,
+) -> Result<GeometrySnapshot, super::client_geometry::GeometryError> {
+    GeometrySnapshot::capture_excluding_opaque(
+        client,
+        page_session,
+        frames,
+        opaque_frames,
+        operation,
+    )
+    .await
 }
 fn same_frames(
     before: &[ObservationFrame],
@@ -7974,6 +7996,106 @@ mod tests {
             .inventory_rejection
             .take()
             .is_none());
+    }
+    /// The optional pixel phase reuses the semantic inventory, so its geometry
+    /// must carry the same proven `<object>`/`<embed>` omissions. Calling the
+    /// plain capture reads the plugin documents as missing inventory and refuses
+    /// a tree that was already read successfully.
+    #[tokio::test]
+    async fn pixel_geometry_reuses_proven_opaque_plugin_omissions() {
+        use super::super::client_geometry::GeometryError;
+        use super::super::client_geometry::GeometrySnapshot;
+        use super::super::element::ExactBinding;
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = log.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                requests.lock().unwrap().push(request.clone());
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getFrameTree" => {
+                        serde_json::json!({"frameTree":{"frame":{"id":"root","loaderId":"doc","url":"https://synthetic.invalid/"},"childFrames":[
+                        {"frame":{"id":"obj-1","loaderId":"obj-doc-1","url":"about:blank","parentId":"root"}},
+                        {"frame":{"id":"obj-2","loaderId":"obj-doc-2","url":"about:blank","parentId":"root"}},
+                        {"frame":{"id":"obj-3","loaderId":"obj-doc-3","url":"about:blank","parentId":"root"}}]}})
+                    }
+                    "Page.getLayoutMetrics" => {
+                        serde_json::json!({"cssVisualViewport":{"clientWidth":100,"clientHeight":80,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":100,"clientHeight":80}})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        serde_json::json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = super::super::cdp::client::CdpClient::connect(&url)
+            .await
+            .unwrap();
+        let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 5,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+        };
+        let main = ObservationFrame {
+            parent_frame_id: None,
+            owner_backend_id: None,
+            url: "https://synthetic.invalid/".into(),
+            binding: ExactBinding {
+                page_session: "page".into(),
+                session: "page".into(),
+                frame: "root".into(),
+                loader: "doc".into(),
+                actionable: false,
+            },
+            offset_x: 0.,
+            offset_y: 0.,
+            frame_path: vec![],
+        };
+        let opaque: HashSet<String> = ["obj-1", "obj-2", "obj-3"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        // The plain capture refuses the proven omissions as missing inventory.
+        assert_eq!(
+            GeometrySnapshot::capture(&client, "page", std::slice::from_ref(&main), &operation)
+                .await
+                .unwrap_err(),
+            GeometryError::IncompleteInventory
+        );
+        // The pixel path's call site must pass them through instead.
+        observe_geometry_snapshot(
+            &client,
+            "page",
+            std::slice::from_ref(&main),
+            &opaque,
+            &operation,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !log.lock().unwrap().iter().any(|request| matches!(
+                request["method"].as_str(),
+                Some("DOM.getFrameOwner" | "DOM.getBoxModel" | "DOM.resolveNode")
+            )),
+            "opaque plugin documents are never read, resolved or measured"
+        );
+        drop(sender);
+        server.abort();
     }
 }
 
