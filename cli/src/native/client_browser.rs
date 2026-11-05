@@ -2198,12 +2198,19 @@ impl RetirementJournal {
     fn stop(&mut self, permanent: bool) {
         self.shutting_down |= permanent;
         if let Some(coordinator) = self.coordinator.as_ref().and_then(std::sync::Weak::upgrade) {
+            let authority = OwnerRetirement {
+                targets: coordinator.retirement_targets().clone(),
+            };
             if permanent {
+                // A permanent Close retires the same owner as scope end. Stamp
+                // the immutable first inventory before sealing admission so an
+                // already-admitted producer can still settle its own proven
+                // cleanup; without the stamp a clean interrupted read became a
+                // local-producer failure and the close could not be proven. The
+                // stop signal remains SessionClosed for this permanent path.
+                authority.targets.seal_for_owner_retirement(&authority);
                 coordinator.seal();
             } else {
-                let authority = OwnerRetirement {
-                    targets: coordinator.retirement_targets().clone(),
-                };
                 coordinator.seal_for_owner_retirement(&authority);
             }
         }
@@ -7000,7 +7007,11 @@ mod tests {
         assert!(replacement_targets.inventory().is_ok());
         journal.stop(true);
         assert!(replacement_targets.inventory().is_err());
-        assert!(replacement_targets.check_settlement_integrity().is_err());
+        // Permanent Close retires the same owner and stamps the immutable
+        // first inventory before sealing admission, so an operation admitted
+        // earlier can still settle its own proven cleanup instead of being
+        // reported as a local-producer failure.
+        assert_eq!(replacement_targets.check_settlement_integrity(), Ok(()));
         let (late, late_targets, _late_notices) = create("late");
         assert_eq!(journal.register(&late), Err(ProtocolError::Cancelled));
         assert!(late_targets.inventory().is_err());
