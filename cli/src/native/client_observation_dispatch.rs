@@ -7645,7 +7645,7 @@ mod tests {
                     "ref": {"id": format!("e{index}"), "revision": "1"},
                     "role": "listitem",
                     "name": format!("node {index}"),
-                    "attributes": {"data": "x".repeat(64)},
+                    "attributes": {"data": "x".repeat(512)},
                 })
             })
             .collect::<Vec<_>>();

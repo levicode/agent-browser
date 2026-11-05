@@ -12431,7 +12431,6 @@ mod node_identity_resample_merge_tests {
     }
 }
 
-
 #[cfg(test)]
 mod opaque_plugin_frame_tests {
     use super::opaque_plugin_frame;
