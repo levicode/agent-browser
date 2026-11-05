@@ -118,7 +118,7 @@ async fn optional_mask_retirement(case: Case) {
                         ));
                         json!({"result":{"value":true}})
                     } else if group == Some("capture-1-frame") {
-                        json!({"result":{"value":{"count":0,"masks":[],"secure":[],"opaque":case == Case::PrivacyFailure,"unsafeGeometry":case == Case::GeometryFailure}}})
+                        json!({"result":{"value":{"count":0,"masks":[],"secure":[],"unprovablePlugin":case == Case::PrivacyFailure,"uninspected":[],"unsafeGeometry":case == Case::GeometryFailure}}})
                     } else if declaration.contains("Array.from(result)") {
                         json!({"result":{"objectId":"security"}})
                     } else if declaration.contains("const read=") {

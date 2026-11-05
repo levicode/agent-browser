@@ -1,7 +1,7 @@
 //! Scoped orchestration of the existing native matcher and protected capture.
 //! The executor retains every task through restoration; capabilities are gated
 //! separately by browser conformance, not by this module's existence.
-use super::client_blobs::{BlobError, BlobScope, BlobStore};
+use super::client_blobs::{BlobError, BlobInfo, BlobScope, BlobStore};
 use super::client_browser::BrowserExecutionLease;
 use super::client_capture::{
     self, CaptureAttemptFailure, CaptureContext, CapturePhase, CaptureReason, CaptureRequest,
@@ -1859,7 +1859,7 @@ impl ObservationDispatch {
             }
             // A captured cleanup failure survives even if the journal itself
             // restored cleanly. Publication does not discharge remote resources.
-            let (pixels, geometry) = captured.map_err(failure)?;
+            let (mut pixels, geometry) = captured.map_err(failure)?;
             if published.load(Ordering::Acquire) {
                 // A late ACK can discharge custody, never publish pixels or
                 // restart final-proof reads after the optional acceptance cut.
@@ -1894,14 +1894,13 @@ impl ObservationDispatch {
             check(&context.page, &pixel_operation).map_err(failure)?;
             screenshot_stage(screenshot, ScreenshotStage::BlobPublication);
             let image = blobs
-                .finish_producer(producer, pixels.png)
+                .finish_producer(producer, std::mem::take(&mut pixels.png))
                 .map_err(|error| failure(blob_error(error)))?;
             let handles = vec![image.handle.clone()];
             let mut value = semantic.clone();
             value["maskedRegionCount"] = json!(pixels.masked_region_count);
-            value["pixels"] = json!({"identityScope":identity,"handle":image.handle,"size":image.size,
-                "sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,
-                "scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count});
+            value["uninspectedRegionCount"] = json!(pixels.uninspected_region_count);
+            value["pixels"] = capture_pixels_metadata(identity, &pixels, &image);
             let publish = fit_observation_result(&mut value);
             if let Err(error) = publish {
                 if !release_handles(blobs, scope, &handles) {
@@ -2912,22 +2911,23 @@ impl ObservationDispatch {
         }
         screenshot_stage(screenshot, ScreenshotStage::BlobPublication);
         let mut handles = Vec::new();
-        if let Some(pixels) = pixels {
+        if let Some(mut pixels) = pixels {
             let producer = producer
                 .take()
                 .ok_or_else(|| failure(ProtocolError::ScopeUnavailable))?;
             let image = context
                 .blobs
-                .finish_producer(producer, pixels.png)
+                .finish_producer(producer, std::mem::take(&mut pixels.png))
                 .map_err(|error| failure(blob_error(error)))?;
             handles.push(image.handle.clone());
-            let image = json!({"identityScope":identity,"handle":image.handle,"size":image.size,"sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,"scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count});
+            let image = capture_pixels_metadata(&identity, &pixels, &image);
             if value.is_null() {
                 value = image;
             } else if matches!(publication_kind, PublicationKind::TraceViewport) {
                 value.as_object_mut().ok_or_else(|| failure(ProtocolError::BrowserFailure))?.extend(image.as_object().ok_or_else(|| failure(ProtocolError::BrowserFailure))?.clone());
             } else {
                 value["maskedRegionCount"] = image["maskedRegionCount"].clone();
+                value["uninspectedRegionCount"] = image["uninspectedRegionCount"].clone();
                 value["pixels"] = image;
             }
         }
@@ -4713,6 +4713,23 @@ fn geometry_error_with_cleanup(
 fn geometry_error(error: super::client_geometry::GeometryError) -> ProtocolError {
     capture_error(client_capture::geometry_reason(error))
 }
+/// The published pixel artifact metadata. Uninspected plugin regions travel
+/// with the image rather than being dropped: their pixels exist, and no
+/// secure-field proof covers them. The count stays exact when the bounded
+/// bounds list is cut, so a caller can always tell that the artifact is
+/// degraded even when the details are bounded.
+fn capture_pixels_metadata(
+    identity: &str,
+    pixels: &client_capture::MaskedCapture,
+    image: &BlobInfo,
+) -> Value {
+    json!({"identityScope":identity,"handle":image.handle,"size":image.size,
+        "sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,
+        "scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count,
+        "uninspectedRegionCount":pixels.uninspected_region_count,
+        "uninspected":pixels.uninspected,
+        "uninspectedTruncated":pixels.uninspected.len()<pixels.uninspected_region_count})
+}
 fn capture_error(error: CaptureReason) -> ProtocolError {
     match error {
         CaptureReason::CleanupFailed => ProtocolError::CleanupFailed,
@@ -4801,6 +4818,52 @@ mod tests {
             capture_error(CaptureReason::CleanupFailed),
             ProtocolError::CleanupFailed
         );
+    }
+
+    #[test]
+    fn capture_pixels_publish_uninspected_plugin_regions_with_an_exact_count() {
+        let region = client_capture::UninspectedRegion {
+            kind: "plugin",
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+        };
+        let image = BlobInfo {
+            handle: "blob".into(),
+            size: 8,
+            sha256: "0".repeat(64),
+        };
+        let pixels = client_capture::MaskedCapture {
+            png: Vec::new(),
+            width: 800,
+            height: 600,
+            scale: 2.0,
+            masked_region_count: 1,
+            uninspected_region_count: 1,
+            uninspected: vec![region],
+            identity_scope: "scope".into(),
+        };
+        let value = capture_pixels_metadata("scope", &pixels, &image);
+        assert_eq!(value["identityScope"], json!("scope"));
+        assert_eq!(value["mediaType"], json!("image/png"));
+        assert_eq!(value["maskedRegionCount"], json!(1));
+        assert_eq!(value["uninspectedRegionCount"], json!(1));
+        assert_eq!(value["uninspectedTruncated"], json!(false));
+        assert_eq!(
+            value["uninspected"],
+            json!([{"kind":"plugin","x":10.0,"y":20.0,"width":30.0,"height":40.0}])
+        );
+        // A bounded bounds list never hides the fact that more regions exist.
+        let truncated = client_capture::MaskedCapture {
+            uninspected_region_count: 3,
+            uninspected: vec![region],
+            ..pixels
+        };
+        let value = capture_pixels_metadata("scope", &truncated, &image);
+        assert_eq!(value["uninspectedRegionCount"], json!(3));
+        assert_eq!(value["uninspectedTruncated"], json!(true));
+        assert_eq!(value["uninspected"].as_array().map(Vec::len), Some(1));
     }
 
     #[tokio::test]

@@ -2,13 +2,13 @@
 //! cleanup integrity is part of the outcome, even for optional screenshots.
 use super::client_browser::BrowserExecutionLease;
 use super::client_debt::{self, CommandCategory};
-use super::client_geometry::{GeometryError, GeometrySnapshot, Polygon, Viewport};
+use super::client_geometry::{Bounds, GeometryError, GeometrySnapshot, Polygon, Viewport};
 use super::client_observation::ObservationFrame;
 use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_session::{CancelSignal, OperationLease};
 use base64::Engine;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
 use std::collections::HashMap;
@@ -20,6 +20,11 @@ const MAX_PIXELS: u64 = 16_777_216;
 // transport allocations retain their independent existing limits.
 pub(super) const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOM_NODES: usize = 100_000;
+// Published metadata is bounded independently of the DOM budget. A page may
+// mount a plugin region per element, and the protocol result must stay inside
+// the existing frame budget, so the exact count is reported while only the
+// first regions keep their bounds.
+const MAX_UNINSPECTED_REGIONS: usize = 256;
 
 #[path = "client_capture_metadata.rs"]
 mod metadata;
@@ -62,12 +67,43 @@ pub struct CaptureContext {
     pub opaque_frames: HashSet<String>,
     pub inventory_complete: bool,
 }
+/// One unmasked capture region. Its plugin document is opaque author content:
+/// the pixels are published as the browser painted them, and no secure-field
+/// proof covers them. A caller that requires a fully inspected capture must
+/// treat the presence of these regions as a limitation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct UninspectedRegion {
+    /// Closed region class. Only plugin regions are published today.
+    pub kind: &'static str,
+    /// CSS pixels relative to the captured viewport origin, clipped to it.
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+impl UninspectedRegion {
+    fn plugin(bounds: Bounds) -> Self {
+        Self {
+            kind: "plugin",
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+        }
+    }
+}
 pub struct MaskedCapture {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub scale: f64,
     pub masked_region_count: usize,
+    /// Exact number of visible plugin regions in the captured viewport. It may
+    /// exceed `uninspected.len()` when the published bounds are bounded.
+    pub uninspected_region_count: usize,
+    /// The published regions, in capture order, at most
+    /// `MAX_UNINSPECTED_REGIONS`.
+    pub uninspected: Vec<UninspectedRegion>,
     pub identity_scope: String,
 }
 #[derive(Debug, Deserialize)]
@@ -76,7 +112,13 @@ struct FrameMasks {
     count: usize,
     secure: Vec<usize>,
     masks: Vec<usize>,
-    opaque: bool,
+    /// A visible plugin region whose pixels cannot be bounded: it sits inside
+    /// protected content, or an ancestor filter paints outside its border box.
+    /// The capture stays refused instead of publishing unbounded pixels.
+    unprovable_plugin: bool,
+    /// Indices of visible plugin regions whose exact owner border quad the
+    /// capture publishes as uninspected.
+    uninspected: Vec<usize>,
     unsafe_geometry: bool,
 }
 #[derive(Clone, PartialEq)]
@@ -84,6 +126,11 @@ struct MaskProof {
     count: usize,
     secure_nodes: Vec<(String, i64)>,
     masks: Vec<Polygon>,
+    /// Visible plugin regions that still paint inside the capture viewport, in
+    /// viewport CSS pixels. They are never masked and never enter the raster
+    /// mask pass; they are published as uninspected metadata.
+    uninspected: Vec<Bounds>,
+    uninspected_total: usize,
 }
 
 fn check(context: &CaptureContext, operation: &OperationLease) -> Result<(), CaptureReason> {
@@ -876,6 +923,8 @@ async fn masks(
         count: 0,
         secure_nodes: Vec::new(),
         masks: Vec::new(),
+        uninspected: Vec::new(),
+        uninspected_total: 0,
     };
     let mut sessions = HashSet::new();
     let mut seen = HashSet::new();
@@ -986,7 +1035,11 @@ async fn masks(
                     let response = command(context, operation, &owned.binding.session, "Runtime.callFunctionOn", json!({"executionContextId":realm,"functionDeclaration":MASK_READER,"arguments":args,"returnByValue":true,"objectGroup":group})).await?;
                     if response.get("exceptionDetails").is_some() { return Err(CaptureReason::MaskingUnproven); }
                     let result: FrameMasks = serde_json::from_value(response["result"]["value"].clone()).map_err(|_|CaptureReason::MaskingUnproven)?;
-                    if result.opaque { return Err(CaptureReason::UninspectableContent); }
+                    // An unprovable plugin region stays refused: its document is
+                    // never inspected, so it could contain secure glyphs, and a
+                    // filtered ancestor can paint them outside the measured box.
+                    // Every other visible plugin region is published unmasked.
+                    if result.unprovable_plugin { return Err(CaptureReason::UninspectableContent); }
                     if result.unsafe_geometry { return Err(CaptureReason::UnsafeGeometry); }
                     proof.count += result.count;
                     if result.secure.len()!=result.count {return Err(CaptureReason::MaskingUnproven);}
@@ -1000,6 +1053,35 @@ async fn masks(
                     if polygons.iter().any(|result| result.as_ref().err() == Some(&CaptureReason::CleanupFailed)) { return Err(CaptureReason::CleanupFailed); }
                     for result in polygons {
                         for polygon in result? { proof.masks.push(geometry.clip_for_capture(id, &polygon).map_err(geometry_reason)?); }
+                    }
+                    // Plugin regions are published, never masked. Their exact
+                    // owner border quad goes through the same shared proof as a
+                    // secure mask, so any frame transform and clip is applied
+                    // before the viewport intersection is reported. A region
+                    // entirely outside the captured pixels is not claimed as
+                    // uninspected; the count stays exact past the published cut.
+                    for index in result.uninspected {
+                        let backend = *batch.get(index).ok_or(CaptureReason::MaskingUnproven)?;
+                        let polygons = geometry
+                            .node_border_polygons(&context.page.client, owned, backend, operation)
+                            .await
+                            .map_err(geometry_reason)?;
+                        for polygon in polygons {
+                            let clipped =
+                                geometry.clip_for_capture(id, &polygon).map_err(geometry_reason)?;
+                            let Some(bounds) =
+                                clipped.bounds().filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
+                            else {
+                                continue;
+                            };
+                            proof.uninspected_total = proof
+                                .uninspected_total
+                                .checked_add(1)
+                                .ok_or(CaptureReason::BoundsExceeded)?;
+                            if proof.uninspected.len() < MAX_UNINSPECTED_REGIONS {
+                                proof.uninspected.push(bounds);
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -1086,13 +1168,25 @@ const PSEUDO_ORIGIN_READER: &str = r#"function(selector,...nodes){
 const MASK_READER: &str = r#"function(selector,...nodes){
  const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
  const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
- let count=0,masks=[],secureIds=[],opaque=false,unsafeGeometry=false;
+ let count=0,masks=[],secureIds=[],unprovablePlugin=false,uninspected=[],unsafeGeometry=false;
  for(const [index,node] of nodes.entries()){
   if(!connected.call(node)||owner.call(node)!==document)throw Error('stale');
   const rect=node.getBoundingClientRect(),style=getComputedStyle(node);
   const visible=rect.width>0&&rect.height>0&&style.visibility!=='hidden'&&style.display!=='none'&&Number(style.opacity)!==0;
-  if(visible&&(node.localName==='object'||node.localName==='embed'))opaque=true;
   let secure=false;for(let p=node;p;){if(p.matches('input[type="password" i]')||p.matches(selector)){secure=true;break;}p=p.parentElement||(p.getRootNode().host||null);}
+  if(visible&&(node.localName==='object'||node.localName==='embed')){
+   // A plugin document is opaque author content and is never inspected for
+   // secure fields. Inside protected content its glyphs still cannot be proven
+   // safe, and an ancestor filter can paint those glyphs outside the measured
+   // border box, so both captures stay refused. Every other visible plugin
+   // region is published unchanged and reported as uninspected: degraded,
+   // never silent.
+   if(secure){unprovablePlugin=true;continue;}
+   let filtered=false;for(let p=node;p;){if(getComputedStyle(p).filter!=='none'){filtered=true;break;}p=p.parentElement||(p.getRootNode().host||null);}
+   if(filtered){unprovablePlugin=true;continue;}
+   uninspected.push(index);
+   continue;
+  }
   if(!secure)continue;
   count++;secureIds.push(index);
   if(!visible){if(style.display==='contents')unsafeGeometry=true;continue;}
@@ -1105,7 +1199,7 @@ const MASK_READER: &str = r#"function(selector,...nodes){
   if(bleed){unsafeGeometry=true;continue;}
   masks.push(index);
  }
- return {count,masks,secure:secureIds,opaque,unsafeGeometry};
+ return {count,masks,secure:secureIds,unprovablePlugin,uninspected,unsafeGeometry};
 }"#;
 
 fn raster_mask(
@@ -1173,6 +1267,14 @@ fn raster_mask(
         height,
         scale: sx,
         masked_region_count: proof.count,
+        uninspected_region_count: proof.uninspected_total,
+        uninspected: proof
+            .uninspected
+            .iter()
+            .take(MAX_UNINSPECTED_REGIONS)
+            .copied()
+            .map(UninspectedRegion::plugin)
+            .collect(),
         identity_scope: scope.to_owned(),
     })
 }
@@ -1222,11 +1324,15 @@ mod tests {
             count: 1,
             secure_nodes: vec![("frame".into(), 1)],
             masks: vec![],
+            uninspected: vec![],
+            uninspected_total: 0,
         };
         let b = MaskProof {
             count: 1,
             secure_nodes: vec![("frame".into(), 2)],
             masks: vec![],
+            uninspected: vec![],
+            uninspected_total: 0,
         };
         assert!(
             a != b,
@@ -1275,6 +1381,8 @@ mod tests {
                 secure_nodes: Vec::new(),
                 count: 1,
                 masks: vec![Polygon::rectangle_for_test(0.75, 0.75, 0.5, 0.5)],
+                uninspected: vec![],
+                uninspected_total: 0,
             },
             "scope",
         )
@@ -1292,11 +1400,87 @@ mod tests {
             &MaskProof {
                 secure_nodes: Vec::new(),
                 count: 0,
-                masks: vec![]
+                masks: vec![],
+                uninspected: vec![],
+                uninspected_total: 0,
             },
             "old"
         )
         .is_err());
+    }
+    #[test]
+    fn uninspected_plugin_regions_are_published_unmasked() {
+        let image = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 120, 80, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let result = raster_mask(
+            bytes.get_ref(),
+            test_viewport(4.0, 4.0),
+            &MaskProof {
+                secure_nodes: Vec::new(),
+                count: 1,
+                masks: vec![Polygon::rectangle_for_test(0.0, 0.0, 1.0, 1.0)],
+                uninspected: vec![Bounds {
+                    x: 1.0,
+                    y: 2.0,
+                    width: 2.0,
+                    height: 2.0,
+                }],
+                uninspected_total: 1,
+            },
+            "scope",
+        )
+        .unwrap();
+        assert_eq!(result.masked_region_count, 1);
+        assert_eq!(result.uninspected_region_count, 1);
+        assert_eq!(
+            result.uninspected,
+            vec![UninspectedRegion {
+                kind: "plugin",
+                x: 1.0,
+                y: 2.0,
+                width: 2.0,
+                height: 2.0,
+            }]
+        );
+        // The secure mask is painted; the plugin region keeps the browser
+        // pixels and only the metadata warns about it.
+        let pixels = image::load_from_memory(&result.png).unwrap().to_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(pixels.get_pixel(2, 3).0, [255, 120, 80, 255]);
+    }
+    #[test]
+    fn uninspected_metadata_is_bounded_but_the_count_is_exact() {
+        let regions = (0..MAX_UNINSPECTED_REGIONS + 2)
+            .map(|_| Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            })
+            .collect::<Vec<_>>();
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let result = raster_mask(
+            bytes.get_ref(),
+            test_viewport(2.0, 2.0),
+            &MaskProof {
+                secure_nodes: Vec::new(),
+                count: 0,
+                masks: vec![],
+                uninspected: regions,
+                uninspected_total: MAX_UNINSPECTED_REGIONS + 2,
+            },
+            "scope",
+        )
+        .unwrap();
+        assert_eq!(result.uninspected_region_count, MAX_UNINSPECTED_REGIONS + 2);
+        assert_eq!(result.uninspected.len(), MAX_UNINSPECTED_REGIONS);
     }
     // Only closed diagnostic values leave this helper; equality stays on raw JSON.
     fn background_page_state_diagnostic(before: &Value, after: &Value) -> Value {
@@ -1489,6 +1673,239 @@ mod tests {
     #[ignore = "requires real Chromium: masked same-process transformed iframe pixels"]
     async fn chromium_shared_geometry_masks_transformed_frame_passwords() {
         static_mask_fixture(true).await;
+    }
+    /// Real-browser acceptance for visible plugin content. Three visible
+    /// `<object>` plugin documents no longer refuse the capture; their owner
+    /// regions are published as unmasked `uninspected` bounds while a password
+    /// input in the same document keeps its black mask.
+    #[tokio::test]
+    #[ignore = "requires real Chromium: three visible <object> plugin regions"]
+    async fn chromium_visible_plugin_regions_are_published_uninspected() {
+        use super::super::client_browser::{ExecutionGate, OwnedBrowser};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let mut owner = OwnedBrowser::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let gate = Arc::new(ExecutionGate::default());
+        let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let client = page.client.clone();
+        let session = page.page_session_id.clone();
+        let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 3_200_001,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        let result: Result<(), String> = async {
+            client.send_command("Emulation.setDeviceMetricsOverride", Some(json!({"width":400,"height":300,"deviceScaleFactor":1,"mobile":false})), Some(&session)).await?;
+            let setup = client.send_command("Runtime.evaluate", Some(json!({"expression":r#"(()=>{
+                document.body.style.cssText='margin:0;background:rgb(25,75,125)';
+                const box='position:absolute;width:100px;height:50px;border:0;padding:0';
+                const plugin=(left,top)=>{const node=document.createElement('object');node.type='text/html';node.data='about:blank';node.style.cssText=box+';left:'+left+'px;top:'+top+'px';document.body.appendChild(node);return node;};
+                window.__pluginFixture={first:plugin(10,10),second:plugin(150,10),third:plugin(10,100)};
+                const input=document.createElement('input');input.type='password';input.value='synthetic-plugin-secret';
+                input.style.cssText=box+';left:150px;top:100px;background:red';
+                document.body.appendChild(input);window.__pluginFixture.input=input;
+                return document.querySelectorAll('object').length===3;
+            })()"#,"returnByValue":true})), Some(&session)).await?;
+            if setup["result"]["value"] != true {
+                return Err("Visible plugin fixture setup failed".into());
+            }
+            // The plugin documents are real renderer targets; wait for the three
+            // native child frames so the inventory proves the same page shape.
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let tree = client.send_command("Page.getFrameTree", Some(json!({})), Some(&session)).await.unwrap();
+                    let children = tree["frameTree"]["childFrames"].as_array().map(Vec::len).unwrap_or(0);
+                    if children >= 3 { return; }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.map_err(|_| "visible plugin frames did not appear")?;
+            page.targets.acknowledge_enrollment().map_err(|_| "Visible plugin inventory acknowledgement failed")?;
+            let super::super::client_observation_dispatch::VerifiedFrameInventory { frames, opaque_frames, .. } =
+                super::super::client_observation_dispatch::verified_frame_inventory(&page, &operation).await.map_err(|error| format!("Visible plugin inventory: {error:?}"))?;
+            if opaque_frames.len() != 3 { return Err(format!("Expected three proven plugin frames, got {opaque_frames:?}")); }
+            let journal = owned_capture_journal(&mut owner, &mut page, &operation);
+            // Accounting replaces the ambient transport handle with its exact
+            // owner-bound view; post-capture reads must use that same view.
+            let client = page.client.clone();
+            let captured = journal.scope(async {
+                start_capture(CaptureContext { page, frames, opaque_frames, inventory_complete: true },
+                    CaptureRequest { secure_field_selector: "input[type=\"password\" i]".into() }, operation).await
+            }).await.map_err(|_| "Visible plugin capture task failed")?
+                .map_err(|error| format!("Visible plugin capture was refused: {error:?}"))?;
+            if captured.uninspected_region_count != 3 || captured.uninspected.len() != 3 {
+                return Err(format!("Unexpected uninspected metadata: {:?}", captured.uninspected));
+            }
+            for (region, expected) in captured.uninspected.iter().zip([(10.0, 10.0), (150.0, 10.0), (10.0, 100.0)]) {
+                let (x, y) = expected;
+                if region.kind != "plugin" || (region.x - x).abs() > 0.5 || (region.y - y).abs() > 0.5
+                    || (region.width - 100.0).abs() > 0.5 || (region.height - 50.0).abs() > 0.5 {
+                    return Err(format!("Unexpected plugin bounds {region:?} for {expected:?}"));
+                }
+            }
+            if captured.masked_region_count < 1 { return Err("Password input mask proof was lost".into()); }
+            let pixels = image::load_from_memory(&captured.png).map_err(|_| "Visible plugin PNG invalid")?.to_rgba8();
+            if pixels.dimensions() != (400, 300) { return Err("Unexpected visible plugin screenshot dimensions".into()); }
+            if pixels.get_pixel(200, 120).0 != [0, 0, 0, 255] { return Err("Password pixels were not black".into()); }
+            if pixels.get_pixel(60, 35).0 == [0, 0, 0, 255] { return Err("Plugin pixels were masked instead of published".into()); }
+            let controls = client.send_command("Runtime.evaluate", Some(json!({"expression":"window.__pluginFixture.input.value==='synthetic-plugin-secret'&&document.querySelectorAll('object').length===3","returnByValue":true})), Some(&session)).await?;
+            if controls["result"]["value"] != true { return Err("Capture changed the visible plugin fixture".into()); }
+            Ok(())
+        }.await;
+        let cleanup = owner.close().await;
+        assert!(
+            cleanup.is_ok(),
+            "Owned test context cleanup failed: {cleanup:?}"
+        );
+        assert!(result.is_ok(), "Visible plugin capture gate: {result:?}");
+    }
+    /// A plugin region whose pixels cannot be bounded keeps the original
+    /// refusal: its document is never inspected, so it could hold secure
+    /// glyphs, and a filtered ancestor can paint them outside the owner border
+    /// box. Degrading to a marker is allowed only when the bounds are truthful.
+    #[tokio::test]
+    #[ignore = "requires real Chromium: unprovable <object> plugin region"]
+    async fn chromium_unprovable_plugin_regions_stay_refused() {
+        for filtered in [false, true] {
+            unprovable_plugin_fixture(filtered).await;
+        }
+    }
+    async fn unprovable_plugin_fixture(filtered: bool) {
+        use super::super::client_browser::{ExecutionGate, OwnedBrowser};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let mut owner = OwnedBrowser::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let gate = Arc::new(ExecutionGate::default());
+        let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let client = page.client.clone();
+        let session = page.page_session_id.clone();
+        let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 3_200_002 + u64::from(filtered),
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        let (setup, selector) = if filtered {
+            (
+                r#"(()=>{
+                document.body.style.cssText='margin:0;background:rgb(25,75,125)';
+                const node=document.createElement('object');node.type='text/html';node.data='about:blank';
+                node.style.cssText='position:absolute;left:10px;top:10px;width:100px;height:50px;border:0;padding:0;filter:blur(4px)';
+                document.body.appendChild(node);
+                return document.querySelectorAll('object').length===1;
+            })()"#,
+                "input[type=\"password\" i]",
+            )
+        } else {
+            (
+                r#"(()=>{
+                document.body.style.cssText='margin:0;background:rgb(25,75,125)';
+                const host=document.createElement('div');host.setAttribute('data-protected','');
+                host.style.cssText='position:absolute;left:0;top:0;width:200px;height:150px';
+                const node=document.createElement('object');node.type='text/html';node.data='about:blank';
+                node.style.cssText='position:absolute;left:10px;top:10px;width:100px;height:50px;border:0;padding:0';
+                host.appendChild(node);document.body.appendChild(host);
+                return document.querySelectorAll('object').length===1;
+            })()"#,
+                "[data-protected],input[type=\"password\" i]",
+            )
+        };
+        let result: Result<(), String> = async {
+            client
+                .send_command(
+                    "Emulation.setDeviceMetricsOverride",
+                    Some(json!({"width":400,"height":300,"deviceScaleFactor":1,"mobile":false})),
+                    Some(&session),
+                )
+                .await?;
+            let setup = client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":setup,"returnByValue":true})),
+                    Some(&session),
+                )
+                .await?;
+            if setup["result"]["value"] != true {
+                return Err("Unprovable plugin fixture setup failed".into());
+            }
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let tree = client
+                        .send_command("Page.getFrameTree", Some(json!({})), Some(&session))
+                        .await
+                        .unwrap();
+                    let children = tree["frameTree"]["childFrames"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if children >= 1 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| "unprovable plugin frame did not appear")?;
+            page.targets
+                .acknowledge_enrollment()
+                .map_err(|_| "Unprovable plugin inventory acknowledgement failed")?;
+            let super::super::client_observation_dispatch::VerifiedFrameInventory {
+                frames,
+                opaque_frames,
+                ..
+            } = super::super::client_observation_dispatch::verified_frame_inventory(
+                &page, &operation,
+            )
+            .await
+            .map_err(|error| format!("Unprovable plugin inventory: {error:?}"))?;
+            let journal = owned_capture_journal(&mut owner, &mut page, &operation);
+            let captured = journal
+                .scope(async {
+                    start_capture(
+                        CaptureContext {
+                            page,
+                            frames,
+                            opaque_frames,
+                            inventory_complete: true,
+                        },
+                        CaptureRequest {
+                            secure_field_selector: selector.into(),
+                        },
+                        operation,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|_| "Unprovable plugin capture task failed")?;
+            match captured {
+                Err(failure)
+                    if failure.reason == CaptureReason::UninspectableContent
+                        && !failure.cleanup_integrity_lost =>
+                {
+                    Ok(())
+                }
+                Err(failure) => Err(format!("Unexpected unprovable plugin refusal: {failure:?}")),
+                Ok(_) => Err("Unprovable plugin pixels were published".into()),
+            }
+        }
+        .await;
+        let cleanup = owner.close().await;
+        assert!(
+            cleanup.is_ok(),
+            "Owned test context cleanup failed: {cleanup:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "Unprovable plugin capture gate (filtered={filtered}): {result:?}"
+        );
     }
     /// Primitive Chromium fixtures launch a real managed owner without the
     /// ClientBrowser dispatcher. Install its exact accounting before capture;
