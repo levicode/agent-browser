@@ -4779,22 +4779,43 @@ fn joined_frame_children(tree: &Value, parent: &str, owned: &HashMap<String, Val
     children.extend(remote);
     children
 }
+/// Author frame inventory plus the opaque plugin subtrees it deliberately
+/// omitted. The semantic pipeline never reads a plugin document, but the
+/// native lineage does list it, so the caller must reconcile the two on the
+/// same boundary.
+pub(crate) struct EnumeratedFrames {
+    pub frames: Vec<ObservationFrame>,
+    /// Roots of `<object>`/`<embed>` plugin subtrees. Descendants of a root are
+    /// omitted with it: they are only reachable through the plugin document.
+    pub opaque_frame_roots: Vec<String>,
+}
 pub async fn enumerate_frames(
     client: &CdpClient,
     page_session: &str,
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
 ) -> Result<Vec<ObservationFrame>, ObservationError> {
+    enumerate_frames_with_opaque(client, page_session, iframe_sessions, lease)
+        .await
+        .map(|enumerated| enumerated.frames)
+}
+/// Ordinary action, screenshot and trace inventory retain the original
+/// exact-object release path while reporting the omitted plugin subtrees.
+pub(crate) async fn enumerate_frames_with_opaque(
+    client: &CdpClient,
+    page_session: &str,
+    iframe_sessions: &HashMap<String, String>,
+    lease: &OperationLease,
+) -> Result<EnumeratedFrames, ObservationError> {
     enumerate_frames_impl(client, page_session, iframe_sessions, lease, false).await
 }
-/// Semantic Observe only. Ordinary action, screenshot and trace inventory
-/// retain the original exact-object release path.
+/// Semantic Observe only. It keeps the retained readonly-group release path.
 pub(crate) async fn enumerate_semantic_frames(
     client: &CdpClient,
     page_session: &str,
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
-) -> Result<Vec<ObservationFrame>, ObservationError> {
+) -> Result<EnumeratedFrames, ObservationError> {
     let retained =
         client.debt_ledger().is_some() && client_debt::OperationJournalHandle::current().is_some();
     enumerate_frames_impl(client, page_session, iframe_sessions, lease, retained).await
@@ -4805,7 +4826,7 @@ async fn enumerate_frames_impl(
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
     readonly_disposal: bool,
-) -> Result<Vec<ObservationFrame>, ObservationError> {
+) -> Result<EnumeratedFrames, ObservationError> {
     if iframe_sessions.len() > 256 {
         return Err(ObservationError::InvalidArguments);
     }
@@ -4820,6 +4841,7 @@ async fn enumerate_frames_impl(
     let tree = command(client, page_session, "Page.getFrameTree", json!({}), lease).await?;
     let mut queue = std::collections::VecDeque::from([(tree["frameTree"].clone(), None::<usize>)]);
     let mut frames: Vec<ObservationFrame> = Vec::new();
+    let mut opaque_frame_roots: Vec<String> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     while let Some((mut tree, parent)) = queue.pop_front() {
         let id = tree["frame"]["id"]
@@ -4941,6 +4963,9 @@ async fn enumerate_frames_impl(
             // as an opaque leaf; never let an unprovable plugin frame deny the
             // whole page's observation.
             if opaque_plugin_frame(data) {
+                // Remember the omitted subtree root so the caller can drop the
+                // same subtree from the native lineage before comparing counts.
+                opaque_frame_roots.push(id.clone());
                 continue;
             }
             descriptor.offset_x =
@@ -4978,7 +5003,10 @@ async fn enumerate_frames_impl(
     for frame in &frames {
         validate_frame(client, frame, lease).await?;
     }
-    Ok(frames)
+    Ok(EnumeratedFrames {
+        frames,
+        opaque_frame_roots,
+    })
 }
 
 /// Parse selector syntax without dispatch or native request reclassification.

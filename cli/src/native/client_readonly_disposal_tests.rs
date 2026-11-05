@@ -233,7 +233,8 @@ async fn semantic_frame_owner_held_group_ack_does_not_consume_eighty_ms() {
     )
     .await
     .expect("frame owner disposal consumed semantic deadline")
-    .unwrap();
+    .unwrap()
+    .frames;
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[1].frame_path, vec!["#child"]);
     let held = peer.next_release().await;

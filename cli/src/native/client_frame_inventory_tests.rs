@@ -541,3 +541,344 @@ fn all_production_action_contexts_consume_the_verified_renderer_map() {
     );
     assert!(!source.contains("filter(|frame|frame.parent_frame_id.is_some())"));
 }
+
+// A same-document route that mounts three <object> plugin documents used to
+// deny every semantic read with StaleScope: the plugin documents are opaque
+// author-inventory omissions, but the native lineage still listed them, so the
+// paired inventory and lineage counts could never agree. The three plugin
+// documents are renderer-owned targets here, exactly as the browser reports
+// them, and an ordinary author iframe sits in the same tree to prove real
+// iframes stay inventoried.
+struct ObjectFramePeer {
+    page: BrowserExecutionLease,
+    operation: OperationLease,
+    _cancel: tokio::sync::watch::Sender<CancelSignal>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for ObjectFramePeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+const OBJECT_FRAMES: [&str; 3] = ["obj-1", "obj-2", "obj-3"];
+const OBJECT_SESSIONS: [&str; 3] = ["obj-session-1", "obj-session-2", "obj-session-3"];
+const OBJECT_BACKENDS: [i64; 3] = [301, 302, 303];
+fn object_frame_tree(session: &str) -> Value {
+    let child = |id: &str, index: usize| {
+        json!({"frame":{"id":id,"parentId":"main-root","loaderId":format!("obj-loader-{index}"),
+            "url":"about:blank"},"childFrames":[]})
+    };
+    match session {
+        "page-session" => json!({"frameTree":{"frame":{"id":"main-root","loaderId":"main-loader",
+            "url":"https://fixture.example/route"},
+            "childFrames":[child("obj-1",1),child("obj-2",2),child("obj-3",3),
+                json!({"frame":{"id":"author-frame","parentId":"main-root",
+                    "loaderId":"author-loader","url":"about:srcdoc"},"childFrames":[]})]}}),
+        session if OBJECT_SESSIONS.contains(&session) => {
+            let index = OBJECT_SESSIONS
+                .iter()
+                .position(|candidate| candidate == &session)
+                .unwrap();
+            let id = OBJECT_FRAMES[index];
+            json!({"frameTree":{"frame":{"id":id,"parentId":"main-root",
+                "loaderId":format!("obj-loader-{}",index+1),"url":"about:blank"},"childFrames":[]}})
+        }
+        other => panic!("unowned session was queried: {other}"),
+    }
+}
+fn object_frame_backend(frame: &str) -> i64 {
+    match frame {
+        "obj-1" => OBJECT_BACKENDS[0],
+        "obj-2" => OBJECT_BACKENDS[1],
+        "obj-3" => OBJECT_BACKENDS[2],
+        "author-frame" => 401,
+        other => panic!("foreign frame owner requested: {other}"),
+    }
+}
+fn object_frame_local_name(frame: &str) -> &'static str {
+    match frame {
+        "obj-1" | "obj-2" | "obj-3" => "object",
+        "author-frame" => "iframe",
+        other => panic!("foreign frame owner requested: {other}"),
+    }
+}
+impl ObjectFramePeer {
+    async fn new() -> Self {
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        attach(&targets, "target-main", "page-session", "page").await;
+        for (target, session) in [
+            ("target-obj-1", OBJECT_SESSIONS[0]),
+            ("target-obj-2", OBJECT_SESSIONS[1]),
+            ("target-obj-3", OBJECT_SESSIONS[2]),
+        ] {
+            attach(&targets, target, session, "iframe").await;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let session = request["sessionId"].as_str().unwrap();
+                let source = request["params"]["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or("");
+                let object = request["params"]["objectId"].as_str().unwrap_or("");
+                let result = match method {
+                    "Page.getFrameTree" => object_frame_tree(session),
+                    "Page.createIsolatedWorld" => {
+                        let frame = request["params"]["frameId"].as_str().unwrap();
+                        let context = match frame {
+                            "main-root" => 1,
+                            "author-frame" => 2,
+                            "obj-1" => 11,
+                            "obj-2" => 12,
+                            "obj-3" => 13,
+                            other => panic!("foreign frame requested: {other}"),
+                        };
+                        json!({"executionContextId":context})
+                    }
+                    "DOM.getFrameOwner" => {
+                        let frame = request["params"]["frameId"].as_str().unwrap();
+                        assert_eq!(session, "page-session");
+                        json!({"backendNodeId":object_frame_backend(frame)})
+                    }
+                    "DOM.resolveNode" => json!({
+                        "object":{"subtype":"node","objectId":format!("object-{}-{}",
+                            request["params"]["executionContextId"],
+                            request["params"]["backendNodeId"])}
+                    }),
+                    "Runtime.callFunctionOn" if source == observation::FRAME_OWNER_GEOMETRY => {
+                        let backend = object
+                            .rsplit('-')
+                            .next()
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .expect("owner object id");
+                        let frame = match backend {
+                            301 => "obj-1",
+                            302 => "obj-2",
+                            303 => "obj-3",
+                            401 => "author-frame",
+                            other => panic!("foreign frame owner resolved: {other}"),
+                        };
+                        json!({"result":{"value":{"x":0,"y":0,"selector":"frame",
+                            "localName":object_frame_local_name(frame)}}})
+                    }
+                    "Runtime.releaseObject" => json!({}),
+                    other => panic!("unmodeled object-frame command {other}: {request}"),
+                };
+                let response = json!({"id":request["id"],"sessionId":session,"result":result});
+                if socket
+                    .send(Message::Text(response.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        let gate = Arc::new(ExecutionGate::default());
+        let page = BrowserExecutionLease {
+            client,
+            targets,
+            permit: gate.enter(false).unwrap(),
+            identity_scope: "scope".into(),
+            page_session_id: "page-session".into(),
+            target_id: "target-main".into(),
+        };
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+        };
+        Self {
+            page,
+            operation,
+            _cancel: cancel,
+            task,
+        }
+    }
+}
+#[tokio::test]
+async fn three_object_plugin_frames_do_not_stale_the_semantic_inventory() {
+    let peer = ObjectFramePeer::new().await;
+    let inventory = verified_frame_inventory(&peer.page, &peer.operation)
+        .await
+        .unwrap();
+    let ids = inventory
+        .frames
+        .iter()
+        .map(|frame| frame.binding.frame.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["main-root", "author-frame"]);
+    assert!(inventory.iframe_sessions.is_empty());
+    for object in OBJECT_FRAMES {
+        assert!(!ids.contains(&object));
+    }
+}
+
+#[test]
+fn author_lineage_omits_opaque_plugin_subtrees_only() {
+    let mut parents = std::collections::HashMap::new();
+    parents.insert("main-root".to_string(), None);
+    for object in OBJECT_FRAMES {
+        parents.insert(object.to_string(), Some("main-root".to_string()));
+    }
+    // A frame nested inside an opaque plugin document is unreachable from the
+    // author tree for the same reason; it must be omitted with its subtree.
+    parents.insert("plugin-nested".to_string(), Some("obj-1".to_string()));
+    parents.insert("author-frame".to_string(), Some("main-root".to_string()));
+    parents.insert(
+        "author-nested".to_string(),
+        Some("author-frame".to_string()),
+    );
+    let mut iframe_sessions = std::collections::HashMap::new();
+    for (object, session) in OBJECT_FRAMES.iter().zip(OBJECT_SESSIONS) {
+        iframe_sessions.insert(object.to_string(), session.to_string());
+    }
+    let lineage = author_lineage(
+        PageLineage {
+            iframe_sessions,
+            parents,
+        },
+        &OBJECT_FRAMES.map(str::to_string),
+    );
+    let mut ids = lineage.parents.keys().cloned().collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec!["author-frame", "author-nested", "main-root"]);
+    assert!(lineage.iframe_sessions.is_empty());
+}
+
+// Real-Chrome control for the same three <object> fixture. The CLI has no
+// trace/observe entry point, so this drives the production paired inventory
+// directly: the native tree really contains three plugin child frames plus one
+// author iframe, and the semantic inventory must succeed with only the author
+// frames. Run with:
+//   cargo test --bin agent-browser e2e_three_object_plugin_frames -- --ignored
+#[tokio::test]
+#[ignore = "requires hosted Chromium: three <object> plugin frames"]
+async fn e2e_three_object_plugin_frames_do_not_stale_the_semantic_inventory() {
+    use crate::native::cdp::chrome::{launch_chrome, LaunchOptions};
+    let _chrome = launch_chrome(&LaunchOptions {
+        headless: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let client = Arc::new(CdpClient::connect(&_chrome.ws_url).await.unwrap());
+    let target = client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({"url":"about:blank"})),
+            None,
+        )
+        .await
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session = client
+        .send_command(
+            "Target.attachToTarget",
+            Some(json!({"targetId":target,"flatten":true})),
+            None,
+        )
+        .await
+        .unwrap()["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client
+        .send_command("Page.enable", Some(json!({})), Some(&session))
+        .await
+        .unwrap();
+    let html = "<html><body>\
+        <object type=\"text/html\" data=\"about:blank\"></object>\
+        <object type=\"text/html\" data=\"about:blank\"></object>\
+        <object type=\"text/html\" data=\"about:blank\"></object>\
+        <iframe src=\"about:blank\"></iframe>\
+        </body></html>";
+    client
+        .send_command(
+            "Page.navigate",
+            Some(json!({"url":format!("data:text/html,{}", urlencoding::encode(html))})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    // Wait for the three plugin documents and the author iframe to exist in
+    // the native frame tree before taking the paired inventory.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let tree = client
+                .send_command("Page.getFrameTree", Some(json!({})), Some(&session))
+                .await
+                .unwrap();
+            let children = tree["frameTree"]["childFrames"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let objects = client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(
+                        json!({"expression":"document.querySelectorAll('object').length",
+                        "returnByValue":true}),
+                    ),
+                    Some(&session),
+                )
+                .await
+                .unwrap();
+            if children >= 4 && objects["result"]["value"] == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("three <object> plugin frames did not appear");
+    let targets = ClientTargets::new("context".into(), "scope".into());
+    attach(&targets, &target, &session, "page").await;
+    let gate = Arc::new(ExecutionGate::default());
+    let page = BrowserExecutionLease {
+        client: client.clone(),
+        targets,
+        permit: gate.enter(false).unwrap(),
+        identity_scope: "scope".into(),
+        page_session_id: session.clone(),
+        target_id: target.clone(),
+    };
+    let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+    let operation = OperationLease {
+        is_callback: false,
+        generation: 1,
+        sequence: 1,
+        deadline: Instant::now() + Duration::from_secs(30),
+        cancellation,
+    };
+    let inventory = verified_frame_inventory(&page, &operation).await.unwrap();
+    let ids = inventory
+        .frames
+        .iter()
+        .map(|frame| frame.binding.frame.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2, "author frames only: {ids:?}");
+    let root = &inventory.frames[0];
+    assert!(root.parent_frame_id.is_none());
+    let author = inventory
+        .frames
+        .iter()
+        .find(|frame| frame.parent_frame_id.as_deref() == Some(root.binding.frame.as_str()))
+        .expect("author iframe stays inventoried");
+    assert_eq!(author.frame_path.len(), 1);
+    assert!(
+        author.frame_path[0].ends_with("iframe:nth-child(4)"),
+        "author iframe keeps its owner path: {:?}",
+        author.frame_path
+    );
+}
