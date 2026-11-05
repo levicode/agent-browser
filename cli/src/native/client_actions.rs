@@ -4755,6 +4755,9 @@ mod tests {
     mod tap_before_press {
         include!("client_actions_tap_before_press_tests.rs");
     }
+    mod observation_latency {
+        include!("client_observation_latency_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
