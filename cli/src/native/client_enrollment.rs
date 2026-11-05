@@ -20497,6 +20497,7 @@ mod tests {
                 origins_complete: true,
             },
             &owner.operation(),
+            64 * 1024 * 1024,
         )
         .await
         .unwrap();
@@ -20527,6 +20528,7 @@ mod tests {
                 origins_complete: true,
             },
             &owner.operation(),
+            64 * 1024 * 1024,
         )
         .await
         .unwrap();
