@@ -13,6 +13,10 @@ enum Case {
     Immediate,
     LateContract,
     PendingClose,
+    /// Explicit Close while the trace capture still owns retained cleanup.
+    /// This is the interruption ordering: shutdown seals admission before the
+    /// interrupted producer settles.
+    PendingShutdown,
     LateUnnegotiated,
     RestoreRejected,
     NeverTerminal,
@@ -289,8 +293,9 @@ async fn run(case: Case) {
     let trace_started = std::time::Instant::now();
     let mut pending_end = None;
     let mut pending_clean_before_terminal = false;
-    let result = if case == Case::PendingClose {
-        // Drive scope.end while capture is still in its retained cleanup window.
+    let mut shutdown_receipt = None;
+    let result = if matches!(case, Case::PendingClose | Case::PendingShutdown) {
+        // Drive close while capture is still in its retained cleanup window.
         tokio::time::timeout(Duration::from_secs(1), async {
             while !peer
                 .log
@@ -309,40 +314,84 @@ async fn run(case: Case) {
             !peer.terminal_sent.load(Ordering::Acquire),
             "fixture scheduling missed pending-close window"
         );
-        fixture.sequence += 1;
-        let end_id = format!("pending-end-{}", fixture.sequence);
-        fixture.write(json!({"type":"request","id":end_id,"generation":1,"operationSeq":fixture.sequence,"timeoutMs":10000,"command":"scope.end","args":{"identityScope":scope}})).await.unwrap();
-        let mut trace_result = None;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut frames = 0;
-            while trace_result.is_none() || pending_end.is_none() {
-                frames += 1;
-                assert!(frames <= 32, "pending close frame bound");
-                let message = fixture.read().await.unwrap();
-                if message["type"] == "event" {
-                    validate_fixture_notice(&message).unwrap();
-                    let seq = message["sequence"].as_u64().unwrap();
-                    assert_eq!(seq, fixture.event_sequence + 1);
-                    fixture.event_sequence = seq;
-                } else {
-                    assert_eq!(message["type"], "result");
-                    if message["id"] == id {
-                        assert!(trace_result.is_none(), "duplicate trace result");
-                        trace_result = Some(message);
+        if case == Case::PendingClose {
+            fixture.sequence += 1;
+            let end_id = format!("pending-end-{}", fixture.sequence);
+            fixture.write(json!({"type":"request","id":end_id,"generation":1,"operationSeq":fixture.sequence,"timeoutMs":10000,"command":"scope.end","args":{"identityScope":scope}})).await.unwrap();
+            let mut trace_result = None;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut frames = 0;
+                while trace_result.is_none() || pending_end.is_none() {
+                    frames += 1;
+                    assert!(frames <= 32, "pending close frame bound");
+                    let message = fixture.read().await.unwrap();
+                    if message["type"] == "event" {
+                        validate_fixture_notice(&message).unwrap();
+                        let seq = message["sequence"].as_u64().unwrap();
+                        assert_eq!(seq, fixture.event_sequence + 1);
+                        fixture.event_sequence = seq;
                     } else {
-                        assert_eq!(message["id"], end_id);
-                        assert!(pending_end.is_none(), "duplicate scope.end result");
-                        pending_clean_before_terminal = message["ok"] == true
-                            && (!peer.terminal_sent.load(Ordering::Acquire)
-                                || !peer.restoration_acked.load(Ordering::Acquire));
-                        pending_end = Some(message);
+                        assert_eq!(message["type"], "result");
+                        if message["id"] == id {
+                            assert!(trace_result.is_none(), "duplicate trace result");
+                            trace_result = Some(message);
+                        } else {
+                            assert_eq!(message["id"], end_id);
+                            assert!(pending_end.is_none(), "duplicate scope.end result");
+                            pending_clean_before_terminal = message["ok"] == true
+                                && (!peer.terminal_sent.load(Ordering::Acquire)
+                                    || !peer.restoration_acked.load(Ordering::Acquire));
+                            pending_end = Some(message);
+                        }
                     }
                 }
-            }
-        })
-        .await
-        .expect("pending scope.end result supervisor stalled");
-        trace_result.unwrap()
+            })
+            .await
+            .expect("pending scope.end result supervisor stalled");
+            trace_result.unwrap()
+        } else {
+            // Explicit terminal Close, exactly the interruption path: the
+            // transport leaves the ordinary lane while the trace capture is
+            // still retained, then the executor shuts down and drains it.
+            fixture
+                .write(json!({"type":"close","id":"z","generation":1}))
+                .await
+                .unwrap();
+            let closed = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut frames = 0;
+                loop {
+                    frames += 1;
+                    assert!(frames <= 32, "shutdown close frame bound");
+                    let message = fixture.read().await.unwrap();
+                    match message["type"].as_str() {
+                        Some("event") => {
+                            validate_fixture_notice(&message).unwrap();
+                            let seq = message["sequence"].as_u64().unwrap();
+                            assert_eq!(seq, fixture.event_sequence + 1);
+                            fixture.event_sequence = seq;
+                        }
+                        Some("result") => {
+                            assert_eq!(message["generation"], 1);
+                        }
+                        Some("closed") => return message,
+                        _ => panic!("unexpected shutdown frame: {message}"),
+                    }
+                }
+            })
+            .await
+            .expect("shutdown close receipt stalled");
+            assert_eq!(closed["id"], "z");
+            assert_eq!(
+                closed["scopeState"], "closed",
+                "an interrupted retained capture must still prove cleanup: {closed}"
+            );
+            assert!(
+                closed.get("cleanup").is_none(),
+                "proven close must keep the legacy receipt shape: {closed}"
+            );
+            shutdown_receipt = Some(closed);
+            Value::Null
+        }
     } else {
         next_result(&mut fixture, &id).await
     };
@@ -407,7 +456,10 @@ async fn run(case: Case) {
             .await
             .unwrap();
     }
-    let end = if let Some(message) = pending_end {
+    let end = if shutdown_receipt.is_some() {
+        // The explicit Close already retired the scope.
+        Ok(Value::Null)
+    } else if let Some(message) = pending_end {
         if message["ok"] == true && message["scopeState"] == "usable" {
             Ok(message["data"].clone())
         } else {
@@ -552,6 +604,16 @@ async fn run(case: Case) {
             assert!(end.is_err());
             assert!(cleanup.is_err());
         }
+        Case::PendingShutdown => {
+            assert!(shutdown_receipt.is_some(), "missing explicit Close receipt");
+            assert!(end.is_ok());
+            assert!(cleanup.is_ok());
+            assert_eq!(result, Value::Null);
+            assert!(
+                !peer.early_restore.load(Ordering::Acquire),
+                "restoration must follow capture receipt, not run early"
+            );
+        }
         Case::PendingClose => {
             let contract = result["ok"] == false
                 && result.get("data").is_none()
@@ -610,6 +672,10 @@ async fn trace_timeout_without_continuation_negotiation_stays_quarantined() {
 #[tokio::test]
 async fn trace_timeout_pending_scope_end_waits_for_terminal_cleanup() {
     run(Case::PendingClose).await;
+}
+#[tokio::test]
+async fn trace_timeout_explicit_shutdown_drains_interrupted_cleanup_and_proves_close() {
+    run(Case::PendingShutdown).await;
 }
 
 #[tokio::test]
