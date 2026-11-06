@@ -4067,8 +4067,8 @@ Options:
                              e.g., --proxy-bypass "localhost,*.internal.com"
   --ignore-https-errors      Ignore HTTPS certificate errors
   --ca-cert <path>           Trust a specific CA certificate for HTTPS interception proxies
-                             (or AGENT_BROWSER_CA_CERT; CLI requests everywhere, local Chromium on Linux;
-                             install --with-deps provides certutil)
+                             (or AGENT_BROWSER_CA_CERT; CLI requests everywhere, local Chromium on Linux
+                             and macOS; on Linux install --with-deps provides certutil)
   --no-ca-cert               Clear CA trust retained by the running browser session
   --use-system-ca            Use the OS trust store for CLI requests (read, install, upgrade, doctor)
                              (or AGENT_BROWSER_USE_SYSTEM_CA)

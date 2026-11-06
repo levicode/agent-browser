@@ -331,18 +331,29 @@ impl ClientBrowser {
                 OpenRequest::Launch {
                     executable_path,
                     headless,
+                    ca_cert,
+                    proxy,
+                    proxy_bypass,
                     options,
-                } => (
-                    super::super::browser::BrowserManager::launch_owned_for_interop(
-                        super::super::cdp::chrome::LaunchOptions {
-                            executable_path,
-                            headless,
-                            ..Default::default()
-                        },
+                } => {
+                    let mut launch = super::super::actions::launch_options_from_env();
+                    launch.executable_path = executable_path.or(launch.executable_path);
+                    launch.headless = headless;
+                    if ca_cert.is_some() {
+                        launch.ca_cert = ca_cert;
+                    }
+                    if proxy.is_some() {
+                        launch.proxy = proxy;
+                    }
+                    if proxy_bypass.is_some() {
+                        launch.proxy_bypass = proxy_bypass;
+                    }
+                    (
+                        super::super::browser::BrowserManager::launch_owned_for_interop(launch)
+                            .await,
+                        options,
                     )
-                    .await,
-                    options,
-                ),
+                }
                 OpenRequest::Connect {
                     endpoint,
                     persistent: false,

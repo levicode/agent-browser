@@ -52,7 +52,7 @@ pub fn validate_launch_options(
         return Err("Cannot use storage_state with extensions".to_string());
     }
     if ca_cert.is_some() && has_cdp {
-        return Err("--ca-cert requires a locally launched Chromium browser on Linux".to_string());
+        return Err("--ca-cert requires a locally launched Chromium browser".to_string());
     }
     if ca_cert.is_some() && profile.is_some() {
         return Err(
@@ -60,8 +60,11 @@ pub fn validate_launch_options(
                 .to_string(),
         );
     }
-    if ca_cert.is_some() && !cfg!(target_os = "linux") {
-        return Err("--ca-cert is currently supported only on Linux".to_string());
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    if ca_cert.is_some() {
+        return Err(
+            "--ca-cert browser trust is currently supported only on Linux and macOS".to_string(),
+        );
     }
     if allow_file_access {
         if let Some(path) = executable_path {

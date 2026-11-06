@@ -16,7 +16,9 @@ use crate::validation::{is_valid_session_name, session_name_error};
 use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil, WedgeReport};
-use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
+#[cfg(target_os = "linux")]
+use super::cdp::chrome::prepare_nss_home;
+use super::cdp::chrome::LaunchOptions;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
@@ -4579,6 +4581,7 @@ async fn auto_launch_inner(
         "local",
         None,
     );
+    #[cfg(target_os = "linux")]
     if let Some(ref ca) = effective_ca_cert {
         options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
     }
@@ -4748,7 +4751,7 @@ async fn apply_launch_mutator_plugins(
     Ok(())
 }
 
-fn launch_options_from_env() -> LaunchOptions {
+pub(crate) fn launch_options_from_env() -> LaunchOptions {
     let headed = headed_from_env();
 
     let extensions: Option<Vec<String>> = env::var("AGENT_BROWSER_EXTENSIONS").ok().map(|v| {
@@ -4778,7 +4781,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ignore_https_errors: env::var("AGENT_BROWSER_IGNORE_HTTPS_ERRORS")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false),
-        ca_cert: None,
+        ca_cert: env::var("AGENT_BROWSER_CA_CERT").ok(),
         ca_bundle: None,
         ca_cert_digest: None,
         prepared_nss_home: None,
@@ -5293,7 +5296,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
             .get("ignoreHTTPSErrors")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        ca_cert: None,
+        ca_cert: env::var("AGENT_BROWSER_CA_CERT").ok(),
         ca_bundle: None,
         ca_cert_digest: None,
         prepared_nss_home: None,
@@ -5397,6 +5400,7 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
 
     if needs_relaunch {
         if local_launch {
+            #[cfg(target_os = "linux")]
             if let Some(ref ca) = effective_ca_cert {
                 launch_options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
             }

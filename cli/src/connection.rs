@@ -970,6 +970,11 @@ fn isolated_client_env_allowed(key: &str) -> bool {
                 | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
                 | "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE"
                 | "AGENT_BROWSER_INVOCATION_CUSTODY"
+                | "AGENT_BROWSER_CA_CERT"
+                | "AGENT_BROWSER_IGNORE_HTTPS_ERRORS"
+                | "AGENT_BROWSER_PROXY"
+                | "AGENT_BROWSER_PROXY_BYPASS"
+                | "AGENT_BROWSER_ARGS"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
         // Only the Linux acceptance binary may transport the four reviewed
