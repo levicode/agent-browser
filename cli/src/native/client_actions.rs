@@ -4758,6 +4758,9 @@ mod tests {
     mod observation_latency {
         include!("client_observation_latency_tests.rs");
     }
+    mod opaque_route_taps {
+        include!("client_actions_opaque_route_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
