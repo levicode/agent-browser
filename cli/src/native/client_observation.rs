@@ -4124,6 +4124,13 @@ async fn revalidate_deferred_pseudos(
         return Ok(());
     }
     let current = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
+    // A pseudo the fresh inventory no longer names is refused before any read,
+    // exactly as when every receiver was described one at a time.
+    for (backend, _) in deferred {
+        current
+            .get(backend)
+            .ok_or(ObservationError::StaleReference)?;
+    }
     // The proof is independent per receiver: describe every read pseudo in
     // bounded batches instead of a serialized round trip each.
     let mut described = Vec::with_capacity(deferred.len());
