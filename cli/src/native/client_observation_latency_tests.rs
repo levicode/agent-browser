@@ -22,6 +22,16 @@ const LARGE_PAGE: &str = r#"()=>{
   }
   parts.push('</main>');
   document.body.innerHTML=parts.join('');
+  // A real management list keeps most of its DOM out of the semantic tree: a
+  // hidden archive and anonymous wrappers are read by the observation but
+  // compacted away. 950 hidden rows plus their text nodes make the candidate
+  // count about five times the emitted node count, as on the reported page.
+  const archive=document.createElement('div');
+  archive.style.display='none';
+  document.getElementById('app').appendChild(archive);
+  // Text nodes, not extra elements: the field page's extra candidates are
+  // mostly character data inside wrappers that compact folds away.
+  for(let g=0;g<6800;g++){archive.appendChild(document.createTextNode('ghost '+g+' '));}
   location.hash='#/account_label';
   return {elements:document.querySelectorAll('*').length,buttons,wrappers,hash:location.hash};
 }"#;
@@ -65,15 +75,31 @@ const DENSE_LIGHT_PAGE: &str = r#"()=>{
     for(let i=0;i<30;i++){
       parts.push('<div class="row" data-index="'+s+'-'+i+'"><div class="cell"><span class="label">Row '+s+'-'+i+'</span></div>');
       parts.push('<button type="button" aria-label="Action '+s+'-'+i+'">Action '+s+'-'+i+'</button>');
-      parts.push('<div class="filler" aria-hidden="true"><span>f</span><span>f</span></div></div>');
+      parts.push('<div class="filler" aria-hidden="true"><span>f</span></div></div>');
       rows++;
     }
     parts.push('</section>');
   }
   parts.push('</main>');
   document.body.innerHTML=parts.join('');
+  // The reported page carries three visible plugin objects. They are opaque
+  // native frames: the observation must inventory them without reading their
+  // subtrees as semantic nodes.
+  for(let o=0;o<3;o++){
+    const holder=document.createElement('div');
+    holder.innerHTML='<object type="text/html" width="300" height="160" data="data:text/html;charset=utf-8,'+encodeURIComponent('<p>plugin '+o+'</p>')+'"></object>';
+    document.getElementById('app').appendChild(holder);
+  }
+  // Eight open shadow roots mirror the field page's custom-element hosts.
+  for(let h=0;h<8;h++){
+    const host=document.createElement('div');
+    host.id='shadow-host-'+h;
+    document.getElementById('app').appendChild(host);
+    const root=host.attachShadow({mode:'open'});
+    root.innerHTML='<span>shadow '+h+'</span>';
+  }
   location.hash='#/account_label';
-  return {elements:document.querySelectorAll('*').length,rows,hash:location.hash};
+  return {elements:document.querySelectorAll('*').length,objects:document.querySelectorAll('object').length,rows,shadows:8,hash:location.hash};
 }"#;
 
 #[tokio::test]
@@ -235,6 +261,7 @@ async fn e2e_observe_dense_light_page_prints_phase_baseline() {
         "the dense page must stay large enough to exercise many batches"
     );
     eprintln!("OBSERVE dense page={}", built["value"]);
+    assert_eq!(built["value"]["objects"], 3, "the dense page must keep the three opaque plugin frames");
 
     let start = Instant::now();
     let snapshot = observe_run(
