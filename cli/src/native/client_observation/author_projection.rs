@@ -32,6 +32,13 @@ pub(super) struct Facts {
     pub line_visible: Option<bool>,
     #[serde(default)]
     pub text: String,
+    /// The renderer's pointer/click/tab-stop/editable evidence for an element
+    /// that may carry no accessible name, role, text or test id. The classic
+    /// snapshot already promotes exactly these nodes into a ref-bearing
+    /// "clickable"/"focusable" node; observation keeps them too, so a model can
+    /// address a visible control that only its cursor marks as actionable.
+    #[serde(default)]
+    pub clickable: bool,
 }
 
 impl Facts {
@@ -514,8 +521,14 @@ pub(super) fn compact(
             || node.test_id.is_some()
             || node.name.is_some()
             || (f.action && coverage[id] && node.text.is_some());
+        // A visible action target is an addressable node even when it has
+        // nothing to name it. The direct-use snapshot already promotes an
+        // unnamed pointer/click/tab-stop/editable element into a ref, and a
+        // model that only ever receives the observation tree otherwise has no
+        // id at all for controls like an icon-font add button.
+        let actionable = f.clickable;
         if options.contains(id)
-            || f.visible && !f.suppress && (independent || (owns && !coverage[id]))
+            || f.visible && !f.suppress && (independent || (owns && !coverage[id]) || actionable)
         {
             retained.insert(*id);
         }
@@ -1000,6 +1013,61 @@ mod tests {
         let code = f.el("code", None, vec![code]);
         let p = f.el("p", None, vec![before, strong, code]);
         assert_eq!(texts(&f.run(vec![p])), vec![Some("Use bold code")]);
+    }
+    #[test]
+    fn clickable_evidence_keeps_an_unnamed_action_target() {
+        // An icon-font add button: a visible <i> with only a pointer cursor for
+        // evidence, so no role, name, text or test id. The direct-use snapshot
+        // promotes it into a ref-bearing clickable node; observation must emit
+        // the same addressable node instead of projecting it away.
+        let mut f = Fixture::default();
+        let icon = f.el("i", None, vec![]);
+        let icon_ref = reference(&icon);
+        f.facts_mut(&icon).clickable = true;
+        let nodes = f.run(vec![icon]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].reference.id, icon_ref);
+        assert_eq!(nodes[0].role, None);
+        assert_eq!(nodes[0].name, None);
+        assert_eq!(nodes[0].text, None);
+        assert_eq!(nodes[0].children.len(), 0);
+
+        // The identical leaf without pointer/click/tab-stop/editable evidence
+        // keeps the old projection: it is not an addressable node.
+        let mut plain = Fixture::default();
+        let inert = plain.el("i", None, vec![]);
+        assert!(plain.run(vec![inert]).is_empty());
+    }
+    #[test]
+    fn clickable_evidence_cannot_retain_a_suppressed_or_unpainted_node() {
+        // The renderer only sets the fact for a painted element, and compaction
+        // still owns suppression: neither can resurrect a node the model must
+        // not see.
+        let mut hidden = Fixture::default();
+        let ghost = hidden.el("i", None, vec![]);
+        hidden.facts_mut(&ghost).clickable = true;
+        hidden.facts_mut(&ghost).visible = false;
+        assert!(hidden.run(vec![ghost]).is_empty());
+
+        let mut suppressed = Fixture::default();
+        let inert = suppressed.el("i", None, vec![]);
+        suppressed.facts_mut(&inert).clickable = true;
+        suppressed.facts_mut(&inert).suppress = true;
+        assert!(suppressed.run(vec![inert]).is_empty());
+    }
+    #[test]
+    fn clickable_wrapper_is_emitted_once_around_its_observable_children() {
+        let mut f = Fixture::default();
+        let label = f.text("标签");
+        let name = f.el("span", None, vec![label]);
+        let name_ref = reference(&name);
+        let row = f.el("div", None, vec![name]);
+        f.facts_mut(&row).clickable = true;
+        let nodes = f.run(vec![row]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].reference.id, name_ref);
+        assert_eq!(nodes[0].children[0].text.as_deref(), Some("标签"));
     }
     #[test]
     fn presentational_roles_alone_do_not_retain_wrappers_or_lose_children() {
