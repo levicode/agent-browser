@@ -1386,6 +1386,21 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const inline=!!style&&(style.display.startsWith('inline')||style.display.startsWith('ruby')||style.display==='contents');
  const breaking=!!e&&(Element.prototype.matches.call(e,'br,input,textarea,select,button,iframe')||e.isContentEditable);
  const action=!!e&&(e.hasAttribute('onclick')||tag==='a'||/^\s*[-+]?\d/.test(e.getAttribute('tabindex')||''));
+ // Direct-use parity: the classic snapshot resolves a visible element whose only
+ // action evidence is a pointer cursor (not merely inherited from an ancestor),
+ // an authored click attribute, a real tab stop or an editable host. Record the
+ // same isolated evidence so observation can keep a control that otherwise has
+ // nothing to name it. A handler property is proved by the separate main-world
+ // hint, never by reading a page getter here.
+ const pointer=!!e&&style.cursor==='pointer';
+ const inheritedPointer=pointer&&!!e.parentElement&&doc.defaultView.getComputedStyle(e.parentElement).cursor==='pointer';
+ const selfBox=!!r&&r.width>0&&r.height>0;
+ const clickable=!!e&&!hidden&&selfBox&&(
+   (pointer&&!inheritedPointer)||
+   e.hasAttribute('onclick')||
+   (e.getAttribute('tabindex')!==null&&e.getAttribute('tabindex')!=='-1')||
+   (e instanceof HTMLElement&&e.isContentEditable&&!(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable))
+ );
  // Closed details excludes the body, but not the first summary's descendants.
  // Bound this per-receiver fact; do not invent visibility from a zero box.
  let inClosedDetails=false;
@@ -1425,7 +1440,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  else if(e&&e.hasAttribute('aria-checked'))controlStates.checked=e.getAttribute('aria-checked')==='true';
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
- const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
+ const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,clickable,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
  return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,safePublicNameFromContent,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:nativeValueControl?e.value:editingHost?editorValue:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
@@ -4525,7 +4540,9 @@ async fn read_batch_with_refs(
         } else {
             main_onclick_hints(client, frame, hint_candidates, lease).await?
         };
-        for (index,hint) in hints { if hint { values[index]["author"]["action"]=json!(true); } }
+        // A proved main-world handler is the same action evidence the direct
+        // snapshot reads from `onclick`; keep such a node addressable too.
+        for (index,hint) in hints { if hint { values[index]["author"]["action"]=json!(true); values[index]["author"]["clickable"]=json!(true); } }
         metadata_stage!(PseudoRevalidation);
         // An observation-supplied inventory already proves this document's
         // secure ancestry and labels; the per-batch inventory would re-read the
