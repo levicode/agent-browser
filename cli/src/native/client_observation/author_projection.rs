@@ -530,6 +530,18 @@ pub(super) fn compact(
         if options.contains(id)
             || f.visible && !f.suppress && (independent || (owns && !coverage[id]) || actionable)
         {
+            // The retained node may still have nothing the model can name it
+            // by: an icon-only close control has no role, name, text or test
+            // id, and the pointer cursor that proves it is actionable is not
+            // part of the public line. The direct-use snapshot says so
+            // ("clickable [cursor:pointer]"); observation must carry the same
+            // evidence, or the model sees an empty line and cannot tell the
+            // control from a decorative node. Only an anonymous action target
+            // needs it; a named control is already identifiable.
+            let named = independent || node.text.as_deref().is_some_and(|text| !text.is_empty());
+            if actionable && f.visible && !f.suppress && !named {
+                node.states.insert("clickable".into(), true);
+            }
             retained.insert(*id);
         }
     }
@@ -1031,12 +1043,44 @@ mod tests {
         assert_eq!(nodes[0].name, None);
         assert_eq!(nodes[0].text, None);
         assert_eq!(nodes[0].children.len(), 0);
+        // The pointer/click evidence must survive into the public line: an
+        // empty ref alone tells the model nothing about which node acts.
+        assert_eq!(nodes[0].states.get("clickable"), Some(&true));
+        let encoded = serde_json::to_value(&nodes[0]).unwrap();
+        assert_eq!(encoded["states"]["clickable"], json!(true));
 
         // The identical leaf without pointer/click/tab-stop/editable evidence
         // keeps the old projection: it is not an addressable node.
         let mut plain = Fixture::default();
         let inert = plain.el("i", None, vec![]);
         assert!(plain.run(vec![inert]).is_empty());
+    }
+    #[test]
+    fn clickable_state_is_only_for_a_node_without_other_identity() {
+        // A named control needs no hint; adding one to every clickable node
+        // would repeat what its role and name already say.
+        let mut named = Fixture::default();
+        let button = named.el("button", Some("button"), vec![]);
+        named
+            .nodes
+            .get_mut(&button["backendNodeId"].as_i64().unwrap())
+            .unwrap()
+            .name = Some("Delete".into());
+        named.facts_mut(&button).clickable = true;
+        let nodes = named.run(vec![button]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].states.get("clickable"), None);
+
+        // A clickable leaf that names itself with its own text is identified
+        // already; the hint would be redundant.
+        let mut authored = Fixture::default();
+        let label = authored.text("删除");
+        let action = authored.el("span", None, vec![label]);
+        authored.facts_mut(&action).clickable = true;
+        let nodes = authored.run(vec![action]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].text.as_deref(), Some("删除"));
+        assert_eq!(nodes[0].states.get("clickable"), None);
     }
     #[test]
     fn clickable_evidence_cannot_retain_a_suppressed_or_unpainted_node() {
