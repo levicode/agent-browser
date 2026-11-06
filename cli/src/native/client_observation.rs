@@ -1504,6 +1504,7 @@ async fn read_backend(
         &acquisition_policy,
         None,
         None,
+        None,
     )
     .await?
     .into_iter()
@@ -2617,17 +2618,29 @@ pub async fn observe(
             frame_kind,
             serde_json::from_value(value).map_err(|_| ObservationError::BackendFailure)
         )?;
-        let security = semantic_capture_stage!(
-            witness,
-            SecurityInventory,
-            frame_kind,
-            security_inventory(client, frame, options, lease).await
-        )?;
+        // One verified frame read feeds both the security inventory and the
+        // author graph. A second full DOM read one round trip later is the same
+        // document for every proof that consumes it, and only doubles the
+        // serialization cost of a dense page.
         let dom = semantic_capture_stage!(
             witness,
             AuthorDom,
             frame_kind,
             frame_dom(client, frame, lease).await
+        )?;
+        // One isolated realm serves this document's security proof and every
+        // metadata batch; each batch used to create its own.
+        let realm = semantic_capture_stage!(
+            witness,
+            FrameProof,
+            frame_kind,
+            observation_realm(client, frame, lease).await
+        )?;
+        let security = semantic_capture_stage!(
+            witness,
+            SecurityInventory,
+            frame_kind,
+            security_inventory_from_dom(client, frame, options, lease, &dom, realm).await
         )?;
         let graph = semantic_capture_stage!(
             witness,
@@ -2706,6 +2719,7 @@ pub async fn observe(
                     true,
                     &security,
                     &pseudos,
+                    Some(realm),
                 )
                 .await
             )?;
@@ -3927,6 +3941,7 @@ async fn evaluate_query_diagnostic_inner(
                 lease,
                 &dom,
                 plan.roots.0.clone(),
+                None,
             )
             .await?
         }
@@ -3940,7 +3955,7 @@ async fn evaluate_query_diagnostic_inner(
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None).await?);
+            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None).await?);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
     witness.stage(Stage::QueryWorld);
@@ -3977,7 +3992,7 @@ async fn evaluate_query_diagnostic_inner(
             let current = role_candidates::plan(&current_dom["root"],&current_ax,expression,options)?;
             if current.as_ref() != Some(expected) { return Err(ObservationError::StaleReference); }
     witness.stage(Stage::SecurityConfirm);
-            let current_security = security_inventory_for_roots(client,frame,&metadata_options,lease,&current_dom,expected.roots.0.clone()).await?;
+            let current_security = security_inventory_for_roots(client,frame,&metadata_options,lease,&current_dom,expected.roots.0.clone(),None).await?;
             if !role_candidates::same_security(&security,&current_security,&ids) { return Err(ObservationError::StaleReference); }
             // Public names can use live properties/computed styles not represented
             // by DOM attributes. Reuse the original projection rather than invent
@@ -3985,7 +4000,7 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::MetadataConfirm);
             let mut confirmed = Vec::new();
             for chunk in ax_nodes.chunks(64) {
-                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None).await?);
+                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None,None).await?);
             }
             for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
             if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
@@ -4109,18 +4124,33 @@ async fn revalidate_deferred_pseudos(
         return Ok(());
     }
     let current = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
-    for (backend, origin) in deferred {
+    // The proof is independent per receiver: describe every read pseudo in
+    // bounded batches instead of a serialized round trip each.
+    let mut described = Vec::with_capacity(deferred.len());
+    for chunk in deferred.chunks(16) {
+        let futures = chunk
+            .iter()
+            .map(|(backend, _)| {
+                let backend = *backend;
+                async move {
+                    command(
+                        client,
+                        &frame.binding.session,
+                        "DOM.describeNode",
+                        json!({"backendNodeId":backend,"depth":0}),
+                        lease,
+                    )
+                    .await
+                }
+            })
+            .collect::<Vec<_>>();
+        described.extend(futures_util::future::join_all(futures).await);
+    }
+    let described = collect_hint_results(described)?;
+    for ((backend, origin), described) in deferred.iter().zip(&described) {
         let fresh = current
             .get(backend)
             .ok_or(ObservationError::StaleReference)?;
-        let described = command(
-            client,
-            &frame.binding.session,
-            "DOM.describeNode",
-            json!({"backendNodeId":backend,"depth":0}),
-            lease,
-        )
-        .await?;
         let node = &described["node"];
         if node["backendNodeId"].as_i64() != Some(*backend)
             || node["nodeType"] != 1
@@ -4441,6 +4471,7 @@ async fn read_batch(
     bounded: bool,
     acquisition_policy: &SecurityInventory,
     pseudos: &PseudoObservation,
+    execution_context: Option<i64>,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
     read_batch_with_refs(
         client,
@@ -4454,6 +4485,7 @@ async fn read_batch(
         acquisition_policy,
         Some(&pseudos.origins),
         Some(&pseudos.deferred),
+        execution_context,
     )
     .await
 }
@@ -4470,6 +4502,7 @@ async fn read_batch_with_refs(
     acquisition_policy: &SecurityInventory,
     pseudo_inventory: Option<&std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>>,
     deferred_pseudos: Option<&std::sync::Mutex<Vec<(i64, i64)>>>,
+    execution_context: Option<i64>,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
     use futures_util::{stream, StreamExt};
     if nodes.is_empty() {
@@ -4491,8 +4524,13 @@ async fn read_batch_with_refs(
     }
     let capture = client_debt::ReadonlyGroupCapture::new(&group);
     let result=capture.scope(async {
-        let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
-        let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
+        let context=match execution_context {
+            Some(context)=>context,
+            None=>{
+                let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
+                world["executionContextId"].as_i64().ok_or("Missing isolated realm")?
+            }
+        };
         metadata_stage!(Resolve);
         let backend_ids:Vec<Option<i64>>=nodes.iter().map(|ax|ax.backend_d_o_m_node_id).collect();
         let resolved:Vec<Result<Value,ObservationError>>=stream::iter(backend_ids.into_iter().map(|backend| {
@@ -4513,18 +4551,54 @@ async fn read_batch_with_refs(
         let cached=if has_pseudo{pseudo_inventory.and_then(|inventory|inventory.lock().ok().and_then(|origins|origins.clone()))}else{None};
         let origins=if has_pseudo{match cached{Some(origins)=>origins,None=>{let fresh=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;if let Some(inventory)=pseudo_inventory{*inventory.lock().map_err(|_|ObservationError::BackendFailure)?=Some(fresh.clone());}fresh}}}else{HashMap::new()};
         metadata_stage!(ReceiverIdentity);
+        // Every non-node receiver is a CSS pseudo element or list marker whose
+        // metadata must be read through its proven owner element. Describe and
+        // resolve them in bounded batches; a per-receiver sequence paid two
+        // serialized round trips each, so a pseudo-heavy page spent much of its
+        // metadata time waiting rather than reading.
+        let pseudo_indices:Vec<usize>=nodes.iter().enumerate().filter(|(index,_)|resolved[*index]["object"]["subtype"]!="node").map(|(index,_)|index).collect();
+        let mut described=Vec::with_capacity(pseudo_indices.len());
+        for chunk in pseudo_indices.chunks(16){
+            let futures=chunk.iter().map(|index|{
+                let index=*index;
+                let backend=nodes[index].backend_d_o_m_node_id;
+                async move {
+                    let backend=backend.ok_or(ObservationError::BackendFailure)?;
+                    command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await
+                }
+            }).collect::<Vec<_>>();
+            described.extend(futures_util::future::join_all(futures).await);
+        }
+        let described=collect_hint_results(described)?;
+        let mut proven=Vec::with_capacity(pseudo_indices.len());
+        for (index,described) in pseudo_indices.iter().zip(&described){
+            let remote=&resolved[*index]["object"];
+            let backend=nodes[*index].backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+            #[cfg(test)]
+            eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&nodes[*index].role).as_deref()==Some("ListMarker"));
+            proven.push(verified_pseudo_origin(remote,described,backend,&origins)?);
+        }
+        let mut owners=Vec::with_capacity(proven.len());
+        for chunk in proven.chunks(16){
+            let futures=chunk.iter().map(|origin|{
+                let origin=*origin;let group=&group;
+                async move {
+                    let owner=resolve_page_object(client,session,origin,Some(context),group,lease).await?;
+                    if owner["object"]["subtype"]!="node"{return Err(ObservationError::StaleReference);}
+                    owner["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
+                }
+            }).collect::<Vec<_>>();
+            owners.extend(futures_util::future::join_all(futures).await);
+        }
+        let owners=collect_hint_results(owners)?;
+        let mut by_index=HashMap::with_capacity(pseudo_indices.len());
+        for ((index,origin),owner) in pseudo_indices.iter().zip(proven).zip(owners){by_index.insert(*index,(origin,owner));}
         let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
-        for (ax,value) in nodes.iter().zip(&resolved){
+        for (index,value) in resolved.iter().enumerate(){
             let remote=&value["object"];
             if remote["subtype"]=="node" { objects.push(remote["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(None);continue; }
-            let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
-            let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
-            #[cfg(test)]
-            eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&ax.role).as_deref()==Some("ListMarker"));
-            let origin=verified_pseudo_origin(remote,&described,backend,&origins)?;
-            let owner=resolve_page_object(client,session,origin,Some(context),&group,lease).await?;
-            if owner["object"]["subtype"]!="node"{return Err(ObservationError::StaleReference);}
-            objects.push(owner["object"]["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(Some(origin));
+            let (origin,owner)=by_index.remove(&index).ok_or(ObservationError::BackendFailure)?;
+            objects.push(owner);pseudo.push(Some(origin));
         }
         metadata_stage!(ReceiverPolicy);
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
@@ -5870,6 +5944,26 @@ fn security_handles(properties: &Value) -> Result<(Option<String>, Vec<String>),
     Ok((focus.ok_or(ObservationError::BackendFailure)?, ancestors))
 }
 
+/// One isolated renderer realm for this document's read-only metadata. Opening
+/// it once per observation keeps every batch's object resolution in a live
+/// context without paying world creation for each batch.
+async fn observation_realm(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+) -> Result<i64, ObservationError> {
+    let world = command(
+        client,
+        &frame.binding.session,
+        "Page.createIsolatedWorld",
+        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),
+        lease,
+    )
+    .await?;
+    world["executionContextId"]
+        .as_i64()
+        .ok_or(ObservationError::BackendFailure)
+}
 async fn security_inventory(
     client: &CdpClient,
     frame: &ObservationFrame,
@@ -5877,8 +5971,37 @@ async fn security_inventory(
     lease: &OperationLease,
 ) -> Result<SecurityInventory, ObservationError> {
     let dom = frame_dom(client, frame, lease).await?;
+    security_inventory_from_dom(
+        client,
+        frame,
+        options,
+        lease,
+        &dom,
+        observation_realm(client, frame, lease).await?,
+    )
+    .await
+}
+/// The same proof over an already acquired verified frame read, in the
+/// observation's shared realm.
+async fn security_inventory_from_dom(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    dom: &Value,
+    execution_context: i64,
+) -> Result<SecurityInventory, ObservationError> {
     let ids = security_root_ids(&dom["root"])?;
-    security_inventory_for_roots(client, frame, options, lease, &dom, ids).await
+    security_inventory_for_roots(
+        client,
+        frame,
+        options,
+        lease,
+        dom,
+        ids,
+        Some(execution_context),
+    )
+    .await
 }
 
 // The normal caller supplies every native root. A role candidate proof may
@@ -5890,6 +6013,7 @@ async fn security_inventory_for_roots(
     lease: &OperationLease,
     dom: &Value,
     ids: Vec<i64>,
+    execution_context: Option<i64>,
 ) -> Result<SecurityInventory, ObservationError> {
     use futures_util::{stream, StreamExt};
     let browser_internal = browser_internal_ids(&dom["root"])?;
@@ -5905,8 +6029,13 @@ async fn security_inventory_for_roots(
         .map_err(|_| ObservationError::ResourceLimit)?;
     let capture = client_debt::ReadonlyGroupCapture::new(&group);
     let result=capture.scope(async {
-        let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
-        let context=world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
+        let context=match execution_context {
+            Some(context)=>context,
+            None=>{
+                let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
+                world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?
+            }
+        };
         let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
             let object=resolve_page_object(client,session,backend,Some(context),group,lease).await?;
             object["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)
@@ -11704,6 +11833,7 @@ mod tests {
             },
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -12614,6 +12744,7 @@ mod tests {
             true,
             &policy,
             &pseudos,
+            None,
         )
         .await
         .unwrap();
@@ -12630,6 +12761,7 @@ mod tests {
                 true,
                 &policy,
                 &pseudos,
+                None,
             )
             .await
             .unwrap();
@@ -12639,6 +12771,83 @@ mod tests {
             &[(3, 2), (3, 2)],
             "every read pseudo must be deferred to the observation-wide proof"
         );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_realm_is_reused_across_metadata_batches() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut worlds = 0;
+            let mut resolves = 0;
+            let mut releases = 0;
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.createIsolatedWorld" => {
+                        worlds += 1;
+                        json!({"executionContextId":17})
+                    }
+                    "DOM.resolveNode" => {
+                        resolves += 1;
+                        assert_eq!(request["params"]["executionContextId"], 17);
+                        let backend = request["params"]["backendNodeId"].as_i64().unwrap();
+                        json!({"object":{"type":"object","subtype":"node","objectId":format!("node-{backend}")}})
+                    }
+                    "Runtime.callFunctionOn" => json!({"result":{"value":[metadata()]}}),
+                    "Runtime.releaseObjectGroup" => {
+                        releases += 1;
+                        json!({})
+                    }
+                    method => panic!("unexpected realm command {method}"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if releases == 2 {
+                    break;
+                }
+            }
+            assert_eq!(worlds, 0, "a supplied realm must not create another");
+            assert_eq!(resolves, 2);
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let (lease, _sender) = lease();
+        let mut refs = observed_refs();
+        let pseudos = PseudoObservation {
+            origins: std::sync::Mutex::new(None),
+            deferred: std::sync::Mutex::new(Vec::new()),
+        };
+        let options = ObservationOptions::default();
+        let policy = SecurityInventory::default();
+        for (id, backend) in [("first", 42), ("second", 43)] {
+            let node = ax(id, backend, &[]);
+            read_batch(
+                &client,
+                &frame(),
+                &[&node],
+                &mut refs,
+                1,
+                &options,
+                &lease,
+                true,
+                &policy,
+                &pseudos,
+                Some(17),
+            )
+            .await
+            .unwrap();
+        }
         server.await.unwrap();
     }
 
@@ -12795,6 +13004,7 @@ mod tests {
                 &op,
                 true,
                 &SecurityInventory::default(),
+                None,
                 None,
                 None,
             )

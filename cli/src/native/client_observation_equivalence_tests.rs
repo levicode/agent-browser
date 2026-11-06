@@ -1295,6 +1295,7 @@ async fn metadata_acquisition_error_drains_started_sibling_before_group_release(
         &SecurityInventory::default(),
         None,
         None,
+        None,
     )
     .await;
     assert_eq!(result.unwrap_err(), ObservationError::BackendFailure);
