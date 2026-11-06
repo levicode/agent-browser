@@ -487,6 +487,35 @@ async fn command(
     }
     result
 }
+
+/// A backend node id is a live-page fact. The caller reads that id from a
+/// tree, then asks the renderer to resolve the object behind it. A page that
+/// replaces the node between those two reads (a route change, a hydration
+/// swap, a form commit still settling) makes the id unresolvable even though
+/// the read itself is healthy. That is a stale reference to the screen the
+/// caller read, so a read-only observation can be re-read against the new
+/// page instead of surfacing as an engine fault. Cancellation and the
+/// operation deadline keep their own classification, and every other read
+/// failure stays a backend failure.
+async fn resolve_page_object(
+    client: &CdpClient,
+    session: &str,
+    backend: i64,
+    execution_context: Option<i64>,
+    group: &str,
+    lease: &OperationLease,
+) -> Result<Value, ObservationError> {
+    let mut params = json!({"backendNodeId":backend,"objectGroup":group});
+    if let Some(context) = execution_context {
+        params["executionContextId"] = Value::from(context);
+    }
+    command(client, session, "DOM.resolveNode", params, lease)
+        .await
+        .map_err(|error| match error {
+            ObservationError::BackendFailure => ObservationError::StaleReference,
+            other => other,
+        })
+}
 #[cfg(test)]
 fn diagnostic_site(args: &Value) -> &'static str {
     match args["functionDeclaration"].as_str() {
@@ -2391,7 +2420,7 @@ impl HiddenFrameProof {
                 if owner["backendNodeId"].as_i64().ok_or(ObservationError::BackendFailure)? != backend { return Err(ObservationError::StaleReference); }
                 let world = command(client, session, "Page.createIsolatedWorld", json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}), lease).await?;
                 let context = world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
-                let remote = command(client, session, "DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}), lease).await?;
+                let remote = resolve_page_object(client, session, backend, Some(context), &group, lease).await?;
                 if remote["object"]["subtype"] != "node" { return Err(ObservationError::BackendFailure); }
                 let object = remote["object"]["objectId"].as_str().ok_or(ObservationError::BackendFailure)?;
                 // The same metadata reader validates the native receiver/document.
@@ -3922,7 +3951,7 @@ async fn evaluate_query_diagnostic_inner(
         let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend: i64| {
             let group=&group;
             async move {
-                let value=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await?;
+                let value=resolve_page_object(client,session,backend,Some(context),group,lease).await?;
                 value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
             }
         })).buffered(16).collect().await;
@@ -4300,14 +4329,9 @@ async fn main_onclick_hints(
                         let backend = *backend;
                         let group = group.clone();
                         async move {
-                            let resolved = command(
-                                client,
-                                session,
-                                "DOM.resolveNode",
-                                json!({"backendNodeId":backend,"objectGroup":group}),
-                                lease,
-                            )
-                            .await?;
+                            let resolved =
+                                resolve_page_object(client, session, backend, None, &group, lease)
+                                    .await?;
                             if resolved["object"]["type"] != "object"
                                 || resolved["object"]["subtype"] != "node"
                             {
@@ -4474,7 +4498,10 @@ async fn read_batch_with_refs(
         let resolved:Vec<Result<Value,ObservationError>>=stream::iter(backend_ids.into_iter().map(|backend| {
             let group=&group;
             async move {
-                command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await
+                // Every candidate carries the backend id its tree listed. A
+                // missing one is the same lost node as an unresolvable id.
+                let backend = backend.ok_or(ObservationError::StaleReference)?;
+                resolve_page_object(client,session,backend,Some(context),group,lease).await
             }
         })).buffered(16).collect().await;
         let resolved=collect_hint_results(resolved)?;
@@ -4495,7 +4522,7 @@ async fn read_batch_with_refs(
             #[cfg(test)]
             eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&ax.role).as_deref()==Some("ListMarker"));
             let origin=verified_pseudo_origin(remote,&described,backend,&origins)?;
-            let owner=command(client,session,"DOM.resolveNode",json!({"backendNodeId":origin,"executionContextId":context,"objectGroup":group}),lease).await?;
+            let owner=resolve_page_object(client,session,origin,Some(context),&group,lease).await?;
             if owner["object"]["subtype"]!="node"{return Err(ObservationError::StaleReference);}
             objects.push(owner["object"]["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(Some(origin));
         }
@@ -5107,7 +5134,7 @@ async fn enumerate_frames_impl(
                     .map_err(|_| ObservationError::ResourceLimit)?;
                 let capture = client_debt::ReadonlyGroupCapture::new(&group);
                 let result = capture.scope(async {
-                    let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":group}),lease).await?;
+                    let resolved=resolve_page_object(client,&parent.binding.session,backend,world["executionContextId"].as_i64(),&group,lease).await?;
                     let object = resolved["object"]["objectId"].as_str().ok_or("Frame owner unavailable")?;
                     let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true,"objectGroup":group}),lease).await?;
                     if value.get("exceptionDetails").is_some() { Err(ObservationError::StaleReference) } else { Ok(value) }
@@ -5124,7 +5151,15 @@ async fn enumerate_frames_impl(
                 )
                 .await?
             } else {
-                let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":"native-frame-enumeration"}),lease).await?;
+                let resolved = resolve_page_object(
+                    client,
+                    &parent.binding.session,
+                    backend,
+                    world["executionContextId"].as_i64(),
+                    "native-frame-enumeration",
+                    lease,
+                )
+                .await?;
                 let object = resolved["object"]["objectId"]
                     .as_str()
                     .ok_or("Frame owner unavailable")?;
@@ -5873,7 +5908,7 @@ async fn security_inventory_for_roots(
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
         let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
-            let object=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await?;
+            let object=resolve_page_object(client,session,backend,Some(context),group,lease).await?;
             object["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)
         }})).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
@@ -10289,6 +10324,14 @@ mod tests {
         json!({"author":{"tag":"button","action":true,"visible":true},"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Save","rect":{"x":1,"y":2,"width":3,"height":4}})
     }
     async fn mock_client(fail_after_metadata: bool) -> (CdpClient, tokio::task::JoinHandle<()>) {
+        mock_client_with_cdp_failure(fail_after_metadata, None).await
+    }
+    /// A peer whose named CDP method answers with a protocol error, standing
+    /// in for one the page invalidated between the tree read and the call.
+    async fn mock_client_with_cdp_failure(
+        fail_after_metadata: bool,
+        fail_method: Option<&'static str>,
+    ) -> (CdpClient, tokio::task::JoinHandle<()>) {
         use futures_util::{SinkExt, StreamExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -10301,6 +10344,18 @@ mod tests {
                     continue;
                 };
                 let request: Value = serde_json::from_str(text).unwrap();
+                if fail_method == Some(request["method"].as_str().unwrap()) {
+                    if ws
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"No node with given id found"}}).to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 let result = match request["method"].as_str().unwrap() {
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","url":"https://fixture.invalid","loaderId":if metadata_read&&fail_after_metadata{"replaced"}else{"doc"}}}})
@@ -10376,6 +10431,49 @@ mod tests {
         assert!(refs.get(&previous).is_some());
         assert!(refs.get("e2").is_none());
         assert_eq!(refs.allocate_ref(), "e3");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn node_removed_during_the_metadata_read_is_a_stale_reference() {
+        let (client, server) = mock_client_with_cdp_failure(false, Some("DOM.resolveNode")).await;
+        let (lease, _sender) = lease();
+        let mut refs = observed_refs();
+        assert_eq!(
+            observe(
+                &client,
+                &[frame()],
+                &mut refs,
+                "scope",
+                1,
+                &ObservationOptions::default(),
+                &lease
+            )
+            .await
+            .unwrap_err(),
+            ObservationError::StaleReference
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn other_cdp_read_failures_stay_backend_failures() {
+        let (client, server) =
+            mock_client_with_cdp_failure(false, Some("Accessibility.getFullAXTree")).await;
+        let (lease, _sender) = lease();
+        let mut refs = observed_refs();
+        assert_eq!(
+            observe(
+                &client,
+                &[frame()],
+                &mut refs,
+                "scope",
+                1,
+                &ObservationOptions::default(),
+                &lease
+            )
+            .await
+            .unwrap_err(),
+            ObservationError::BackendFailure
+        );
         server.abort();
     }
     #[tokio::test]
