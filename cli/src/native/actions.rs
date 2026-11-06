@@ -17363,6 +17363,52 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
+    fn test_launch_options_from_env_reads_forwarded_browser_launch_defaults() {
+        // The isolated `session connect` transport forwards exactly these
+        // environment names, so the daemon-side defaults must consume them.
+        let guard = EnvGuard::new(&[
+            "AGENT_BROWSER_CA_CERT",
+            "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+            "AGENT_BROWSER_PROXY",
+            "AGENT_BROWSER_PROXY_BYPASS",
+            "AGENT_BROWSER_ARGS",
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+        ]);
+        guard.set("AGENT_BROWSER_CA_CERT", "/tmp/proxy-ca.pem");
+        guard.set("AGENT_BROWSER_IGNORE_HTTPS_ERRORS", "1");
+        guard.set("AGENT_BROWSER_PROXY", "http://proxy.example.com:8080");
+        guard.set(
+            "AGENT_BROWSER_PROXY_BYPASS",
+            "*.internal.example.com,localhost",
+        );
+        guard.set(
+            "AGENT_BROWSER_ARGS",
+            "--disable-features=Translate\n--window-size=1280,720",
+        );
+        guard.set(
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            "/opt/chrome-for-testing/chrome",
+        );
+
+        let opts = launch_options_from_env();
+        assert_eq!(opts.ca_cert.as_deref(), Some("/tmp/proxy-ca.pem"));
+        assert!(opts.ignore_https_errors);
+        assert_eq!(opts.proxy.as_deref(), Some("http://proxy.example.com:8080"));
+        assert_eq!(
+            opts.proxy_bypass.as_deref(),
+            Some("*.internal.example.com,localhost")
+        );
+        assert_eq!(
+            opts.args,
+            vec!["--disable-features=Translate", "--window-size=1280,720",]
+        );
+        assert_eq!(
+            opts.executable_path.as_deref(),
+            Some("/opt/chrome-for-testing/chrome")
+        );
+    }
+
+    #[test]
     fn test_launch_options_from_env_hide_scrollbars_false() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_HIDE_SCROLLBARS"]);
         guard.set("AGENT_BROWSER_HIDE_SCROLLBARS", "false");
