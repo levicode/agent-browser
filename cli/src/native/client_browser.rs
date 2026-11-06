@@ -2043,6 +2043,9 @@ struct ScopeOpenWire {
     executable_path: Option<String>,
     headless: Option<bool>,
     endpoint: Option<String>,
+    ca_cert: Option<String>,
+    proxy: Option<String>,
+    proxy_bypass: Option<String>,
     #[serde(default)]
     block_service_workers: bool,
     viewport: Option<InitialViewport>,
@@ -2058,6 +2061,9 @@ enum OpenRequest {
     Launch {
         executable_path: Option<String>,
         headless: bool,
+        ca_cert: Option<String>,
+        proxy: Option<String>,
+        proxy_bypass: Option<String>,
         options: ScopeCreationOptions,
     },
     Connect {
@@ -2130,12 +2136,18 @@ impl<'de> serde::Deserialize<'de> for OpenRequest {
             "launch" if context == "isolated" && wire.endpoint.is_none() => Ok(Self::Launch {
                 executable_path: wire.executable_path,
                 headless: wire.headless.unwrap_or(true),
+                ca_cert: wire.ca_cert,
+                proxy: wire.proxy,
+                proxy_bypass: wire.proxy_bypass,
                 options,
             }),
             "connect"
                 if matches!(context, "isolated" | "persistent")
                     && wire.executable_path.is_none()
-                    && wire.headless.is_none() =>
+                    && wire.headless.is_none()
+                    && wire.ca_cert.is_none()
+                    && wire.proxy.is_none()
+                    && wire.proxy_bypass.is_none() =>
             {
                 let endpoint = wire
                     .endpoint
@@ -2151,7 +2163,10 @@ impl<'de> serde::Deserialize<'de> for OpenRequest {
                 if context == "isolated"
                     && wire.endpoint.is_none()
                     && wire.executable_path.is_none()
-                    && wire.headless.is_none() =>
+                    && wire.headless.is_none()
+                    && wire.ca_cert.is_none()
+                    && wire.proxy.is_none()
+                    && wire.proxy_bypass.is_none() =>
             {
                 Ok(Self::Reuse { options })
             }
@@ -2755,18 +2770,27 @@ impl ClientBrowser {
                 OpenRequest::Launch {
                     executable_path,
                     headless,
+                    ca_cert,
+                    proxy,
+                    proxy_bypass,
                     ..
                 } => {
-                    match super::browser::BrowserManager::launch_owned(
-                        super::cdp::chrome::LaunchOptions {
-                            executable_path,
-                            headless,
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .await
-                    {
+                    // The dedicated session transport keeps the client's
+                    // browser environment across its isolated boundary; the
+                    // launch command's explicit fields win over it.
+                    let mut options = super::actions::launch_options_from_env();
+                    options.executable_path = executable_path.or(options.executable_path);
+                    options.headless = headless;
+                    if ca_cert.is_some() {
+                        options.ca_cert = ca_cert;
+                    }
+                    if proxy.is_some() {
+                        options.proxy = proxy;
+                    }
+                    if proxy_bypass.is_some() {
+                        options.proxy_bypass = proxy_bypass;
+                    }
+                    match super::browser::BrowserManager::launch_owned(options, None).await {
                         Ok(manager) => {
                             OwnedBrowser::isolated_for_scope(
                                 manager,

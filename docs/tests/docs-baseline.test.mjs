@@ -223,7 +223,7 @@ test("intentional docs edits apply to the live floor without touching the pinned
   const before = "It is not supported on macOS or Windows.";
   assert.ok(original.modernMarkdown.includes(before));
   assert.ok(!current.modernMarkdown.includes(before));
-  assert.ok(current.content.some((sample) => sample.includes("where Chromium already uses the operating system trust store")));
+  assert.ok(current.content.some((sample) => sample.includes("Browser trust is still not supported on Windows.")));
 });
 
 test("link normalization preserves origin, path, query and fragment destinations", () => {

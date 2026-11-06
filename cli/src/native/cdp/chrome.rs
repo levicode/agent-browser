@@ -431,6 +431,48 @@ struct ChromeArgs {
     temp_user_data_dir: Option<PathBuf>,
 }
 
+#[cfg(target_os = "macos")]
+fn add_macos_ca_spki_pins(options: &LaunchOptions, args: &mut Vec<String>) -> Result<(), String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let bundle = match options.ca_bundle.clone() {
+        Some(bundle) => bundle,
+        None => match options.ca_cert.as_deref() {
+            Some(path) => crate::ca_bundle::load(path)?,
+            None => return Ok(()),
+        },
+    };
+    let mut pins: Vec<String> = Vec::new();
+    for cert in bundle.certificates() {
+        let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
+            .map_err(|error| format!("Failed to parse CA certificate for macOS trust: {error}"))?;
+        let digest = Sha256::digest(parsed.tbs_certificate.subject_pki.raw);
+        pins.push(base64::engine::general_purpose::STANDARD.encode(digest));
+    }
+    if pins.is_empty() {
+        return Ok(());
+    }
+    const FLAG: &str = "--ignore-certificate-errors-spki-list=";
+    let mut merged: Vec<String> = Vec::new();
+    if let Some(existing) = args.iter().find(|argument| argument.starts_with(FLAG)) {
+        merged.extend(
+            existing[FLAG.len()..]
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+    }
+    for pin in pins {
+        if !merged.iter().any(|value| value == &pin) {
+            merged.push(pin);
+        }
+    }
+    args.retain(|argument| !argument.starts_with(FLAG));
+    args.push(format!("{FLAG}{}", merged.join(",")));
+    Ok(())
+}
+
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
@@ -590,6 +632,12 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     if should_disable_dev_shm(&args) {
         args.push("--disable-dev-shm-usage".to_string());
     }
+
+    // macOS has no per-profile NSS store for Chromium to read; pin the CA's
+    // public key in Chrome's own SPKI allowlist, derived from the named file.
+    // Linux keeps its isolated NSS database.
+    #[cfg(target_os = "macos")]
+    add_macos_ca_spki_pins(options, &mut args)?;
 
     Ok(ChromeArgs {
         args,
@@ -1877,6 +1925,54 @@ mod tests {
         assert!(!should_disable_dev_shm(&[
             "--disable-dev-shm-usage".to_string()
         ]));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_ca_cert_adds_spki_allow_list_and_keeps_user_hashes() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tls/ca-a.pem");
+        let bundle = crate::ca_bundle::load(path).unwrap();
+        let expected: Vec<String> = bundle
+            .certificates()
+            .iter()
+            .map(|cert| {
+                let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref()).unwrap();
+                let digest = Sha256::digest(parsed.tbs_certificate.subject_pki.raw);
+                base64::engine::general_purpose::STANDARD.encode(digest)
+            })
+            .collect();
+        assert!(!expected.is_empty());
+
+        let options = LaunchOptions {
+            headless: true,
+            ca_cert: Some(path.to_string()),
+            args: vec!["--ignore-certificate-errors-spki-list=user-pin".to_string()],
+            ..Default::default()
+        };
+        let built = build_chrome_args(&options).unwrap();
+        let flag = built
+            .args
+            .iter()
+            .find(|argument| argument.starts_with("--ignore-certificate-errors-spki-list="))
+            .expect("macOS CA trust must add the SPKI allow list");
+        let values: Vec<&str> = flag["--ignore-certificate-errors-spki-list=".len()..]
+            .split(',')
+            .collect();
+        assert!(values.contains(&"user-pin"));
+        for pin in &expected {
+            assert!(values.contains(&pin.as_str()), "missing CA pin {pin}");
+        }
+        assert_eq!(
+            built
+                .args
+                .iter()
+                .filter(|argument| argument.starts_with("--ignore-certificate-errors-spki-list="))
+                .count(),
+            1
+        );
     }
 
     #[cfg(unix)]

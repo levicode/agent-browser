@@ -22,7 +22,7 @@ agent-browser --use-system-ca read https://example.com
   <tbody>
     <tr><td><code>--proxy &lt;url&gt;</code></td><td>Proxy server URL, with optional credentials</td></tr>
     <tr><td><code>--proxy-bypass &lt;hosts&gt;</code></td><td>Hosts that should bypass the proxy</td></tr>
-    <tr><td><code>--ca-cert &lt;path&gt;</code></td><td>Trust a CA certificate or PEM bundle for the CLI's own HTTPS requests, and in a locally launched Chromium browser on Linux</td></tr>
+    <tr><td><code>--ca-cert &lt;path&gt;</code></td><td>Trust a CA certificate or PEM bundle for the CLI's own HTTPS requests, and in a locally launched Chromium browser on Linux or macOS</td></tr>
     <tr><td><code>--use-system-ca</code></td><td>Use the operating system trust store for the CLI's own HTTPS requests</td></tr>
     <tr><td><code>--no-ca-cert</code></td><td>Clear CA trust retained by the running browser session</td></tr>
   </tbody>
@@ -39,7 +39,7 @@ agent-browser --use-system-ca read https://example.com
     <tr><td><code>AGENT_BROWSER_PROXY_BYPASS</code></td><td>agent-browser proxy bypass list</td></tr>
     <tr><td><code>AGENT_BROWSER_PROXY_USERNAME</code></td><td>Proxy username when credentials are provided separately</td></tr>
     <tr><td><code>AGENT_BROWSER_PROXY_PASSWORD</code></td><td>Proxy password when credentials are provided separately</td></tr>
-    <tr><td><code>AGENT_BROWSER_CA_CERT</code></td><td>Path to a CA certificate or PEM bundle for CLI requests and locally launched Chromium on Linux</td></tr>
+    <tr><td><code>AGENT_BROWSER_CA_CERT</code></td><td>Path to a CA certificate or PEM bundle for CLI requests and locally launched Chromium on Linux or macOS</td></tr>
     <tr><td><code>AGENT_BROWSER_USE_SYSTEM_CA</code></td><td>Use the operating system trust store for CLI requests</td></tr>
     <tr><td><code>SSL_CERT_FILE</code></td><td>Fallback CA file for CLI requests when no CA is configured</td></tr>
     <tr><td><code>HTTP_PROXY</code> / <code>HTTPS_PROXY</code></td><td>Standard proxy environment variables, used as fallbacks</td></tr>
@@ -58,9 +58,11 @@ agent-browser --use-system-ca read https://example.com
 
 ### Browser
 
-On Linux, `--ca-cert` imports each certificate into a private NSS database used only by the Chromium process launched for that session. Normal hostname and validity checks remain enabled. Later commands retain that trust when they omit the flag. A different certificate or `--no-ca-cert` relaunches Chromium without restarting the daemon. The same certificate content reuses the current browser even when supplied from a different path. `agent-browser install --with-deps` installs the required `certutil`; otherwise install `libnss3-tools` on Debian/Ubuntu or `nss-tools` on RPM Linux.
+On Linux, `--ca-cert` imports each certificate into a private NSS database used only by the Chromium process launched for that session. `agent-browser install --with-deps` installs the required `certutil`; otherwise install `libnss3-tools` on Debian/Ubuntu or `nss-tools` on RPM Linux. On macOS, it derives the CA certificates' Subject Public Key Information hashes and adds them to Chromium's `--ignore-certificate-errors-spki-list` for that launch. Only certificates chaining to the named CA are accepted; hostname and validity checks stay enabled, and no certificate errors are ignored globally.
 
-For browser commands, the option cannot be combined with `--profile`, `--cdp`, `--auto-connect`, providers, Lightpanda, or `--ignore-https-errors`. Browser trust is not supported on macOS or Windows, where Chromium already uses the operating system trust store.
+Normal hostname and validity checks remain enabled on both platforms. Later commands retain that trust when they omit the flag. A different certificate or `--no-ca-cert` relaunches Chromium without restarting the daemon. The same certificate content reuses the current browser even when supplied from a different path.
+
+For browser commands, the option cannot be combined with `--profile`, `--cdp`, `--auto-connect`, providers, Lightpanda, or `--ignore-https-errors`. Browser trust is still not supported on Windows.
 
 ## SOCKS proxy
 

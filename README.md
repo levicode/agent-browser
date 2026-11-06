@@ -1057,7 +1057,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--proxy <url>` | Proxy server URL with optional auth (or `AGENT_BROWSER_PROXY` env) |
 | `--proxy-bypass <hosts>` | Hosts to bypass proxy (or `AGENT_BROWSER_PROXY_BYPASS` env) |
 | `--ignore-https-errors` | Ignore HTTPS certificate errors (useful for self-signed certs) |
-| `--ca-cert <path>` | Trust a CA certificate or PEM bundle for the CLI's own HTTPS requests on every platform, and for locally launched Chromium on Linux; later commands in the same running session retain it when omitted (or `AGENT_BROWSER_CA_CERT` env) |
+| `--ca-cert <path>` | Trust a CA certificate or PEM bundle for the CLI's own HTTPS requests on every platform, and for locally launched Chromium on Linux and macOS; later commands in the same running session retain it when omitted (or `AGENT_BROWSER_CA_CERT` env) |
 | `--no-ca-cert` | Clear CA trust retained by the running browser session (or `AGENT_BROWSER_CLEAR_CA_CERT`) |
 | `--use-system-ca` | Use the operating system trust store for the CLI's own HTTPS requests: `read`, `install`, `upgrade`, `doctor` (or `AGENT_BROWSER_USE_SYSTEM_CA` env) |
 | `--allow-file-access` | Allow file:// URLs to access local files (Chromium only) |
@@ -1208,7 +1208,7 @@ The auto-discovered `./agent-browser.json` cannot set `executablePath`, `args` o
 }
 ```
 
-`caCert` remains effective for later commands in the same running session. Use `"clearCaCert": true`, `--no-ca-cert`, or `AGENT_BROWSER_CLEAR_CA_CERT=1` to remove it. Setting, changing, or clearing the CA relaunches Chromium without restarting the daemon. Repeating the same certificate content, including from a different path, reuses the current browser. On Linux, `agent-browser install --with-deps` installs the required `certutil`; otherwise install `libnss3-tools` on Debian/Ubuntu or `nss-tools` on RPM Linux.
+`caCert` remains effective for later commands in the same running session. Use `"clearCaCert": true`, `--no-ca-cert`, or `AGENT_BROWSER_CLEAR_CA_CERT=1` to remove it. Setting, changing, or clearing the CA relaunches Chromium without restarting the daemon. Repeating the same certificate content, including from a different path, reuses the current browser. On Linux, `agent-browser install --with-deps` installs the required `certutil`; otherwise install `libnss3-tools` on Debian/Ubuntu or `nss-tools` on RPM Linux. On macOS, the certificates' public-key hashes are added to Chromium's SPKI allow list for that launch, so only certificates chaining to the named CA are accepted; no global certificate errors are ignored.
 
 `read`, `install`, `upgrade`, and `doctor` make their own HTTPS requests and trust the built-in Mozilla roots by default. On every platform, `--ca-cert` adds the CA to those requests, and `--use-system-ca` switches them to the operating system trust store, which already holds a CA deployed by MDM or an enterprise image. `SSL_CERT_FILE` is used as a fallback CA file and is ignored with a warning when unusable. Neither option disables certificate or hostname verification. For `read`, a selection given on the command line stays in effect for the session until `close`, including across daemon restarts; `--no-ca-cert` or `--use-system-ca false` turns it off. `read` never launches or relaunches a browser because of these options. They do not yet change how agent-browser connects to a remote browser over `--cdp`, `--auto-connect`, or a provider.
 

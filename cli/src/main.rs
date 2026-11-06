@@ -257,17 +257,17 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
     }
     if flags.ca_cert.is_some() && flags.cdp.is_some() {
         return Some(
-            "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+            "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser)",
         );
     }
     if flags.ca_cert.is_some() && flags.auto_connect {
         return Some(
-            "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+            "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser)",
         );
     }
     if flags.ca_cert.is_some() && flags.provider.is_some() {
         return Some(
-            "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+            "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser)",
         );
     }
     if flags.ca_cert.is_some() && flags.profile.is_some() {
@@ -281,10 +281,11 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
             .as_deref()
             .is_some_and(|engine| !engine.eq_ignore_ascii_case("chrome"))
     {
-        return Some("--ca-cert is supported only with the Chrome engine on Linux");
+        return Some("--ca-cert is supported only with the Chrome engine on Linux and macOS");
     }
-    if flags.ca_cert.is_some() && !cfg!(target_os = "linux") {
-        return Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)");
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    if flags.ca_cert.is_some() {
+        return Some("--ca-cert browser trust is currently supported only on Linux and macOS (read, install, upgrade, and doctor accept it on every platform)");
     }
 
     None
@@ -3093,15 +3094,15 @@ mod tests {
         let cases = [
             (
                 with_ca(launch_mode_flags(false, true, false, false)),
-                "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser on Linux)",
+                "Cannot use --ca-cert with --cdp (--ca-cert requires a locally launched Chromium browser)",
             ),
             (
                 with_ca(launch_mode_flags(true, false, false, false)),
-                "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser on Linux)",
+                "Cannot use --ca-cert with --auto-connect (--ca-cert requires a locally launched Chromium browser)",
             ),
             (
                 with_ca(launch_mode_flags(false, false, true, false)),
-                "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser on Linux)",
+                "Cannot use --ca-cert with -p/--provider (--ca-cert requires a locally launched Chromium browser)",
             ),
             (
                 ignore_errors,
@@ -3113,7 +3114,7 @@ mod tests {
             ),
             (
                 lightpanda,
-                "--ca-cert is supported only with the Chrome engine on Linux",
+                "--ca-cert is supported only with the Chrome engine on Linux and macOS",
             ),
             (clear, "Cannot use --ca-cert with --no-ca-cert"),
         ];
@@ -3146,7 +3147,7 @@ mod tests {
 
         let error = incompatible_launch_mode_error(&flags);
         assert!(
-            error.is_none() || error == Some("--ca-cert browser trust is currently supported only on Linux (read, install, upgrade, and doctor accept it on every platform)"),
+            error.is_none() || error == Some("--ca-cert browser trust is currently supported only on Linux and macOS (read, install, upgrade, and doctor accept it on every platform)"),
             "README proxy CA configuration is incompatible: {error:?}"
         );
     }
