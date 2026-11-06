@@ -3666,6 +3666,33 @@ impl OwnerDebtLedger {
                 })
         })
     }
+    /// Cleanup proof only for a capture-local protected-read source group.
+    ///
+    /// A group name is minted per protected capture. Its record is created by
+    /// the first admitted member and removed only when the exact group/realm
+    /// destruction or a proven group release is observed (or when an
+    /// unsubmitted reservation is abandoned). A missing record therefore
+    /// proves that no live object remains in the group: it was never admitted,
+    /// or its document was already destroyed or released.
+    ///
+    /// Any present record stays strict, including a group whose creations have
+    /// all acknowledged: a grouped creation does not record individual object
+    /// handles, so its group record is the only custody evidence. A
+    /// contaminated or retired ledger never grants the proof. This grants no
+    /// authority; it only lets cleanup skip a release command that can no
+    /// longer reach a live document.
+    pub(crate) fn readonly_group_has_retired_record(&self, name: &str) -> bool {
+        if name.is_empty() {
+            return false;
+        }
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        if state.integrity_lost || state.retired {
+            return false;
+        }
+        !state.groups.values().any(|group| group.name == name)
+    }
     /// Exact reader destruction, not aggregate zero debt or lifecycle absence.
     /// The caller holds the transport owner lock across this synchronous check.
     pub(crate) fn network_command_destroyed_active(&self, status: &CommandStatusHandle) -> bool {
