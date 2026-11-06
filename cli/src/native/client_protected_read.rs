@@ -539,12 +539,30 @@ impl<'a> ProtectedReadJournal<'a> {
             return Err(ProtectedReadReason::CleanupFailed);
         }
         let attempts = self.records()?.masks.clone();
+        let ledger = self.page.client.debt_ledger();
         for mask in attempts.into_iter().rev() {
             if mask.step == MaskStep::GroupReleased {
                 continue;
             }
             if Instant::now() >= deadline {
                 break;
+            }
+            // A capture-local group that never admitted an object-producing
+            // member, or whose exact group/realm destruction or release was
+            // already observed, has nothing to remove or release. Sending a
+            // cleanup command against the document a navigation just removed
+            // would fail and quarantine the whole scope over an empty group.
+            if ledger
+                .as_ref()
+                .is_some_and(|ledger| ledger.readonly_group_has_retired_record(&mask.group))
+            {
+                self.records()?
+                    .masks
+                    .iter_mut()
+                    .find(|owned| owned.session == mask.session && owned.group == mask.group)
+                    .ok_or(ProtectedReadReason::CleanupFailed)?
+                    .step = MaskStep::GroupReleased;
+                continue;
             }
             if mask.step == MaskStep::InstalledOrUnknown {
                 if let Some(handle) = &mask.holder {
@@ -1442,6 +1460,57 @@ mod tests {
             assert_eq!(data.masks[0].step, super::MaskStep::Removed);
             assert!(data.rates[0].acknowledged);
         }
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_group_proof_discharges_only_a_retired_or_never_admitted_group() {
+        use super::super::client_debt::{CommandCategory, OperationKey, OwnerDebtLedger};
+        let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        page.client.install_debt_ledger(ledger.clone()).unwrap();
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        // A capture-local group that was never admitted holds no object, so
+        // cleanup must not send a release command against a removed document.
+        assert!(ledger.readonly_group_has_retired_record("never-created"));
+        journal
+            .scope(async {
+                super::super::client_debt::native_object_group(
+                    "admitted-group",
+                    super::super::client_debt::command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        page.client.send_command(
+                            "Runtime.evaluate",
+                            Some(json!({
+                                "expression": "1",
+                                "returnByValue": true,
+                                "objectGroup": "admitted-group"
+                            })),
+                            Some("session"),
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+            })
+            .await;
+        // An admitted group keeps its custody record even after every creation
+        // acknowledged: the strict remove/release path must stay.
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!ledger.readonly_group_has_retired_record("admitted-group"));
+        assert!(ledger.readonly_group_has_retired_record("another-unknown-group"));
         page.client.close().await;
         server.await.unwrap();
     }
