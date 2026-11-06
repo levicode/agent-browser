@@ -1136,6 +1136,15 @@ pub(crate) struct SemanticCaptureContext<'a> {
     pub(crate) opaque_frames: &'a HashSet<String>,
 }
 impl GeometrySnapshot {
+    /// Omission-less capture for fixtures and tests only. Production geometry
+    /// is always derived from a verified frame inventory, which may have proved
+    /// and omitted opaque `<object>`/`<embed>` subtrees; re-reading such a tree
+    /// without those omissions reports them as missing inventory. Every
+    /// inventory-derived production path therefore calls
+    /// `capture_excluding_opaque` (or `capture_semantic`) with the provenance's
+    /// exact omission set, and this primitive is compile-gated to tests so an
+    /// omission-less production call cannot be reintroduced.
+    #[cfg(test)]
     pub async fn capture(
         client: &CdpClient,
         page_session: &str,
@@ -1331,7 +1340,10 @@ impl GeometrySnapshot {
         Ok(())
     }
     /// Refresh layout after an intentional native scroll, never admitting a
-    /// replacement document, renderer, owner, or newly appearing frame.
+    /// replacement document, renderer, owner, or newly appearing frame. The
+    /// snapshot's proven opaque `<object>`/`<embed>` omissions stay known
+    /// omissions: re-reading the session frame tree strictly would report them
+    /// as missing inventory and refuse every pointer action on the page.
     pub async fn refresh_after_scroll(
         &self,
         client: &CdpClient,
@@ -1359,7 +1371,14 @@ impl GeometrySnapshot {
                 },
             })
             .collect::<Vec<_>>();
-        let fresh = Self::capture(client, &self.page_session, &inputs, operation).await?;
+        let fresh = Self::capture_excluding_opaque(
+            client,
+            &self.page_session,
+            &inputs,
+            &self.excluded,
+            operation,
+        )
+        .await?;
         if fresh.frames.len() != self.frames.len()
             || fresh.sessions.len() != self.sessions.len()
             || self.frames.iter().any(|(id, old)| {
@@ -2694,6 +2713,19 @@ mod tests {
                 .unwrap();
                 // A revalidation must reuse the same proven omissions.
                 geometry.revalidate(&client, &operation).await.unwrap();
+                // levicode/agent-browser#52: the action's in-flight refresh
+                // after scrollIntoViewIfNeeded must reuse them too. A strict
+                // re-read reported the proven plugin documents as missing
+                // inventory and refused every pointer action on the page.
+                let refreshed = geometry
+                    .refresh_after_scroll(&client, &operation)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    refreshed.frames.keys().collect::<HashSet<_>>(),
+                    geometry.frames.keys().collect::<HashSet<_>>()
+                );
+                assert_eq!(refreshed.excluded, geometry.excluded);
                 assert!(
                     !log.lock().unwrap().iter().any(|request| {
                         matches!(
