@@ -52,6 +52,30 @@ fn semantic_node_count(node: &Value) -> usize {
     count
 }
 
+
+// The dense, pseudo-light page shape of the reported 1,476-node UAT account
+// list: a large light DOM, no CSS pseudo markers, no inline click handlers and
+// no shadow trees. It isolates the per-node identity read from the pseudo and
+// hint work the other regression covers.
+const DENSE_LIGHT_PAGE: &str = r#"()=>{
+  const parts=['<main id="app">','<h1>Account overview</h1>','<div id="toolbar"></div>'];
+  let rows=0;
+  for(let s=0;s<24;s++){
+    parts.push('<section class="card" aria-label="Section '+s+'"><h2>Section '+s+'</h2>');
+    for(let i=0;i<30;i++){
+      parts.push('<div class="row" data-index="'+s+'-'+i+'"><div class="cell"><span class="label">Row '+s+'-'+i+'</span></div>');
+      parts.push('<button type="button" aria-label="Action '+s+'-'+i+'">Action '+s+'-'+i+'</button>');
+      parts.push('<div class="filler" aria-hidden="true"><span>f</span><span>f</span></div></div>');
+      rows++;
+    }
+    parts.push('</section>');
+  }
+  parts.push('</main>');
+  document.body.innerHTML=parts.join('');
+  location.hash='#/account_label';
+  return {elements:document.querySelectorAll('*').length,rows,hash:location.hash};
+}"#;
+
 #[tokio::test]
 #[ignore = "requires hosted Chromium: large sub-route observation latency budget"]
 async fn e2e_observe_pseudo_heavy_page_stays_within_budget() {
@@ -145,6 +169,102 @@ async fn e2e_observe_pseudo_heavy_page_stays_within_budget() {
             "observation[{label}] took {elapsed:?}, above {budget:?}"
         );
     }
+    let cleanup = browser.shutdown().await;
+    assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
+}
+
+// Baseline bed for the staged dense-page work: the same shape the field
+// observation measured (1,476 nodes), printed with its native phase map so each
+// optimization step can compare capture cost rather than a wall-clock guess.
+#[tokio::test]
+#[ignore = "requires hosted Chromium: dense light-DOM observation baseline"]
+async fn e2e_observe_dense_light_page_prints_phase_baseline() {
+    use crate::native::client_browser::ClientBrowser;
+    use crate::native::client_session::ClientSession;
+    use crate::native::client_transport::ClientEventSink;
+
+    let broker = Arc::new(ClientSession::new());
+    let browser = ClientBrowser::new(broker.clone());
+    let (sink, _events) = ClientEventSink::test_channel(broker.clone());
+    browser.set_event_sink(sink.clone()).unwrap();
+    let mut operations = FixtureOperations::new(broker.clone());
+    let opened = observe_run(
+        &browser,
+        &mut operations,
+        &sink,
+        "scope.open",
+        fixture_scope_open("launch", None),
+        30,
+    )
+    .await
+    .unwrap();
+    let scope = opened["identityScope"].as_str().unwrap().to_owned();
+    observe_run(
+        &browser,
+        &mut operations,
+        &sink,
+        "scope.configure",
+        fixture_configuration(&scope, None),
+        30,
+    )
+    .await
+    .unwrap();
+    observe_run(
+        &browser,
+        &mut operations,
+        &sink,
+        "page.activate",
+        json!({"identityScope":scope}),
+        30,
+    )
+    .await
+    .unwrap();
+    let built = observe_run(
+        &browser,
+        &mut operations,
+        &sink,
+        "page.evaluate",
+        json!({"identityScope":scope,"source":DENSE_LIGHT_PAGE,"argument":null}),
+        30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(built["value"]["hash"], "#/account_label");
+    assert!(
+        built["value"]["elements"].as_u64().unwrap_or(0) > 4_000,
+        "the dense page must stay large enough to exercise many batches"
+    );
+    eprintln!("OBSERVE dense page={}", built["value"]);
+
+    let start = Instant::now();
+    let snapshot = observe_run(
+        &browser,
+        &mut operations,
+        &sink,
+        "browser.observe",
+        json!({
+            "identityScope":scope,
+            "testIdAttribute":"data-testid",
+            "secureFieldSelector":FIXTURE_SECURE_SELECTOR,
+            "options":{}
+        }),
+        120,
+    )
+    .await
+    .unwrap();
+    let elapsed = start.elapsed();
+    let bytes = serde_json::to_vec(&snapshot).map(|value| value.len()).unwrap_or(0);
+    eprintln!(
+        "OBSERVE [dense-light] elapsed_ms={} nodes={} bytes={} phases={}",
+        elapsed.as_millis(),
+        semantic_node_count(&snapshot["root"]),
+        bytes,
+        snapshot["phases"]
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "dense light observation took {elapsed:?}"
+    );
     let cleanup = browser.shutdown().await;
     assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
 }
