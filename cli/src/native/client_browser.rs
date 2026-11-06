@@ -2781,6 +2781,11 @@ impl ClientBrowser {
                     let mut options = super::actions::launch_options_from_env();
                     options.executable_path = executable_path.or(options.executable_path);
                     options.headless = headless;
+                    // The interop launch has no hide-scrollbars field, and the
+                    // isolated daemon's environment always carries the CLI's
+                    // default (false). Keep the launch default (true) so the
+                    // engine's rendering matches every non-isolated launch.
+                    options.hide_scrollbars = true;
                     if ca_cert.is_some() {
                         options.ca_cert = ca_cert;
                     }
