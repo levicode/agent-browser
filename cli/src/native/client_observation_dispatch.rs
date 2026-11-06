@@ -1191,6 +1191,10 @@ impl ObservationDispatch {
                 &request,
                 DispatchRequest::Observe(_) | DispatchRequest::TraceSemantic(_)
             );
+            // #48: optional trace evidence owns no page authority. A lost
+            // cleanup proof must not seal the target registry; the retained
+            // settlement records the loss as trace-local.
+            let evidence_only = matches!(&request, DispatchRequest::TraceSemantic(_));
             let run = self.run(
                 context,
                 request,
@@ -1246,7 +1250,9 @@ impl ObservationDispatch {
                         delivered.is_err()
                     }) && !release_handles(&blobs, &scope, &output.handles)
                     {
-                        targets.seal();
+                        if !evidence_only {
+                            targets.seal();
+                        }
                         return Err(DispatchFailure {
                             error: ProtocolError::CleanupFailed,
                             identity_scope: scope.identity_scope,
@@ -1255,7 +1261,7 @@ impl ObservationDispatch {
                     }
                 }
                 Err(error) => {
-                    if error.cleanup_integrity_lost {
+                    if error.cleanup_integrity_lost && !evidence_only {
                         targets.seal();
                     }
                     match send.take() {

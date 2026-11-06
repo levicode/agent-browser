@@ -2230,6 +2230,9 @@ async fn execute_bounded<E: ClientExecutor>(
 ) -> NativeOutcome {
     let trace_screenshot = command == "capture.screenshot"
         && args.get("purpose").and_then(serde_json::Value::as_str) == Some("trace");
+    // #48: an optional semantic trace or trace screenshot owns only disposable
+    // evidence. Its lost cleanup proof is trace-local, never page uncertainty.
+    let evidence_only = command == "browser.trace";
     let key = super::client_debt::OperationKey {
         generation: lease.generation,
         operation_seq: lease.sequence,
@@ -2243,6 +2246,17 @@ async fn execute_bounded<E: ClientExecutor>(
         continuation_negotiated,
     )
     .await;
+    // #48: an optional semantic trace or trace screenshot owns only disposable
+    // evidence. A lost cleanup proof is trace-local: publish a clean refusal and
+    // never enter the retention/retirement path that quarantines the scope.
+    if evidence_only && outcome.effects == Effects::Unknown {
+        outcome.effects = Effects::NotDispatched;
+        outcome.retention = None;
+        if outcome.result.is_ok() {
+            outcome.result = Err(ProtocolError::StaleReference);
+        }
+        return outcome;
+    }
     if outcome.effects != Effects::Unknown || !continuation_negotiated {
         outcome.retention = None;
         return outcome;
@@ -2329,6 +2343,7 @@ async fn execute_until_deadline<E: ClientExecutor>(
 ) -> NativeOutcome {
     let trace_screenshot = command == "capture.screenshot"
         && args.get("purpose").and_then(serde_json::Value::as_str) == Some("trace");
+    let evidence_only = command == "browser.trace";
     let sequence = lease.sequence;
     let generation = lease.generation;
     let key = super::client_debt::OperationKey {
@@ -2384,18 +2399,24 @@ async fn execute_until_deadline<E: ClientExecutor>(
         generation,
         operation_seq: sequence,
     });
-    let effects = match status.mutation_dispatched() {
-        Some(false) => Effects::NotDispatched,
-        Some(true) => Effects::Unknown,
-        // An incapable executor or missing journal retains the legacy terminal
-        // behavior. Executor entry is never promoted into reusable proof.
-        None if !broker.has_started(sequence) => Effects::NotDispatched,
-        // The executor was admitted but had not registered its journal yet. A
-        // read-only command cannot commit a mutation, so no receipt is
-        // uncertainty about application effects; it is a retryable
-        // non-dispatch. Mutation-capable commands stay conservatively Unknown.
-        None if read_only_command => Effects::NotDispatched,
-        None => Effects::Unknown,
+    let effects = if evidence_only {
+        // Optional trace evidence can be discarded; its grace expiry is never
+        // page-mutation uncertainty (#48).
+        Effects::NotDispatched
+    } else {
+        match status.mutation_dispatched() {
+            Some(false) => Effects::NotDispatched,
+            Some(true) => Effects::Unknown,
+            // An incapable executor or missing journal retains the legacy terminal
+            // behavior. Executor entry is never promoted into reusable proof.
+            None if !broker.has_started(sequence) => Effects::NotDispatched,
+            // The executor was admitted but had not registered its journal yet. A
+            // read-only command cannot commit a mutation, so no receipt is
+            // uncertainty about application effects; it is a retryable
+            // non-dispatch. Mutation-capable commands stay conservatively Unknown.
+            None if read_only_command => Effects::NotDispatched,
+            None => Effects::Unknown,
+        }
     };
     let reason = if protected_cleanup_deadline
         .is_some_and(|cleanup| tokio::time::Instant::now() >= cleanup)

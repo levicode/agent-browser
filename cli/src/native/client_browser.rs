@@ -3991,21 +3991,29 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let (semantic_send, semantic_receive) = tokio::sync::oneshot::channel();
             // Captured before the request moves into the retained producer.
             let modifies_page = dispatch_modifies_page(&request);
+            // Optional trace evidence is settled as trace-local loss (#48) at
+            // every boundary, including the retained producer and transport.
+            let trace_screenshot = matches!(&request, DispatchRequest::Screenshot(request)
+                if request.purpose == super::client_observation_dispatch::ScreenshotPurpose::Trace);
+            let semantic_trace = matches!(&request, DispatchRequest::TraceSemantic(_));
+            let evidence = if semantic_trace {
+                super::client_tasks::SettlementEvidence::OptionalTrace
+            } else {
+                super::client_tasks::SettlementEvidence::Ordinary
+            };
             let receive = self
                 .tasks
-                .start_operation_prepared(
+                .start_operation_prepared_evidence(
                     context.scope.identity_scope.clone(),
                     context.page.targets.clone(),
                     self.broker.clone(),
                     journal,
                     lease.cancellation.clone(),
+                    evidence,
                     move || {
                         // The registry has accepted capacity, but has not spawned
                         // work. Exact-owner/policy validation and Observe ticket
                         // admission are synchronous and precede any task reorder.
-                        let trace_screenshot = matches!(&request, DispatchRequest::Screenshot(request)
-                            if request.purpose == super::client_observation_dispatch::ScreenshotPurpose::Trace);
-                        let semantic_trace = matches!(&request, DispatchRequest::TraceSemantic(_));
                         let protected_receipt = protected_read_receipt_eligible(&request);
                         let prepared = observation.prepare(context, request, lease)?;
                         Ok(async move {
@@ -4016,29 +4024,51 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     // Only the dispatcher can issue this receipt,
                                     // after the tree-only commit. Keep this same
                                     // registered producer alive through its join.
-                                    let _ = semantic_send.send((NativeOutcome {
-                                        retention: None,
-                                        result: Ok(value.clone()),
-                                        effects: Effects::Completed,
-                                    }, task.receipt.cleanup_failed_before_publication()));
+                                    let _ = semantic_send.send((
+                                        NativeOutcome {
+                                            retention: None,
+                                            result: Ok(value.clone()),
+                                            effects: Effects::Completed,
+                                        },
+                                        task.receipt.cleanup_failed_before_publication(),
+                                    ));
                                 }
                             }
                             let cleanup = task.join.await;
-                            let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup, modifies_page);
-                            if (trace_screenshot || semantic_trace) && (std::time::Instant::now() >= receipt_deadline
-                                || *receipt_cancellation.borrow() != super::client_session::CancelSignal::None)
+                            let (mut outcome, mut dirty) =
+                                settle_observation_dispatch(output, cleanup, modifies_page);
+                            if (trace_screenshot || semantic_trace)
+                                && (std::time::Instant::now() >= receipt_deadline
+                                    || *receipt_cancellation.borrow()
+                                        != super::client_session::CancelSignal::None)
                             {
                                 if let Ok(value) = &outcome.result {
                                     if trace_screenshot {
-                                        dirty |= receipt_blobs.discard_trace_image(receipt_generation, value).is_err();
+                                        dirty |= receipt_blobs
+                                            .discard_trace_image(receipt_generation, value)
+                                            .is_err();
                                     }
-                                    outcome.result = Err(if dirty { ProtocolError::CleanupFailed } else {
-                                        (*receipt_cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)
+                                    outcome.result = Err(if dirty {
+                                        ProtocolError::CleanupFailed
+                                    } else {
+                                        (*receipt_cancellation.borrow())
+                                            .error()
+                                            .unwrap_or(ProtocolError::DeadlineExceeded)
                                     });
                                 }
                             }
-                            let (outcome, dirty) = settle_trace_screenshot(outcome, dirty, trace_screenshot || semantic_trace, &receipt_journal);
-                            settle_protected_read(outcome, dirty, protected_receipt, &receipt_journal)
+                            let (outcome, dirty) = settle_trace_screenshot(
+                                outcome,
+                                dirty,
+                                trace_screenshot || semantic_trace,
+                                &receipt_journal,
+                            );
+                            settle_protected_read(
+                                outcome,
+                                dirty,
+                                protected_receipt,
+                                &receipt_journal,
+                            )
                         })
                     },
                 )

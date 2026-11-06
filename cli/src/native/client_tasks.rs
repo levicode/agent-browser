@@ -19,6 +19,15 @@ pub struct RetainedCompletion {
     pub cleanup_integrity_lost: bool,
     operation: Option<super::client_debt::OperationKey>,
 }
+/// What the operation owns when it settles. Ordinary operations may own page
+/// mutation proof; an optional trace owns only disposable evidence (#48), so a
+/// lost cleanup proof or unsettled registry inventory is trace-local and never
+/// seals the page, retains the producer, or quarantines the scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SettlementEvidence {
+    Ordinary,
+    OptionalTrace,
+}
 #[derive(Default)]
 struct Tasks {
     closing: bool,
@@ -189,12 +198,38 @@ impl RetainedTasks {
     where
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
     {
-        self.start_operation_prepared(
+        self.start_operation_evidence(
             identity_scope,
             targets,
             broker,
             journal,
             cancellation,
+            SettlementEvidence::Ordinary,
+            future,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_operation_evidence<F>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        broker: Arc<super::client_session::ClientSession>,
+        journal: super::client_debt::OperationJournalHandle,
+        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        evidence: SettlementEvidence,
+        future: F,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+    {
+        self.start_operation_prepared_evidence(
+            identity_scope,
+            targets,
+            broker,
+            journal,
+            cancellation,
+            evidence,
             || Ok(future),
         )
         .await
@@ -213,6 +248,33 @@ impl RetainedTasks {
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
         P: FnOnce() -> Result<F, ProtocolError>,
     {
+        self.start_operation_prepared_evidence(
+            identity_scope,
+            targets,
+            broker,
+            journal,
+            cancellation,
+            SettlementEvidence::Ordinary,
+            prepare,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_operation_prepared_evidence<F, P>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        broker: Arc<super::client_session::ClientSession>,
+        journal: super::client_debt::OperationJournalHandle,
+        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        evidence: SettlementEvidence,
+        prepare: P,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+        P: FnOnce() -> Result<F, ProtocolError>,
+    {
+        let optional_trace = evidence == SettlementEvidence::OptionalTrace;
         let operations = self.operations.clone();
         let task_targets = targets.clone();
         let key = journal.key();
@@ -239,8 +301,10 @@ impl RetainedTasks {
                     if let Some(deadline) = monitor_registry.retire(key) {
                         tokio::time::sleep_until(deadline.into()).await;
                         if monitor_registry.expire(key, std::time::Instant::now()) {
-                            monitor_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedDeadlineSeal);
-                            let _ = monitor_broker.quarantine();
+                            if !optional_trace {
+                                monitor_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedDeadlineSeal);
+                                let _ = monitor_broker.quarantine();
+                            }
                         }
                     }
                 });
@@ -287,6 +351,22 @@ impl RetainedTasks {
                     );
                 }
                 let dirty = already_dirty || settlement.is_err();
+                if optional_trace {
+                    // #48: an optional trace owns only disposable evidence. A
+                    // cleanup loss or an unsettled target inventory is
+                    // trace-local: publish a clean refusal on a usable scope,
+                    // never seal the page, retain the producer, or quarantine.
+                    if dirty
+                        || outcome.effects == Effects::Unknown
+                        || matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
+                    {
+                        outcome.result = Err(ProtocolError::StaleReference);
+                        outcome.effects = Effects::NotDispatched;
+                    }
+                    outcome.retention = None;
+                    let _ = operations.finish(key, false);
+                    return (outcome, false);
+                }
                 if !dirty && outcome.result.is_err() {
                     // Executor entry and current debt count are not dispatch
                     // evidence. Preserve a completed prefix, but never invent a
@@ -1177,5 +1257,81 @@ mod fixed_read_eof_tests {
         assert!(outcome.retention.is_none());
         assert!(tasks.recovery_candidate(key).is_none());
         assert_eq!(tasks.drain().await, Err(ProtocolError::CleanupFailed));
+    }
+
+    #[tokio::test]
+    async fn optional_trace_evidence_settles_trace_local_loss_without_quarantine() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_protocol::ScopeState;
+        use super::super::client_session::ClientSession;
+        use super::super::client_targets::ClientTargets;
+
+        for (evidence, ordinary) in [
+            (SettlementEvidence::OptionalTrace, false),
+            (SettlementEvidence::Ordinary, true),
+        ] {
+            let tasks = RetainedTasks::default();
+            let broker = Arc::new(ClientSession::new());
+            let lease = broker.admit(1, 1, 5000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            targets
+                .attached("ctx", "selected".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("selected").unwrap();
+            targets
+                .resume_permit("selected")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap();
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            ledger.bind_context("ctx").unwrap();
+            ledger.bind_session("ctx", "selected", "session").unwrap();
+            let key = OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            };
+            let journal = ledger
+                .operation(key, "selected".into(), "session".into())
+                .unwrap();
+            journal.bind_operation(&lease).unwrap();
+            let receive = tasks
+                .start_operation_evidence(
+                    "scope".into(),
+                    targets.clone(),
+                    broker.clone(),
+                    journal,
+                    lease.cancellation.clone(),
+                    evidence,
+                    async {
+                        (
+                            NativeOutcome {
+                                retention: None,
+                                result: Err(ProtocolError::CleanupFailed),
+                                effects: Effects::Unknown,
+                            },
+                            true,
+                        )
+                    },
+                )
+                .await
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), receive)
+                .await
+                .unwrap()
+                .unwrap();
+            if ordinary {
+                assert_eq!(outcome.result, Err(ProtocolError::CleanupFailed));
+                assert_eq!(outcome.effects, Effects::Unknown);
+                assert_eq!(broker.health().unwrap().1, ScopeState::Quarantined);
+            } else {
+                assert_eq!(outcome.result, Err(ProtocolError::StaleReference));
+                assert_eq!(outcome.effects, Effects::NotDispatched);
+                assert_eq!(broker.health().unwrap().1, ScopeState::Usable);
+                assert!(targets.inventory().is_ok());
+            }
+        }
     }
 }
