@@ -106,7 +106,11 @@ struct ScreenshotFailureWitness {
     sequence: u64,
     state: Mutex<ScreenshotFailureState>,
     started: std::time::Instant,
-    last: Mutex<std::time::Instant>,
+    /// The stage currently running and the instant it started. A phase's
+    /// duration belongs to the stage that was running, not to the checkpoint
+    /// that ended it; attributing it to the checkpoint labelled the whole
+    /// semantic read as the frame-geometry capture that follows it.
+    last: Mutex<(&'static str, std::time::Instant)>,
     phases: Mutex<Vec<(&'static str, u64)>>,
     #[cfg(test)]
     receipt_for_test: Option<Arc<Mutex<Option<ScreenshotFailureReceiptForTest>>>>,
@@ -129,7 +133,10 @@ impl ScreenshotFailureWitness {
             generation: operation.generation,
             sequence: operation.sequence,
             started: std::time::Instant::now(),
-            last: Mutex::new(std::time::Instant::now()),
+            last: Mutex::new((
+                stage_name(ScreenshotStage::PrepareScope),
+                std::time::Instant::now(),
+            )),
             phases: Mutex::new(Vec::new()),
             #[cfg(test)]
             receipt_for_test: None,
@@ -163,10 +170,11 @@ impl ScreenshotFailureWitness {
     fn enter(&self, stage: ScreenshotStage) {
         if let Ok(mut last) = self.last.lock() {
             let now = std::time::Instant::now();
-            let elapsed = now.saturating_duration_since(*last).as_micros() as u64;
-            *last = now;
+            let (running, started) = *last;
+            let elapsed = now.saturating_duration_since(started).as_micros() as u64;
+            *last = (stage_name(stage), now);
             if let Ok(mut phases) = self.phases.lock() {
-                phases.push((stage_name(stage), elapsed));
+                phases.push((running, elapsed));
             }
         }
         if let Ok(mut state) = self.state.lock() {
@@ -176,18 +184,28 @@ impl ScreenshotFailureWitness {
         }
     }
     fn timing(&self) -> serde_json::Value {
+        fn add(
+            map: &mut serde_json::Map<String, serde_json::Value>,
+            name: &'static str,
+            micros: u64,
+        ) {
+            let current = map
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            map.insert(name.to_owned(), serde_json::Value::from(current + micros));
+        }
         let mut map = serde_json::Map::new();
         if let Ok(phases) = self.phases.lock() {
             for (name, micros) in phases.iter() {
-                let current = map
-                    .get(*name)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-                map.insert(
-                    (*name).to_owned(),
-                    serde_json::Value::from(current + micros),
-                );
+                add(&mut map, name, *micros);
             }
+        }
+        // The stage still running when the result was built is part of the
+        // observation's cost too, and it is the final segment.
+        if let Ok(last) = self.last.lock() {
+            let (running, started) = *last;
+            add(&mut map, running, started.elapsed().as_micros() as u64);
         }
         serde_json::Value::Object(map)
     }
@@ -5390,6 +5408,21 @@ mod tests {
         assert!(witness
             .take_failure(|| panic!("success must not sample inventory"))
             .is_none());
+    }
+    #[test]
+    fn phase_attribution_names_the_stage_that_was_running() {
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        witness.enter(ScreenshotStage::SemanticMetadata);
+        std::thread::sleep(Duration::from_millis(3));
+        witness.enter(ScreenshotStage::SemanticFrameGeometry);
+        std::thread::sleep(Duration::from_millis(3));
+        let timing = witness.timing();
+        // The semantic read runs between the metadata and frame-geometry
+        // checkpoints; its duration belongs to the metadata stage, and the
+        // still-running frame-geometry stage keeps its own final segment.
+        assert!(timing["semantic-metadata"].as_u64().unwrap_or(0) >= 3_000);
+        assert!(timing["semantic-frame-geometry"].as_u64().unwrap_or(0) >= 3_000);
     }
     #[test]
     fn optional_pixel_witness_is_opt_in_and_keeps_pre_capture_refusal_before_cleanup() {
