@@ -2677,6 +2677,25 @@ pub async fn observe(
             .filter_map(|ax| ax.backend_d_o_m_node_id.map(|id| (id, ax)))
             .collect();
         let candidate_ids: std::collections::HashSet<i64> = graph.ids.iter().copied().collect();
+        // Subtrees that compact is guaranteed to discard are not read: the
+        // same DOM-only suppress inputs feed both this pre-filter and the
+        // metadata reader, and compact::emit returns before visiting any child
+        // of a suppressed node.
+        let mut suppressed: HashMap<i64, (i64, String)> = HashMap::new();
+        collect_suppressed(&dom["root"], false, &mut suppressed);
+        let probed = match semantic_capture_stage!(
+            witness,
+            Metadata,
+            frame_kind,
+            display_none_subtrees(client, frame, &dom, lease).await
+        ) {
+            Ok(probed) => probed,
+            Err(_) => HashMap::new(),
+        };
+        for (id, fact) in probed {
+            suppressed.entry(id).or_insert(fact);
+        }
+        let suppressed_ids: std::collections::HashSet<i64> = suppressed.keys().copied().collect();
         let mut text_folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
         let mut folded_text: std::collections::HashSet<i64> = std::collections::HashSet::new();
         collect_folded_text(
@@ -2684,6 +2703,7 @@ pub async fn observe(
             &mut text_folds,
             &mut folded_text,
             &candidate_ids,
+            &suppressed_ids,
             &ax_by_backend,
         );
         // Text nodes read through their parent's object are not separate
@@ -2691,7 +2711,7 @@ pub async fn observe(
         let candidates: Vec<AXNode> = graph
             .ids
             .iter()
-            .filter(|id| !folded_text.contains(*id))
+            .filter(|id| !folded_text.contains(*id) && !suppressed_ids.contains(*id))
             .map(|id| {
                 ax_by_backend
                     .get(id)
@@ -2743,6 +2763,15 @@ pub async fn observe(
                 )?;
                 apply_security(&mut node, id, &security);
                 nodes.insert(id, node);
+            }
+        }
+        // compact still needs every graph id in the facts map. Suppressed
+        // subtrees get a suppress-only stub with no public reference, since
+        // emit never reaches them; the duplicate assignment/shadow graph
+        // structure is unchanged.
+        for (backend, (kind, tag)) in &suppressed {
+            if candidate_ids.contains(backend) && !nodes.contains_key(backend) {
+                nodes.insert(*backend, suppressed_stub(frame, *kind, tag));
             }
         }
         // A single fresh inventory proves every pseudo read in this document
@@ -4503,6 +4532,7 @@ fn collect_folded_text(
     folds: &mut HashMap<i64, Vec<FoldedText>>,
     folded: &mut std::collections::HashSet<i64>,
     candidates: &std::collections::HashSet<i64>,
+    suppressed: &std::collections::HashSet<i64>,
     ax_by_backend: &HashMap<i64, &AXNode>,
 ) {
     let kind = node["nodeType"].as_i64();
@@ -4510,7 +4540,7 @@ fn collect_folded_text(
         if let (Some(parent), Some(children)) =
             (node["backendNodeId"].as_i64(), node["children"].as_array())
         {
-            if candidates.contains(&parent) {
+            if candidates.contains(&parent) && !suppressed.contains(&parent) {
                 for (index, child) in children.iter().enumerate() {
                     if child["nodeType"].as_i64() != Some(3) {
                         continue;
@@ -4518,7 +4548,10 @@ fn collect_folded_text(
                     let Some(backend) = child["backendNodeId"].as_i64() else {
                         continue;
                     };
-                    if !candidates.contains(&backend) || !folded.insert(backend) {
+                    if !candidates.contains(&backend)
+                        || suppressed.contains(&backend)
+                        || !folded.insert(backend)
+                    {
                         continue;
                     }
                     let text = child["nodeValue"].as_str().unwrap_or("");
@@ -4541,9 +4574,240 @@ fn collect_folded_text(
     for key in ["children", "shadowRoots", "pseudoElements"] {
         if let Some(children) = node[key].as_array() {
             for child in children {
-                collect_folded_text(child, folds, folded, candidates, ax_by_backend);
+                collect_folded_text(child, folds, folded, candidates, suppressed, ax_by_backend);
             }
         }
+    }
+}
+
+fn dom_attr<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+    let attributes = node["attributes"].as_array()?;
+    attributes.chunks(2).find_map(|pair| {
+        (pair.first().and_then(Value::as_str) == Some(name))
+            .then(|| pair.get(1).and_then(Value::as_str).unwrap_or(""))
+    })
+}
+/// The same DOM-only conditions the METADATA reader turns into
+/// `author.suppress`: the listed element names, `aria-hidden="true"`, and the
+/// `inert` attribute. Computed style (display/content-visibility/interactivity)
+/// is deliberately absent because the DOM snapshot cannot prove it.
+fn suppress_root(node: &Value) -> bool {
+    let local = node["localName"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        local.as_str(),
+        "script" | "style" | "head" | "template" | "noscript" | "next-route-announcer"
+    ) || dom_attr(node, "aria-hidden").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        || dom_attr(node, "inert").is_some()
+}
+/// Collects every DOM node whose projected facts are unconditionally
+/// suppressed by `compact`: the suppress root and its whole subtree. A closed
+/// `<details>` suppresses every child except the first `<summary>` subtree,
+/// exactly as `inClosedDetails` does. `compact::emit` returns before visiting
+/// any child of a suppressed node, so no descendant can be emitted.
+fn collect_suppressed(node: &Value, suppressed: bool, out: &mut HashMap<i64, (i64, String)>) {
+    let kind = node["nodeType"].as_i64().unwrap_or(0);
+    let local = node["localName"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let inside = suppressed || (kind == 1 && suppress_root(node));
+    if inside {
+        if let Some(backend) = node["backendNodeId"].as_i64() {
+            out.insert(backend, (kind, local.clone()));
+        }
+    }
+    let children = node["children"].as_array();
+    let closed_details = kind == 1 && local == "details" && dom_attr(node, "open").is_none();
+    let summary_index = closed_details
+        .then(|| {
+            children.and_then(|children| {
+                children
+                    .iter()
+                    .position(|child| child["localName"].as_str() == Some("summary"))
+            })
+        })
+        .flatten();
+    if let Some(children) = children {
+        for (index, child) in children.iter().enumerate() {
+            let child_inside = inside || (closed_details && Some(index) != summary_index);
+            collect_suppressed(child, child_inside, out);
+        }
+    }
+    for key in ["shadowRoots", "pseudoElements"] {
+        if let Some(children) = node[key].as_array() {
+            for child in children {
+                collect_suppressed(child, inside, out);
+            }
+        }
+    }
+}
+/// One isolated-world call walks the light DOM once and returns, for every
+/// element, its computed `display`. The DOM snapshot maps the returned
+/// childNodes paths back to backend ids. Nothing here resolves a node, so the
+/// probe costs one call per frame instead of one per node. A path that no
+/// longer matches the snapshot is ignored, which keeps the pre-filter
+/// conservative under a changing document.
+async fn display_none_subtrees(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    dom: &Value,
+    lease: &OperationLease,
+) -> Result<HashMap<i64, (i64, String)>, ObservationError> {
+    let session = &frame.binding.session;
+    let world = command(
+        client,
+        session,
+        "Page.createIsolatedWorld",
+        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-display-probe"}),
+        lease,
+    )
+    .await?;
+    let context = world["executionContextId"]
+        .as_i64()
+        .ok_or(ObservationError::BackendFailure)?;
+    let expression = r#"(() => {
+      const out = [];
+      const walk = (node, path) => {
+        const children = node.childNodes;
+        for (let i = 0; i < children.length; i++) {
+          const child = children[i];
+          if (child.nodeType !== 1) continue;
+          const next = path.concat(i);
+          let none = false;
+          try { none = getComputedStyle(child).display === 'none'; } catch {}
+          out.push([next, String(child.localName || '').toLowerCase(), none]);
+          walk(child, next);
+        }
+      };
+      walk(document.documentElement, []);
+      return out;
+    })()"#;
+    let result = command(
+        client,
+        session,
+        "Runtime.evaluate",
+        json!({"expression":expression,"contextId":context,"returnByValue":true,"awaitPromise":false}),
+        lease,
+    )
+    .await?;
+    if result.get("exceptionDetails").is_some() {
+        return Err(ObservationError::BackendFailure);
+    }
+    let rows = result["result"]["value"]
+        .as_array()
+        .ok_or(ObservationError::BackendFailure)?;
+    fn find_html(node: &Value) -> Option<&Value> {
+        if node["nodeType"].as_i64() == Some(1)
+            && node["localName"]
+                .as_str()
+                .is_some_and(|local| local.eq_ignore_ascii_case("html"))
+        {
+            return Some(node);
+        }
+        for key in ["children", "shadowRoots", "pseudoElements"] {
+            if let Some(children) = node[key].as_array() {
+                for child in children {
+                    if let Some(found) = find_html(child) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+    let Some(html) = find_html(&dom["root"]) else {
+        return Ok(HashMap::new());
+    };
+    fn mark_subtree(node: &Value, out: &mut HashMap<i64, (i64, String)>) {
+        let kind = node["nodeType"].as_i64().unwrap_or(0);
+        let local = node["localName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if let Some(backend) = node["backendNodeId"].as_i64() {
+            out.insert(backend, (kind, local));
+        }
+        for key in ["children", "shadowRoots", "pseudoElements"] {
+            if let Some(children) = node[key].as_array() {
+                for child in children {
+                    mark_subtree(child, out);
+                }
+            }
+        }
+    }
+    fn mark_path(
+        node: &Value,
+        path: &mut Vec<usize>,
+        target: &[usize],
+        local: &str,
+        out: &mut HashMap<i64, (i64, String)>,
+        found: &mut bool,
+    ) {
+        if *found {
+            return;
+        }
+        let Some(children) = node["children"].as_array() else {
+            return;
+        };
+        for (index, child) in children.iter().enumerate() {
+            path.push(index);
+            if path.as_slice() == target {
+                let child_local = child["localName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if child["nodeType"].as_i64() == Some(1) && child_local == local {
+                    mark_subtree(child, out);
+                    *found = true;
+                }
+                path.pop();
+                return;
+            }
+            mark_path(child, path, target, local, out, found);
+            path.pop();
+            if *found {
+                return;
+            }
+        }
+    }
+    let mut hidden: HashMap<i64, (i64, String)> = HashMap::new();
+    for row in rows {
+        let Some(path) = row.get(0).and_then(Value::as_array) else {
+            continue;
+        };
+        if row.get(2).and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(local) = row.get(1).and_then(Value::as_str) else {
+            continue;
+        };
+        let path: Vec<usize> = path
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|v| v as usize)
+            .collect();
+        if path.is_empty() {
+            continue;
+        }
+        let mut found = false;
+        mark_path(html, &mut Vec::new(), &path, local, &mut hidden, &mut found);
+    }
+    Ok(hidden)
+}
+fn suppressed_stub(frame: &ObservationFrame, kind: i64, tag: &str) -> SemanticNode {
+    SemanticNode {
+        author: Some(author_projection::Facts {
+            tag: tag.to_owned(),
+            node_type: kind,
+            suppress: true,
+            visible: false,
+            ..Default::default()
+        }),
+        frame_path: frame.frame_path.clone(),
+        ..Default::default()
     }
 }
 
@@ -10797,6 +11061,107 @@ mod tests {
         json!({"author":{"tag":"button","action":true,"visible":true},"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Save","rect":{"x":1,"y":2,"width":3,"height":4}})
     }
     #[test]
+    fn suppressed_prefilter_keeps_summary_and_interactive_ancestors() {
+        let node = |kind: i64,
+                    backend: i64,
+                    local: &str,
+                    attributes: Value,
+                    children: Vec<Value>| json!({"nodeType":kind,"backendNodeId":backend,"localName":local,"attributes":attributes,"children":children});
+        let text = |backend: i64, value: &str| json!({"nodeType":3,"backendNodeId":backend,"nodeValue":value});
+        let dom = node(
+            9,
+            1,
+            "",
+            json!([]),
+            vec![node(
+                1,
+                2,
+                "html",
+                json!([]),
+                vec![
+                    node(
+                        1,
+                        3,
+                        "head",
+                        json!([]),
+                        vec![
+                            node(1, 4, "script", json!([]), vec![text(5, "x")]),
+                            node(1, 6, "style", json!([]), vec![text(7, "y")]),
+                        ],
+                    ),
+                    node(
+                        1,
+                        8,
+                        "body",
+                        json!([]),
+                        vec![
+                            node(
+                                1,
+                                9,
+                                "div",
+                                json!(["aria-hidden", "true"]),
+                                vec![node(
+                                    1,
+                                    10,
+                                    "button",
+                                    json!(["class", "x"]),
+                                    vec![text(12, "Close")],
+                                )],
+                            ),
+                            node(1, 13, "span", json!(["inert", ""]), vec![text(14, "inert")]),
+                            node(
+                                1,
+                                15,
+                                "details",
+                                json!([]),
+                                vec![
+                                    node(1, 16, "summary", json!([]), vec![text(17, "More")]),
+                                    node(
+                                        1,
+                                        18,
+                                        "p",
+                                        json!([]),
+                                        vec![node(
+                                            1,
+                                            19,
+                                            "span",
+                                            json!([]),
+                                            vec![text(20, "Hidden")],
+                                        )],
+                                    ),
+                                ],
+                            ),
+                            node(
+                                1,
+                                21,
+                                "details",
+                                json!(["open", ""]),
+                                vec![node(1, 22, "p", json!([]), vec![text(23, "Open")])],
+                            ),
+                            node(1, 24, "button", json!([]), vec![text(25, "Visible")]),
+                        ],
+                    ),
+                ],
+            )],
+        );
+        let mut suppressed: HashMap<i64, (i64, String)> = HashMap::new();
+        collect_suppressed(&dom, false, &mut suppressed);
+        let dropped: std::collections::HashSet<i64> = suppressed.keys().copied().collect();
+        for backend in [3, 4, 5, 6, 7, 9, 10, 12, 13, 14, 18, 19, 20] {
+            assert!(
+                dropped.contains(&backend),
+                "backend {backend} must be suppressed"
+            );
+        }
+        for backend in [1, 2, 8, 15, 16, 17, 21, 22, 23, 24, 25] {
+            assert!(
+                !dropped.contains(&backend),
+                "backend {backend} must stay readable"
+            );
+        }
+    }
+
+    #[test]
     fn folded_text_plan_uses_child_node_positions_and_values() {
         let dom = json!({"root":{"nodeType":9,"backendNodeId":1,"children":[
             {"nodeType":1,"backendNodeId":2,"children":[
@@ -10811,7 +11176,14 @@ mod tests {
         let ax: HashMap<i64, &AXNode> = HashMap::new();
         let mut folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
         let mut folded: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        collect_folded_text(&dom["root"], &mut folds, &mut folded, &candidates, &ax);
+        collect_folded_text(
+            &dom["root"],
+            &mut folds,
+            &mut folded,
+            &candidates,
+            &std::collections::HashSet::new(),
+            &ax,
+        );
         assert_eq!(folded, std::collections::HashSet::from([3, 6]));
         let element = &folds[&2];
         assert_eq!(element.len(), 1);
