@@ -2683,8 +2683,6 @@ pub async fn observe(
         // of a suppressed node.
         let mut suppressed: HashMap<i64, (i64, String)> = HashMap::new();
         collect_suppressed(&dom["root"], false, &mut suppressed);
-        let dom_suppressed = suppressed.len();
-        let probe_start = std::time::Instant::now();
         let probed = match semantic_capture_stage!(
             witness,
             Metadata,
@@ -2694,31 +2692,8 @@ pub async fn observe(
             Ok(probed) => probed,
             Err(_) => HashMap::new(),
         };
-        let probe_ms = probe_start.elapsed().as_millis();
         for (id, fact) in probed {
             suppressed.entry(id).or_insert(fact);
-        }
-        {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/display-probe.log")
-            {
-                let in_graph = suppressed
-                    .keys()
-                    .filter(|id| graph.ids.contains(*id))
-                    .count();
-                let _ = writeln!(
-                    file,
-                    "probe ms={} probeHidden={} domSuppressed={} totalSuppressed={} inGraph={}",
-                    probe_ms,
-                    suppressed.len() - dom_suppressed,
-                    dom_suppressed,
-                    suppressed.len(),
-                    in_graph
-                );
-            }
         }
         let suppressed_ids: std::collections::HashSet<i64> = suppressed.keys().copied().collect();
         let mut text_folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
@@ -4724,31 +4699,6 @@ async fn display_none_subtrees(
     let rows = result["result"]["value"]
         .as_array()
         .ok_or(ObservationError::BackendFailure)?;
-    let mut elements: HashMap<Vec<usize>, (i64, i64, String)> = HashMap::new();
-    fn index_paths(
-        node: &Value,
-        path: &mut Vec<usize>,
-        elements: &mut HashMap<Vec<usize>, (i64, i64, String)>,
-    ) {
-        let Some(children) = node["children"].as_array() else {
-            return;
-        };
-        for (index, child) in children.iter().enumerate() {
-            path.push(index);
-            let kind = child["nodeType"].as_i64().unwrap_or(0);
-            let local = child["localName"]
-                .as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if kind == 1 {
-                if let Some(backend) = child["backendNodeId"].as_i64() {
-                    elements.insert(path.clone(), (backend, kind, local.clone()));
-                }
-            }
-            index_paths(child, path, elements);
-            path.pop();
-        }
-    }
     fn find_html(node: &Value) -> Option<&Value> {
         if node["nodeType"].as_i64() == Some(1)
             && node["localName"]
@@ -4771,7 +4721,6 @@ async fn display_none_subtrees(
     let Some(html) = find_html(&dom["root"]) else {
         return Ok(HashMap::new());
     };
-    index_paths(html, &mut Vec::new(), &mut elements);
     fn mark_subtree(node: &Value, out: &mut HashMap<i64, (i64, String)>) {
         let kind = node["nodeType"].as_i64().unwrap_or(0);
         let local = node["localName"]
@@ -4825,8 +4774,6 @@ async fn display_none_subtrees(
         }
     }
     let mut hidden: HashMap<i64, (i64, String)> = HashMap::new();
-    let mut display_none_rows = 0usize;
-    let mut matched = 0usize;
     for row in rows {
         let Some(path) = row.get(0).and_then(Value::as_array) else {
             continue;
@@ -4834,7 +4781,6 @@ async fn display_none_subtrees(
         if row.get(2).and_then(Value::as_bool) != Some(true) {
             continue;
         }
-        display_none_rows += 1;
         let Some(local) = row.get(1).and_then(Value::as_str) else {
             continue;
         };
@@ -4848,27 +4794,6 @@ async fn display_none_subtrees(
         }
         let mut found = false;
         mark_path(html, &mut Vec::new(), &path, local, &mut hidden, &mut found);
-        if found {
-            matched += 1;
-        }
-    }
-    {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/display-probe-raw.log")
-        {
-            let _ = writeln!(
-                file,
-                "raw rows={} displayNoneRows={} matched={} hidden={} elements={}",
-                rows.len(),
-                display_none_rows,
-                matched,
-                hidden.len(),
-                elements.len()
-            );
-        }
     }
     Ok(hidden)
 }
