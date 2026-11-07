@@ -4689,6 +4689,33 @@ impl SubmittedCommand {
             return Vec::new();
         }
         if response.session_id.as_deref() != command.provenance.session.as_deref() {
+            // A session-addressed command can come back at the browser level
+            // when the browser no longer knows its session: the reply then
+            // carries no session id at all. The page can create and remove a
+            // frame target between the read that addressed it and this reply,
+            // so the omitted id is that session's retirement, not corruption.
+            // The browser's own "Session with given id not found" answer proves
+            // the exact session was already gone; its retained objects, groups
+            // and pending commands are unreachable and can be discharged
+            // without contaminating every later operation on the scope. Any
+            // other mismatch keeps the strict integrity loss.
+            let command_session = command.provenance.session.clone();
+            if response.session_id.is_none()
+                && response
+                    .error
+                    .as_ref()
+                    .is_some_and(super::cdp::types::CdpError::is_session_not_found)
+            {
+                if let Some(session) = command_session {
+                    destroy_matching(
+                        &mut state,
+                        |provenance| provenance.session.as_deref() == Some(session.as_str()),
+                        true,
+                        false,
+                    );
+                    return Vec::new();
+                }
+            }
             // Omission is valid only when both sides are browser-level.
             command.status.set(CommandStatus::IntegrityLost);
             state.contaminate_integrity();
@@ -6347,6 +6374,111 @@ pub(crate) mod tests {
         release.settle(&response(json!({})));
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
         assert!(!ledger.snapshot().integrity_lost);
+    }
+
+    fn frame_session(ledger: &Arc<OwnerDebtLedger>) -> OperationJournalHandle {
+        ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 2,
+                },
+                "frame-target".into(),
+                "frame".into(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn browser_level_session_not_found_discharges_the_exact_retired_session() {
+        let (ledger, _page) = owner();
+        let frame = frame_session(&ledger);
+        // One retained object on the page-created session.
+        let created = ledger
+            .reserve_command(
+                Some(&frame),
+                "DOM.resolveNode",
+                Some(&json!({"objectGroup":"native-frame-owner-2-1","backendNodeId":42})),
+                Some("frame"),
+            )
+            .unwrap();
+        let created_status = created.status();
+        let created = created.submit().unwrap();
+        created.settle(
+            &serde_json::from_value(
+                json!({"id":2,"sessionId":"frame","result":{"object":{"objectId":"framed-node"}}}),
+            )
+            .unwrap(),
+        );
+        assert_eq!(created_status.snapshot(), CommandStatus::Acknowledged);
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        // The page removed that frame target before the reply to this exact
+        // read could be attributed to its session.
+        let read = ledger
+            .reserve_command(
+                Some(&frame),
+                "Page.getFrameTree",
+                Some(&json!({})),
+                Some("frame"),
+            )
+            .unwrap();
+        let read_status = read.status();
+        let read = read.submit().unwrap();
+        read.settle(
+            &serde_json::from_value(json!({"id":3,"error":{"code":-32000,
+                "message":"Session with given id not found."}}))
+            .unwrap(),
+        );
+        // The browser's own answer proves the exact session was gone: its
+        // retained object and this command are discharged, and the scope's
+        // ledger stays intact for the next operation.
+        assert_eq!(read_status.snapshot(), CommandStatus::Destroyed);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.object_debt, 0);
+        assert_eq!(snapshot.outstanding_commands, 0);
+        assert!(!snapshot.integrity_lost);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_named_session_still_loses_ledger_integrity() {
+        let (ledger, _page) = owner();
+        let frame = frame_session(&ledger);
+        let read = ledger
+            .reserve_command(
+                Some(&frame),
+                "Page.getFrameTree",
+                Some(&json!({})),
+                Some("frame"),
+            )
+            .unwrap();
+        let status = read.status();
+        let read = read.submit().unwrap();
+        read.settle(
+            &serde_json::from_value(json!({"id":3,"sessionId":"other","error":{"code":-32000,
+                "message":"Session with given id not found."}}))
+            .unwrap(),
+        );
+        assert_eq!(status.snapshot(), CommandStatus::IntegrityLost);
+        assert!(ledger.snapshot().integrity_lost);
+    }
+
+    #[tokio::test]
+    async fn an_omitted_session_on_a_success_reply_still_loses_ledger_integrity() {
+        let (ledger, _page) = owner();
+        let frame = frame_session(&ledger);
+        let read = ledger
+            .reserve_command(
+                Some(&frame),
+                "Page.getFrameTree",
+                Some(&json!({})),
+                Some("frame"),
+            )
+            .unwrap();
+        let status = read.status();
+        let read = read.submit().unwrap();
+        read.settle(&serde_json::from_value(json!({"id":3,"result":{}})).unwrap());
+        assert_eq!(status.snapshot(), CommandStatus::IntegrityLost);
+        assert!(ledger.snapshot().integrity_lost);
     }
 
     #[tokio::test]

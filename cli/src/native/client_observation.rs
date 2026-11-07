@@ -377,7 +377,20 @@ pub(crate) async fn retained_read_command(
         biased;
         result = &mut command => {
             if !owns_resources { check(lease)?; }
-            return result.map_err(|_| ObservationError::BackendFailure);
+            // A page-created frame target can retire between the inventory
+            // that admitted this read and the command that addresses it. The
+            // browser then answers at the browser level that the session does
+            // not exist. That is the frame reference being stale, not a page
+            // fault: the read dispatched nothing, and a re-read of the settled
+            // inventory can observe the new frame set. Every other command
+            // failure keeps its backend classification.
+            return result.map_err(|error| {
+                if super::cdp::types::is_session_not_found_message(&error) {
+                    ObservationError::StaleReference
+                } else {
+                    ObservationError::BackendFailure
+                }
+            });
         }
         _ = cancellation.changed() => observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::Cancelled),
         _ = tokio::time::sleep_until(lease.deadline.into()) => observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::DeadlineExceeded),
@@ -2835,13 +2848,25 @@ pub async fn observe(
             }
             pending.extend(node.children.iter().rev());
         }
-        traversal.record(frame_policy::DocumentCapture {
-            frame: frame.binding.frame.clone(),
-            node_count,
-            truncated: frame_truncated,
-            emitted_owners,
-            hidden_owners,
-        })?;
+        // The captured document must still match the frame inventory this read
+        // was admitted with. A page-created frame target that retires during
+        // the walk leaves a child owner the document no longer emits, and the
+        // traversal refuses the record. The page inventory moved, not the
+        // scope: the read dispatched nothing and the enclosing observation can
+        // re-read the settled inventory. Capacity and every other traversal
+        // error keep their existing classification.
+        traversal
+            .record(frame_policy::DocumentCapture {
+                frame: frame.binding.frame.clone(),
+                node_count,
+                truncated: frame_truncated,
+                emitted_owners,
+                hidden_owners,
+            })
+            .map_err(|error| match error {
+                ObservationError::BackendFailure => ObservationError::StaleReference,
+                error => error,
+            })?;
         frame_roots.insert(frame.binding.frame.clone(), roots);
         semantic_capture_stage!(
             witness,
