@@ -1505,8 +1505,10 @@ async fn read_backend(
         None,
         None,
         None,
+        None,
     )
     .await?
+    .0
     .into_iter()
     .next()
     .ok_or(ObservationError::BackendFailure)?;
@@ -2674,24 +2676,27 @@ pub async fn observe(
             .filter(|ax| ax_string(&ax.role).as_deref() != Some("InlineTextBox"))
             .filter_map(|ax| ax.backend_d_o_m_node_id.map(|id| (id, ax)))
             .collect();
+        let candidate_ids: std::collections::HashSet<i64> = graph.ids.iter().copied().collect();
+        let mut text_folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
+        let mut folded_text: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        collect_folded_text(
+            &dom["root"],
+            &mut text_folds,
+            &mut folded_text,
+            &candidate_ids,
+            &ax_by_backend,
+        );
+        // Text nodes read through their parent's object are not separate
+        // receivers; every other candidate keeps its own resolve.
         let candidates: Vec<AXNode> = graph
             .ids
             .iter()
+            .filter(|id| !folded_text.contains(*id))
             .map(|id| {
                 ax_by_backend
                     .get(id)
                     .map(|ax| (*ax).clone())
-                    .unwrap_or(AXNode {
-                        node_id: String::new(),
-                        role: None,
-                        name: None,
-                        value: None,
-                        description: None,
-                        properties: None,
-                        child_ids: None,
-                        backend_d_o_m_node_id: Some(*id),
-                        ignored: None,
-                    })
+                    .unwrap_or_else(|| synthetic_ax(*id))
             })
             .collect();
         // One observation-owned frame inventory supplies every metadata batch's
@@ -2704,7 +2709,7 @@ pub async fn observe(
         };
         let mut nodes = HashMap::new();
         for chunk in candidates.chunks(64) {
-            let batch = semantic_capture_stage!(
+            let (batch, folded) = semantic_capture_stage!(
                 witness,
                 Metadata,
                 frame_kind,
@@ -2720,9 +2725,14 @@ pub async fn observe(
                     &security,
                     &pseudos,
                     Some(realm),
+                    Some(&text_folds),
                 )
                 .await
             )?;
+            for (backend, mut node) in folded {
+                apply_security(&mut node, backend, &security);
+                nodes.insert(backend, node);
+            }
             for (ax, mut node) in chunk.iter().zip(batch) {
                 let id = semantic_capture_stage!(
                     witness,
@@ -3955,7 +3965,7 @@ async fn evaluate_query_diagnostic_inner(
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None).await?);
+            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None,None).await?.0);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
     witness.stage(Stage::QueryWorld);
@@ -4000,7 +4010,7 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::MetadataConfirm);
             let mut confirmed = Vec::new();
             for chunk in ax_nodes.chunks(64) {
-                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None,None).await?);
+                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None,None,None).await?.0);
             }
             for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
             if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
@@ -4457,6 +4467,86 @@ async fn main_onclick_hints(
     settle_captured_object_group(client, session, &group, result, lease, &capture).await
 }
 
+/// One text node read through its parent element's resolved object. The
+/// parent's batch calls the same METADATA reader on the real child node, so
+/// text costs one metadata call and no extra DOM.resolveNode. The plan carries
+/// the child's position and value so a changed document falls back to the
+/// existing stale-reference retry instead of attaching the wrong facts.
+#[derive(Clone)]
+struct FoldedText {
+    backend: i64,
+    index: usize,
+    prefix: String,
+    length: usize,
+    ax: AXNode,
+}
+fn synthetic_ax(backend: i64) -> AXNode {
+    AXNode {
+        node_id: String::new(),
+        role: None,
+        name: None,
+        value: None,
+        description: None,
+        properties: None,
+        child_ids: None,
+        backend_d_o_m_node_id: Some(backend),
+        ignored: None,
+    }
+}
+/// Collects every text node whose parent is an element (or the document) that
+/// is itself a candidate, from the verified DOM snapshot. Comments and missing
+/// node kinds keep their childNodes position in the snapshot, so the plan's
+/// index is the renderer's own childNodes index. Shadow roots and pseudo
+/// elements are never parents here; their text keeps the per-node path.
+fn collect_folded_text(
+    node: &Value,
+    folds: &mut HashMap<i64, Vec<FoldedText>>,
+    folded: &mut std::collections::HashSet<i64>,
+    candidates: &std::collections::HashSet<i64>,
+    ax_by_backend: &HashMap<i64, &AXNode>,
+) {
+    let kind = node["nodeType"].as_i64();
+    if kind == Some(1) && !node["pseudoType"].is_string() {
+        if let (Some(parent), Some(children)) =
+            (node["backendNodeId"].as_i64(), node["children"].as_array())
+        {
+            if candidates.contains(&parent) {
+                for (index, child) in children.iter().enumerate() {
+                    if child["nodeType"].as_i64() != Some(3) {
+                        continue;
+                    }
+                    let Some(backend) = child["backendNodeId"].as_i64() else {
+                        continue;
+                    };
+                    if !candidates.contains(&backend) || !folded.insert(backend) {
+                        continue;
+                    }
+                    let text = child["nodeValue"].as_str().unwrap_or("");
+                    let prefix = text.chars().take(32).collect::<String>();
+                    let ax = ax_by_backend
+                        .get(&backend)
+                        .map(|ax| (*ax).clone())
+                        .unwrap_or_else(|| synthetic_ax(backend));
+                    folds.entry(parent).or_default().push(FoldedText {
+                        backend,
+                        index,
+                        prefix,
+                        length: text.encode_utf16().count(),
+                        ax,
+                    });
+                }
+            }
+        }
+    }
+    for key in ["children", "shadowRoots", "pseudoElements"] {
+        if let Some(children) = node[key].as_array() {
+            for child in children {
+                collect_folded_text(child, folds, folded, candidates, ax_by_backend);
+            }
+        }
+    }
+}
+
 /// Observation-lifetime pseudo evidence. One frame inventory supplies every
 /// batch's receiver classification, and every read pseudo is revalidated once
 /// after the final batch rather than once per batch.
@@ -4479,7 +4569,8 @@ async fn read_batch(
     acquisition_policy: &SecurityInventory,
     pseudos: &PseudoObservation,
     execution_context: Option<i64>,
-) -> Result<Vec<SemanticNode>, ObservationError> {
+    text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
+) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
     read_batch_with_refs(
         client,
         frame,
@@ -4493,6 +4584,7 @@ async fn read_batch(
         Some(&pseudos.origins),
         Some(&pseudos.deferred),
         execution_context,
+        text_folds,
     )
     .await
 }
@@ -4510,10 +4602,11 @@ async fn read_batch_with_refs(
     pseudo_inventory: Option<&std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>>,
     deferred_pseudos: Option<&std::sync::Mutex<Vec<(i64, i64)>>>,
     execution_context: Option<i64>,
-) -> Result<Vec<SemanticNode>, ObservationError> {
+    text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
+) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
     use futures_util::{stream, StreamExt};
     if nodes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let session = &frame.binding.session;
     let group = client
@@ -4691,8 +4784,67 @@ async fn read_batch_with_refs(
         }
         // The originating element supplies security policy only. Identity stays
         // the native pseudo backend, never the origin's DOM reference.
+        metadata_stage!(FoldedTextRead);
+        // Text children are read through the parent receiver in the same
+        // batch. The plan carries childNodes positions and the snapshot value
+        // so a changed document refuses the read instead of attaching facts to
+        // the wrong text node.
+        let folded_rows = if let Some(folds) = text_folds {
+            let plans: Vec<Value> = nodes
+                .iter()
+                .map(|ax| {
+                    Value::Array(
+                        ax.backend_d_o_m_node_id
+                            .and_then(|backend| folds.get(&backend))
+                            .map(|list| {
+                                list.iter()
+                                    .map(|fold| json!([fold.index, &fold.prefix, fold.length]))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            if plans.iter().any(|plan| plan.as_array().is_some_and(|entries| !entries.is_empty())) {
+                let plan = serde_json::to_string(&plans).map_err(|_| ObservationError::BackendFailure)?;
+                let function = format!(
+                    "function(testId,secureSelector,plan,...parents){{const read={METADATA};const folds=JSON.parse(plan);return parents.map((node,index)=>{{const entries=folds[index]||[];return entries.map(entry=>{{const child=node.childNodes[entry[0]];if(!child||child.nodeType!==3)return {{__nativeStatus:'fallback'}};const value=String(child.nodeValue===null?'':child.nodeValue);if(value.length!==entry[2]||!value.startsWith(entry[1]))return {{__nativeStatus:'fallback'}};return read.call(child,testId,secureSelector,true,false,false,false,false);}});}});}}"
+                );
+                let mut arguments = vec![
+                    json!({"value":options.test_id_attribute}),
+                    json!({"value":options.secure_field_selector}),
+                    json!({"value":plan}),
+                ];
+                arguments.extend(objects.iter().map(|o| json!({"objectId":o})));
+                let result = command(
+                    client,
+                    session,
+                    "Runtime.callFunctionOn",
+                    json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),
+                    lease,
+                )
+                .await?;
+                if result.get("exceptionDetails").is_some() {
+                    return Err(ObservationError::BackendFailure);
+                }
+                let rows = result["result"]["value"]
+                    .as_array()
+                    .ok_or(ObservationError::BackendFailure)?
+                    .clone();
+                if rows.len() != nodes.len() {
+                    return Err(ObservationError::BackendFailure);
+                }
+                Some(rows)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // The originating element supplies security policy only. Identity stays
+        // the native pseudo backend, never the origin's DOM reference.
         metadata_stage!(Projection);
-        nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
+        let main_nodes = nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
             let readonly=if origin.is_some(){readonly_pseudo_metadata(data,ax)}else{data.clone()};
             let mut node=match refs.as_deref_mut() {
                 Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded),
@@ -4700,7 +4852,68 @@ async fn read_batch_with_refs(
             }?;
             if let (Some(origin),Some(policy))=(origin,policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
             Ok(node)
-        }).collect()
+        }).collect::<Result<Vec<_>,ObservationError>>()?;
+        let mut folded_nodes = Vec::new();
+        if let (Some(folds), Some(rows)) = (text_folds, folded_rows) {
+            for (index, ax) in nodes.iter().enumerate() {
+                let backend = ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+                let Some(list) = folds.get(&backend) else { continue };
+                let data = rows
+                    .get(index)
+                    .and_then(Value::as_array)
+                    .ok_or(ObservationError::BackendFailure)?;
+                if data.len() != list.len() {
+                    return Err(ObservationError::BackendFailure);
+                }
+                for (fold, value) in list.iter().zip(data) {
+                    match value["__nativeStatus"].as_str() {
+                        Some("fallback") => {
+                            // A changed childNodes position or value is read
+                            // from the exact backend id instead of trusting
+                            // this batch's position.
+                            let mut node = read_folded_text_fallback(
+                                client,
+                                session,
+                                frame,
+                                fold,
+                                refs.as_deref_mut(),
+                                revision,
+                                options,
+                                lease,
+                                bounded,
+                                context,
+                                &group,
+                            )
+                            .await?;
+                            if let Some(policy) = policy {
+                                apply_security(&mut node, fold.backend, policy);
+                                if node.states.get("secure") == Some(&true) {
+                                    scrub_content(&mut node);
+                                }
+                            }
+                            folded_nodes.push((fold.backend, node));
+                            continue;
+                        }
+                        Some("stale-reference") => return Err(ObservationError::StaleReference),
+                        Some("resource-limit") => return Err(ObservationError::ResourceLimit),
+                        Some(_) => return Err(ObservationError::BackendFailure),
+                        None => {}
+                    }
+                    let mut node = match refs.as_deref_mut() {
+                        Some(refs)=>project_node(frame, fold.backend, &fold.ax, refs, revision, value, bounded),
+                        None=>project_node_with_refs(frame, fold.backend, &fold.ax, None, revision, value, bounded),
+                    }?;
+                    if let Some(policy) = policy {
+                        apply_security(&mut node, fold.backend, policy);
+                        if node.states.get("secure") == Some(&true) {
+                            scrub_content(&mut node);
+                        }
+                    }
+                    folded_nodes.push((fold.backend, node));
+                }
+            }
+        }
+        Ok((main_nodes, folded_nodes))
     }).await;
     #[cfg(test)]
     let primary_failed = result.is_err();
@@ -4715,6 +4928,60 @@ async fn read_batch_with_refs(
         eprintln!("native-metadata-first-failure stage=ObjectGroupCleanup");
     }
     result
+}
+
+/// Reads one text node folded by position when its batch plan no longer
+/// matches the live childNodes. The backend id is the exact identity; this is
+/// the same single-receiver metadata read the unfolded path would have paid.
+#[allow(clippy::too_many_arguments)]
+async fn read_folded_text_fallback(
+    client: &CdpClient,
+    session: &str,
+    frame: &ObservationFrame,
+    fold: &FoldedText,
+    refs: Option<&mut RefMap>,
+    revision: u64,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    bounded: bool,
+    context: i64,
+    group: &str,
+) -> Result<SemanticNode, ObservationError> {
+    let object =
+        resolve_page_object(client, session, fold.backend, Some(context), group, lease).await?;
+    if object["object"]["subtype"] != "node" {
+        return Err(ObservationError::StaleReference);
+    }
+    let object_id = object["object"]["objectId"]
+        .as_str()
+        .ok_or(ObservationError::StaleReference)?;
+    let function = format!(
+        "function(testId,secureSelector,node){{const read={METADATA};return read.call(node,testId,secureSelector,{bounded},false,false,false,false);}}"
+    );
+    let result = command(
+        client,
+        session,
+        "Runtime.callFunctionOn",
+        json!({"objectId":object_id,"functionDeclaration":function,"arguments":[{"value":options.test_id_attribute},{"value":options.secure_field_selector},{"objectId":object_id}],"returnByValue":true,"objectGroup":group}),
+        lease,
+    )
+    .await?;
+    if result.get("exceptionDetails").is_some() {
+        return Err(ObservationError::BackendFailure);
+    }
+    let data = &result["result"]["value"];
+    match data["__nativeStatus"].as_str() {
+        Some("stale-reference") => return Err(ObservationError::StaleReference),
+        Some("resource-limit") => return Err(ObservationError::ResourceLimit),
+        Some(_) => return Err(ObservationError::BackendFailure),
+        None => {}
+    }
+    match refs {
+        Some(refs) => project_node(frame, fold.backend, &fold.ax, refs, revision, data, bounded),
+        None => {
+            project_node_with_refs(frame, fold.backend, &fold.ax, None, revision, data, bounded)
+        }
+    }
 }
 
 /// Failure-only test diagnostics. Only fixed booleans and bounded ordinals leave
@@ -10529,6 +10796,38 @@ mod tests {
     fn metadata() -> Value {
         json!({"author":{"tag":"button","action":true,"visible":true},"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Save","rect":{"x":1,"y":2,"width":3,"height":4}})
     }
+    #[test]
+    fn folded_text_plan_uses_child_node_positions_and_values() {
+        let dom = json!({"root":{"nodeType":9,"backendNodeId":1,"children":[
+            {"nodeType":1,"backendNodeId":2,"children":[
+                {"nodeType":3,"backendNodeId":3,"nodeValue":"alpha"},
+                {"nodeType":8,"backendNodeId":4,"nodeValue":"comment"},
+                {"nodeType":1,"backendNodeId":5,"children":[
+                    {"nodeType":3,"backendNodeId":6,"nodeValue":"beta"}
+                ]}
+            ]}
+        ]}});
+        let candidates: std::collections::HashSet<i64> = [1, 2, 3, 5, 6].into_iter().collect();
+        let ax: HashMap<i64, &AXNode> = HashMap::new();
+        let mut folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
+        let mut folded: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        collect_folded_text(&dom["root"], &mut folds, &mut folded, &candidates, &ax);
+        assert_eq!(folded, std::collections::HashSet::from([3, 6]));
+        let element = &folds[&2];
+        assert_eq!(element.len(), 1);
+        assert_eq!(
+            (
+                element[0].backend,
+                element[0].index,
+                element[0].prefix.as_str(),
+                element[0].length
+            ),
+            (3, 0, "alpha", 5)
+        );
+        let span = &folds[&5];
+        assert_eq!((span[0].backend, span[0].index), (6, 0));
+        assert!(!folds.contains_key(&1));
+    }
     async fn mock_client(fail_after_metadata: bool) -> (CdpClient, tokio::task::JoinHandle<()>) {
         mock_client_with_cdp_failure(fail_after_metadata, None).await
     }
@@ -11911,9 +12210,11 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(nodes.len(), 2);
         assert_ne!(nodes[0].reference.id, nodes[1].reference.id);
         server.await.unwrap();
@@ -12822,6 +13123,7 @@ mod tests {
             &policy,
             &pseudos,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -12838,6 +13140,7 @@ mod tests {
                 true,
                 &policy,
                 &pseudos,
+                None,
                 None,
             )
             .await
@@ -12921,6 +13224,7 @@ mod tests {
                 &policy,
                 &pseudos,
                 Some(17),
+                None,
             )
             .await
             .unwrap();
@@ -13084,10 +13388,11 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
             if mode == "valid" || mode == "secure" {
-                let projected = result.unwrap().remove(0);
+                let projected = result.unwrap().0.remove(0);
                 let entry = refs
                     .get(projected.reference.id.trim_start_matches('@'))
                     .unwrap();
