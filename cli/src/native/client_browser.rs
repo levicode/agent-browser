@@ -2600,6 +2600,17 @@ struct InteropReplacementPhaseOneSnapshot {
     enrollment: Arc<super::client_enrollment::ClientEnrollment>,
 }
 
+/// Commands whose native reader addresses only the page session and therefore
+/// needs no frame inventory to execute. They are the read commands that use the
+/// fixed-read admission class, so an enrolling page-created target is waited
+/// out rather than reported as an unavailable scope.
+fn command_is_fixed_read(command: &str) -> bool {
+    matches!(
+        command,
+        "page.title" | "page.url" | "session.environment" | "context.cookies.get"
+    )
+}
+
 /// Commands that only read application state: no input, DOM or browser
 /// setting can be committed by them. `capture.screenshot` and
 /// `browser.trace` are deliberately absent because they own protected-read
@@ -4851,7 +4862,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(broker.issue_eval_child(&lease, &page.identity_scope)?)
                         } else { None };
                         let debt = page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
-                        let fixed_read = matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get");
+                        let fixed_read = command_is_fixed_read(&command);
                         if let Some(permit) = &eval_child {
                             dispatch_tasks.check_eval_dispatch(permit)?;
                             debt.check_eval_input(permit)?;
@@ -4956,10 +4967,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             dispatched = true;
                             return Ok(serde_json::json!({"activated": true}));
                         }
+                        // A fixed read never addresses a frame session, so a
+                        // page-created target still enrolling is readiness, not
+                        // an unavailable scope. It takes the same bounded
+                        // enrollment wait as a protected read (#72); mutating
+                        // commands keep the immediate completeness refusal.
                         let attachments = page
                             .targets
-                            .inventory()?
-                            .1
+                            .dispatch_inventory(&lease, fixed_read)
+                            .await?
                             .into_iter()
                             .filter(|target| {
                                 target.purpose
@@ -6741,6 +6757,32 @@ mod tests {
             assert_eq!(replacement.frame_policy, frozen);
         }
     }
+    #[test]
+    fn fixed_reads_are_the_page_session_metadata_commands() {
+        for command in [
+            "page.title",
+            "page.url",
+            "session.environment",
+            "context.cookies.get",
+        ] {
+            assert!(command_is_fixed_read(command), "{command}");
+        }
+        // Observation reads wait through their own protected-read path, and a
+        // mutation or frame-addressed command must keep the immediate fence.
+        for command in [
+            "browser.observe",
+            "browser.query",
+            "fixture.read-fields",
+            "capture.screenshot",
+            "page.evaluate",
+            "page.navigate",
+            "context.cookies.set",
+            "context.viewport",
+        ] {
+            assert!(!command_is_fixed_read(command), "{command}");
+        }
+    }
+
     #[test]
     fn read_only_commands_cannot_claim_unknown_mutation() {
         for command in [
