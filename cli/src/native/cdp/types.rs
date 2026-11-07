@@ -85,6 +85,30 @@ impl std::fmt::Display for CdpError {
     }
 }
 
+impl CdpError {
+    /// The browser answers a command addressed to a session at the browser
+    /// level when it cannot resolve that session. The reply then carries no
+    /// session id, and this closed shape is how the browser says exactly that:
+    /// the addressed session was already gone, not that the protocol broke.
+    pub(crate) fn is_session_not_found(&self) -> bool {
+        is_session_not_found_message(&self.message)
+    }
+}
+
+/// The same closed browser answer as it survives the client's legacy string
+/// error channel (`CDP error (<method>): <browser text>`). No other command
+/// failure carries it, and the wrapper is native text, not page content.
+pub(crate) fn is_session_not_found_message(message: &str) -> bool {
+    const ANSWER: &str = "session with given id not found";
+    let trimmed = message.trim_end_matches(['.', ' ']);
+    if let Some(wrapped) = trimmed.strip_prefix("CDP error (") {
+        if let Some((method, answer)) = wrapped.split_once("): ") {
+            return !method.is_empty() && answer.eq_ignore_ascii_case(ANSWER);
+        }
+    }
+    trimmed.eq_ignore_ascii_case(ANSWER)
+}
+
 // ---------------------------------------------------------------------------
 // CDP events (broadcast to subscribers)
 // ---------------------------------------------------------------------------
@@ -583,4 +607,38 @@ pub struct BrowserVersionInfo {
 #[allow(clippy::upper_case_acronyms)]
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cdp_generated.rs"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_not_found_is_one_closed_browser_answer() {
+        let error = CdpError {
+            code: Some(-32000),
+            message: "Session with given id not found.".into(),
+            data: None,
+        };
+        assert!(error.is_session_not_found());
+        assert!(is_session_not_found_message(
+            "CDP error (Page.getFrameTree): Session with given id not found."
+        ));
+        for message in [
+            "Session with given id not found",
+            "CDP error (Page.getFrameTree): Session with given id not found",
+        ] {
+            assert!(is_session_not_found_message(message));
+        }
+        // Every other error keeps its strict classification.
+        assert!(!is_session_not_found_message(
+            "CDP error (Page.getFrameTree): Cannot find context with specified id"
+        ));
+        assert!(CdpError {
+            code: Some(-32001),
+            message: "Session with given id not found.".into(),
+            data: None,
+        }
+        .is_session_not_found());
+    }
 }
