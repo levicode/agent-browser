@@ -2919,6 +2919,59 @@ impl ClientTargets {
     ) -> Result<(), ProtocolError> {
         self.wait_read_inventory(operation, false).await.map(|_| ())
     }
+    /// A read-only inventory can hold a frame session the page has already
+    /// retired: the browser destroyed that target, but the registry still lists
+    /// it until the supervisor applies the queued `Target.detachedFromTarget`.
+    /// A CDP read against that session fails even though the scope itself is
+    /// healthy; waiting for the registry to apply the detach the browser
+    /// already reported is readiness, not a retry of the failed read.
+    ///
+    /// Returns `true` once the registry no longer owns `session`, `false` when
+    /// the caller's own operation deadline expired first (the caller keeps its
+    /// original failure), and an explicit cancellation/scope error otherwise.
+    /// The wait never extends the operation's deadline and never masks the
+    /// primary failure: this is the same bounded notification wait the read
+    /// inventory uses.
+    pub(crate) async fn wait_read_session_retired(
+        &self,
+        operation: &super::client_session::OperationLease,
+        session: &str,
+    ) -> Result<bool, ProtocolError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.sealed || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if let Some(error) = (*operation.cancellation.borrow()).error() {
+                    return Err(error);
+                }
+                if !state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == session)
+                {
+                    return Ok(true);
+                }
+            }
+            let mut cancellation = operation.cancellation.clone();
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = cancellation.changed() => {
+                    return Err((*operation.cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled));
+                }
+                _ = tokio::time::sleep_until(operation.deadline.into()) => {
+                    return Ok(false);
+                }
+            }
+        }
+    }
     /// Restart alone may wait for exact, already-observed enrollment work. Keep
     /// the full registry guard through publication; ordinary settlement remains
     /// fail closed and never treats an incomplete inventory as reusable.
@@ -6008,5 +6061,82 @@ mod owned_inventory_diagnostic_opt_in_tests {
             read_operation(std::time::Instant::now() + std::time::Duration::from_millis(40));
         let result = registry.wait_read_inventory(&operation, false).await;
         assert!(matches!(result, Err(ProtocolError::DeadlineExceeded)));
+    }
+
+    async fn retired_read_registry() -> std::sync::Arc<ClientTargets> {
+        let registry = ready_read_registry();
+        registry
+            .attached(
+                "ctx",
+                "frame-target".into(),
+                "frame-session".into(),
+                "iframe".into(),
+            )
+            .unwrap();
+        registry.configured("frame-target").unwrap();
+        registry
+            .resume_permit("frame-target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn retired_read_session_waits_for_the_registry_to_apply_the_detach() {
+        let registry = retired_read_registry().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (_cancel, operation) = read_operation(deadline);
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .wait_read_session_retired(&operation, "frame-session")
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a still-owned session must keep the read waiting for its detach"
+        );
+        registry.detach("frame-target").unwrap();
+        assert!(waiting.await.unwrap().unwrap());
+        // The same session must not be waited for again once it is gone.
+        let (_cancel, operation) = read_operation(deadline);
+        assert!(registry
+            .wait_read_session_retired(&operation, "frame-session")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn retired_read_session_returns_false_at_the_operations_existing_deadline() {
+        let registry = retired_read_registry().await;
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_millis(40));
+        assert_eq!(
+            registry
+                .wait_read_session_retired(&operation, "frame-session")
+                .await
+                .unwrap(),
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_read_session_refuses_immediately_when_the_registry_sealed() {
+        let registry = retired_read_registry().await;
+        registry.seal();
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.wait_read_session_retired(&operation, "frame-session"),
+        )
+        .await
+        .expect("a sealed registry must not wait for a detach");
+        assert!(matches!(result, Err(ProtocolError::ScopeUnavailable)));
     }
 }

@@ -28,6 +28,14 @@ enum Fault {
     FocusCleanup,
     InventoryCleanup,
     InventoryStaleCleanup,
+    /// The browser retires the OOPIF session while the read enumerates it, and
+    /// the registry applies the detach: a fresh inventory no longer owns it.
+    RetiredIframe,
+    /// The same failure without the detach evidence: the read must keep its
+    /// original failure rather than retrying or swallowing it.
+    RetiredIframeStuck,
+    /// A page (not iframe) session failure is never waited out.
+    RetiredPageSession,
 }
 struct Peer {
     page: BrowserExecutionLease,
@@ -65,41 +73,57 @@ fn node(id: &str, parent: Option<&str>, children: Vec<Value>, loader_changed: bo
     }
     json!({"frame":frame,"childFrames":children})
 }
-fn frame_tree(session: &str, oopif: bool, fault: Fault, changed: bool) -> Value {
-    let local_parent = if oopif { "remote-root" } else { "main-root" };
+fn frame_tree(
+    session: &str,
+    oopif: bool,
+    remote_owned: bool,
+    fault: Fault,
+    changed: bool,
+) -> Value {
     let nested = node("nested", Some("local"), vec![], changed);
-    let local = node("local", Some(local_parent), vec![nested], changed);
     let tree = match session {
-        "page-session" => node(
-            "main-root",
-            None,
-            if oopif {
-                vec![node("remote-root", Some("main-root"), vec![], changed)]
+        "page-session" => {
+            // Once the OOPIF target is detached the page tree no longer owns
+            // that remote root, exactly as the browser reports it.
+            if oopif && remote_owned {
+                let local = node("local", Some("remote-root"), vec![nested], changed);
+                node(
+                    "main-root",
+                    None,
+                    vec![node("remote-root", Some("main-root"), vec![local], changed)],
+                    changed,
+                )
             } else {
-                vec![local]
-            },
-            changed,
-        ),
-        "remote-session" => node(
-            if fault == Fault::ForeignRendererRoot && changed {
-                "foreign-root"
-            } else {
-                "remote-root"
-            },
-            Some(if fault == Fault::ForeignParent {
-                "foreign-parent"
-            } else {
-                "main-root"
-            }),
-            vec![local],
-            changed,
-        ),
+                let local = node("local", Some("main-root"), vec![nested], changed);
+                node("main-root", None, vec![local], changed)
+            }
+        }
+        "remote-session" => {
+            let local = node("local", Some("remote-root"), vec![nested], changed);
+            node(
+                if fault == Fault::ForeignRendererRoot && changed {
+                    "foreign-root"
+                } else {
+                    "remote-root"
+                },
+                Some(if fault == Fault::ForeignParent {
+                    "foreign-parent"
+                } else {
+                    "main-root"
+                }),
+                vec![local],
+                changed,
+            )
+        }
         other => panic!("unowned session was queried: {other}"),
     };
     json!({"frameTree":tree})
 }
 impl Peer {
     async fn new(oopif: bool, fault: Fault) -> Self {
+        Self::with_deadline(oopif, fault, Duration::from_secs(5)).await
+    }
+    async fn with_deadline(oopif: bool, fault: Fault, budget: Duration) -> Self {
         let targets = ClientTargets::new("context".into(), "scope".into());
         attach(&targets, "target-for-main", "page-session", "page").await;
         if oopif {
@@ -117,6 +141,7 @@ impl Peer {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut world_seen = false;
             let mut remote_trees = 0;
+            let mut retired_iframe_seen = false;
             while let Some(Ok(Message::Text(text))) = socket.next().await {
                 let request: Value = serde_json::from_str(&text).unwrap();
                 captured.lock().unwrap().push(request.clone());
@@ -132,11 +157,34 @@ impl Peer {
                         if session == "remote-session" {
                             remote_trees += 1;
                         }
+                        if fault == Fault::RetiredPageSession && session == "page-session" {
+                            fail = true;
+                        }
                         let changed = (fault == Fault::LoaderChanged && world_seen)
                             || (fault == Fault::ForeignRendererRoot && remote_trees > 1);
-                        frame_tree(session, oopif, fault, changed)
+                        let remote_owned = registry
+                            .inventory()
+                            .map(|(_, targets)| {
+                                targets
+                                    .iter()
+                                    .any(|target| target.target_id == "target-for-remote")
+                            })
+                            .unwrap_or(false);
+                        frame_tree(session, oopif, remote_owned, fault, changed)
                     }
                     "Page.createIsolatedWorld" => {
+                        if matches!(fault, Fault::RetiredIframe | Fault::RetiredIframeStuck)
+                            && session == "remote-session"
+                            && !retired_iframe_seen
+                        {
+                            retired_iframe_seen = true;
+                            if fault == Fault::RetiredIframe {
+                                // The detach the browser already reported is
+                                // applied before the failed read observes it.
+                                registry.detach("target-for-remote").unwrap();
+                            }
+                            fail = true;
+                        }
                         if !world_seen
                             && matches!(fault, Fault::ReplaceSession | Fault::ReattachSameSession)
                         {
@@ -280,7 +328,7 @@ impl Peer {
             is_callback: false,
             generation: 1,
             sequence: 1,
-            deadline: Instant::now() + Duration::from_secs(5),
+            deadline: Instant::now() + budget,
             cancellation,
         };
         Self {
@@ -1019,4 +1067,48 @@ async fn chromium_object_hash_route_geometry_accepts_proven_opaque_subtrees() {
     geometry.revalidate(&page.client, &operation).await.unwrap();
     drop(cancel);
     owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_frame_target_retired_during_enumeration_settles_as_a_stale_scope() {
+    let peer = Peer::new(true, Fault::RetiredIframe).await;
+    let result = verified_frame_inventory(&peer.page, &peer.operation).await;
+    assert!(
+        matches!(result, Err(ProtocolError::StaleScope)),
+        "a page-created frame target that detached during the read moves the page inventory, not the scope"
+    );
+    // The registry applied the detach, so the engine's one fresh re-read sees
+    // the page without the transient frame.
+    let (_, targets) = peer.page.targets.inventory().unwrap();
+    assert!(targets
+        .iter()
+        .all(|target| target.target_id != "target-for-remote"));
+}
+
+#[tokio::test]
+async fn a_retired_iframe_session_without_detach_keeps_its_original_failure() {
+    let peer =
+        Peer::with_deadline(true, Fault::RetiredIframeStuck, Duration::from_millis(300)).await;
+    let started = Instant::now();
+    let result = verified_frame_inventory(&peer.page, &peer.operation).await;
+    assert!(
+        matches!(result, Err(ProtocolError::BrowserFailure)),
+        "a failure the registry never attributes to a detach keeps its class"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the wait is bounded by the operation's own deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_page_session_failure_is_never_waited_out_as_target_churn() {
+    let peer = Peer::new(false, Fault::RetiredPageSession).await;
+    let started = Instant::now();
+    let result = verified_frame_inventory(&peer.page, &peer.operation).await;
+    assert!(matches!(result, Err(ProtocolError::BrowserFailure)));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "only page-created frame targets are target churn"
+    );
 }
