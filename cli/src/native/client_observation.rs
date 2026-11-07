@@ -2212,11 +2212,13 @@ fn project_node_with_refs(
         node.safe_public_name = node
             .safe_public_name
             .map(|name| name.chars().take(256).collect());
+        let clickable = node.author.as_ref().is_some_and(|facts| facts.clickable);
         node.attributes.retain(|name, _| {
             matches!(
                 name.as_str(),
                 "type" | "autocomplete" | "href" | "role" | "placeholder"
             ) || name.starts_with("aria-")
+                || (matches!(name.as_str(), "class" | "id") && clickable)
         });
         // Bounded METADATA already reduced href against its exact document.
         // Preserve its explicit query/fragment elision markers and whole path.
@@ -12819,6 +12821,26 @@ mod tests {
         assert_eq!(observed.attributes["aria-label"], "Public");
         let read = project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, false).unwrap();
         assert_eq!(read.attributes["data-private"], "synthetic-secret");
+
+        // A page-authored identifier on an action target is a DOM fact the
+        // model may use to tell two anonymous icons apart; the renderer only
+        // prints these for an anonymous target. A non-action node keeps the
+        // old bounded allowlist.
+        let mut data = metadata();
+        data["attributes"] =
+            json!({"class":"icon-add","id":"add","data-private":"synthetic-secret"});
+        data["author"]["clickable"] = json!(true);
+        let mut refs = observed_refs();
+        let action =
+            project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, true).unwrap();
+        assert_eq!(action.attributes["class"], "icon-add");
+        assert_eq!(action.attributes["id"], "add");
+        assert!(!action.attributes.contains_key("data-private"));
+        data["author"]["clickable"] = json!(false);
+        let mut refs = observed_refs();
+        let plain = project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, true).unwrap();
+        assert!(!plain.attributes.contains_key("class"));
+        assert!(!plain.attributes.contains_key("id"));
     }
     #[test]
     fn exact_reference_exhaustion_returns_error_without_publishing() {

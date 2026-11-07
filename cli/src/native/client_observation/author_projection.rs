@@ -216,6 +216,109 @@ impl Graph {
 fn facts(node: &SemanticNode) -> Result<&Facts, ObservationError> {
     node.author.as_ref().ok_or(ObservationError::BackendFailure)
 }
+
+/// Anonymous action targets in one block all render as the same `[clickable]`
+/// line, so a model cannot tell a block's own add control from a close control
+/// attached to one row. Mark the block's trailing target when it sits at the
+/// block's right edge: that is the position a list's own control occupies, and
+/// no row-attached target shares it. Only layout the renderer already proved is
+/// used, and only when at least two anonymous targets share the nearest block,
+/// so a lone target keeps its old line and named controls are unchanged.
+fn mark_trailing_anonymous_action_targets(
+    graph: &Graph,
+    nodes: &mut HashMap<i64, SemanticNode>,
+    retained: &HashSet<i64>,
+    rendered_parent: &HashMap<i64, i64>,
+) {
+    let targets: Vec<i64> = graph
+        .ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            retained.contains(id)
+                && nodes
+                    .get(id)
+                    .is_some_and(|node| node.states.get("clickable") == Some(&true))
+        })
+        .collect();
+    if targets.len() < 2 {
+        return;
+    }
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for id in &targets {
+        let mut current = rendered_parent.get(id).copied();
+        for _ in 0..256 {
+            let Some(ancestor) = current else { break };
+            *counts.entry(ancestor).or_insert(0) += 1;
+            current = rendered_parent.get(&ancestor).copied();
+        }
+    }
+    let order: HashMap<i64, usize> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index))
+        .collect();
+    // A target that is the only anonymous action target inside its immediate
+    // container belongs to one row (a tag's close control); a target whose
+    // container holds several belongs to the block itself. Mark only targets
+    // that share a block with another anonymous target, so an isolated icon
+    // elsewhere keeps its old line.
+    for id in &targets {
+        let Some(parent) = rendered_parent.get(id).copied() else {
+            continue;
+        };
+        if counts.get(&parent).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let in_block = rendered_parent
+            .get(&parent)
+            .is_some_and(|grandparent| counts.get(grandparent).copied().unwrap_or(0) >= 2);
+        if in_block {
+            if let Some(node) = nodes.get_mut(id) {
+                node.states.insert("row".into(), true);
+            }
+        }
+    }
+    // The nearest ancestor with a painted box that owns two or more anonymous
+    // targets is the block, even when compaction later drops that ancestor's
+    // line: the plus and every row's close control still share it.
+    let mut trailing: HashMap<i64, i64> = HashMap::new();
+    for id in &targets {
+        let mut current = rendered_parent.get(id).copied();
+        for _ in 0..256 {
+            let Some(ancestor) = current else { break };
+            if counts.get(&ancestor).copied().unwrap_or(0) >= 2
+                && nodes.get(&ancestor).is_some_and(|node| node.rect.is_some())
+            {
+                let last = trailing.entry(ancestor).or_insert(*id);
+                if order.get(id) > order.get(last) {
+                    *last = *id;
+                }
+                break;
+            }
+            current = rendered_parent.get(&ancestor).copied();
+        }
+    }
+    for (block, last) in trailing {
+        let Some(block_rect) = nodes.get(&block).and_then(|node| node.rect.as_ref()) else {
+            continue;
+        };
+        let Some(target_rect) = nodes.get(&last).and_then(|node| node.rect.as_ref()) else {
+            continue;
+        };
+        // A trailing control in a block's own right padding ends within its own
+        // width of the block edge; a control inside a row ends at the row edge.
+        let margin = 24.0f64.max(target_rect.width);
+        let right = target_rect.x + target_rect.width;
+        if right + margin < block_rect.x + block_rect.width {
+            continue;
+        }
+        if let Some(node) = nodes.get_mut(&last) {
+            node.states.insert("last".into(), true);
+            node.states.insert("trailing".into(), true);
+        }
+    }
+}
 fn collapse(text: &str) -> String {
     let mut out = String::new();
     let mut space = false;
@@ -545,6 +648,7 @@ pub(super) fn compact(
             retained.insert(*id);
         }
     }
+    mark_trailing_anonymous_action_targets(graph, &mut nodes, &retained, &rendered_parent);
     let mut count = 0usize;
     let mut truncated = false;
     #[allow(clippy::too_many_arguments)] // One staged owner map and publication budget.
@@ -617,7 +721,7 @@ pub(super) fn compact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::client_observation::NodeReference;
+    use crate::native::client_observation::{NodeReference, Rect};
     use serde_json::json;
 
     #[derive(Default)]
@@ -1112,6 +1216,86 @@ mod tests {
         assert_eq!(nodes[0].children.len(), 1);
         assert_eq!(nodes[0].children[0].reference.id, name_ref);
         assert_eq!(nodes[0].children[0].text.as_deref(), Some("标签"));
+    }
+    fn set_rect(f: &mut Fixture, node: &Value, x: f64, y: f64, width: f64, height: f64) {
+        f.nodes
+            .get_mut(&node["backendNodeId"].as_i64().unwrap())
+            .unwrap()
+            .rect = Some(Rect {
+            x,
+            y,
+            width,
+            height,
+        });
+    }
+    #[test]
+    fn trailing_anonymous_action_target_in_a_block_is_marked() {
+        // The dialog shape: a block holds rows of text + close controls, then
+        // its own control in the block's right padding. Every anonymous target
+        // used to read `[clickable]`; the block's own one now says where it is.
+        let mut f = Fixture::default();
+        let tag_text = f.text("素材白名单");
+        let close = f.el("i", None, vec![]);
+        f.facts_mut(&close).clickable = true;
+        set_rect(&mut f, &close, 380.0, 110.0, 20.0, 20.0);
+        let close_ref = reference(&close);
+        let row = f.el("div", None, vec![tag_text, close]);
+        set_rect(&mut f, &row, 100.0, 100.0, 400.0, 40.0);
+        let plus = f.el("i", None, vec![]);
+        f.facts_mut(&plus).clickable = true;
+        set_rect(&mut f, &plus, 470.0, 150.0, 12.0, 12.0);
+        let plus_ref = reference(&plus);
+        let card = f.el("div", None, vec![row, plus]);
+        set_rect(&mut f, &card, 100.0, 100.0, 400.0, 200.0);
+        let nodes = f.run(vec![card]);
+        let all = flat(&nodes);
+        let close = all.iter().find(|n| n.reference.id == close_ref).unwrap();
+        let plus = all.iter().find(|n| n.reference.id == plus_ref).unwrap();
+        // The row-attached close keeps only the fact that it acts.
+        assert_eq!(close.states.get("clickable"), Some(&true));
+        assert_eq!(close.states.get("last"), None);
+        assert_eq!(close.states.get("trailing"), None);
+        // The block's own trailing control is the only one at the block edge.
+        assert_eq!(plus.states.get("clickable"), Some(&true));
+        assert_eq!(plus.states.get("last"), Some(&true));
+        assert_eq!(plus.states.get("trailing"), Some(&true));
+        let encoded = serde_json::to_value(plus).unwrap();
+        assert_eq!(encoded["states"]["last"], json!(true));
+        assert_eq!(encoded["states"]["trailing"], json!(true));
+    }
+    #[test]
+    fn lone_or_interior_anonymous_action_targets_keep_the_old_line() {
+        // A block with one anonymous target has nothing to disambiguate; a
+        // trailing target that ends inside a row is a row control, not the
+        // block's own. Both keep the plain `[clickable]` line.
+        let mut lone = Fixture::default();
+        let only = lone.el("i", None, vec![]);
+        lone.facts_mut(&only).clickable = true;
+        set_rect(&mut lone, &only, 470.0, 150.0, 12.0, 12.0);
+        let card = lone.el("div", None, vec![only.clone()]);
+        set_rect(&mut lone, &card, 100.0, 100.0, 400.0, 200.0);
+        let nodes = lone.run(vec![card]);
+        let all = flat(&nodes);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].states.get("clickable"), Some(&true));
+        assert_eq!(all[0].states.get("last"), None);
+        assert_eq!(all[0].states.get("trailing"), None);
+
+        let mut interior = Fixture::default();
+        let first = interior.el("i", None, vec![]);
+        interior.facts_mut(&first).clickable = true;
+        set_rect(&mut interior, &first, 150.0, 110.0, 20.0, 20.0);
+        let last = interior.el("i", None, vec![]);
+        interior.facts_mut(&last).clickable = true;
+        set_rect(&mut interior, &last, 250.0, 150.0, 20.0, 20.0);
+        let card = interior.el("div", None, vec![first, last]);
+        set_rect(&mut interior, &card, 100.0, 100.0, 400.0, 200.0);
+        let nodes = interior.run(vec![card]);
+        for node in flat(&nodes) {
+            assert_eq!(node.states.get("clickable"), Some(&true));
+            assert_eq!(node.states.get("last"), None);
+            assert_eq!(node.states.get("trailing"), None);
+        }
     }
     #[test]
     fn presentational_roles_alone_do_not_retain_wrappers_or_lose_children() {
