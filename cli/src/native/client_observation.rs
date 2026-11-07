@@ -5087,6 +5087,63 @@ pub async fn enumerate_frames(
     enumerate_frames_with_opaque(client, page_session, iframe_sessions, lease)
         .await
         .map(|enumerated| enumerated.frames)
+        .map_err(EnumerateFailure::into_observation)
+}
+/// A frame enumeration that failed inside one renderer session, preserving the
+/// address of that session. A page target the browser retired while the read
+/// was enumerating is churn the caller can wait out and re-read; every other
+/// failure keeps its original classification.
+#[derive(Debug)]
+pub(crate) struct EnumerateFailure {
+    observation: ObservationError,
+    session: Option<String>,
+}
+impl EnumerateFailure {
+    fn session(session: &str, observation: ObservationError) -> Self {
+        // Only a backend failure is evidence that the addressed session itself
+        // failed. Cancellation, deadline and cleanup loss keep their meaning
+        // and are never re-read as target churn.
+        let session = (observation == ObservationError::BackendFailure).then(|| session.to_owned());
+        Self {
+            observation,
+            session,
+        }
+    }
+    /// The renderer session the failed command addressed, when the failure is
+    /// evidence that session itself went away.
+    pub(crate) fn retired_session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    pub(crate) fn into_observation(self) -> ObservationError {
+        self.observation
+    }
+}
+impl From<ObservationError> for EnumerateFailure {
+    fn from(observation: ObservationError) -> Self {
+        Self {
+            observation,
+            session: None,
+        }
+    }
+}
+impl From<&str> for EnumerateFailure {
+    fn from(message: &str) -> Self {
+        Self {
+            observation: ObservationError::from(message),
+            session: None,
+        }
+    }
+}
+async fn session_command(
+    client: &CdpClient,
+    session: &str,
+    method: &str,
+    args: Value,
+    lease: &OperationLease,
+) -> Result<Value, EnumerateFailure> {
+    command(client, session, method, args, lease)
+        .await
+        .map_err(|observation| EnumerateFailure::session(session, observation))
 }
 /// Ordinary action, screenshot and trace inventory retain the original
 /// exact-object release path while reporting the omitted plugin subtrees.
@@ -5095,7 +5152,7 @@ pub(crate) async fn enumerate_frames_with_opaque(
     page_session: &str,
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
-) -> Result<EnumeratedFrames, ObservationError> {
+) -> Result<EnumeratedFrames, EnumerateFailure> {
     enumerate_frames_impl(client, page_session, iframe_sessions, lease, false).await
 }
 /// Semantic Observe only. It keeps the retained readonly-group release path.
@@ -5104,7 +5161,7 @@ pub(crate) async fn enumerate_semantic_frames(
     page_session: &str,
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
-) -> Result<EnumeratedFrames, ObservationError> {
+) -> Result<EnumeratedFrames, EnumerateFailure> {
     let retained =
         client.debt_ledger().is_some() && client_debt::OperationJournalHandle::current().is_some();
     enumerate_frames_impl(client, page_session, iframe_sessions, lease, retained).await
@@ -5115,19 +5172,19 @@ async fn enumerate_frames_impl(
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
     readonly_disposal: bool,
-) -> Result<EnumeratedFrames, ObservationError> {
+) -> Result<EnumeratedFrames, EnumerateFailure> {
     if iframe_sessions.len() > 256 {
-        return Err(ObservationError::InvalidArguments);
+        return Err(ObservationError::InvalidArguments.into());
     }
     let mut owned_trees = HashMap::new();
     for (frame, session) in iframe_sessions {
-        let tree = command(client, session, "Page.getFrameTree", json!({}), lease).await?;
+        let tree = session_command(client, session, "Page.getFrameTree", json!({}), lease).await?;
         if tree["frameTree"]["frame"]["id"].as_str() != Some(frame.as_str()) {
-            return Err(ObservationError::StaleReference);
+            return Err(ObservationError::StaleReference.into());
         }
         owned_trees.insert(frame.clone(), tree["frameTree"].clone());
     }
-    let tree = command(client, page_session, "Page.getFrameTree", json!({}), lease).await?;
+    let tree = session_command(client, page_session, "Page.getFrameTree", json!({}), lease).await?;
     let mut queue = std::collections::VecDeque::from([(tree["frameTree"].clone(), None::<usize>)]);
     let mut frames: Vec<ObservationFrame> = Vec::new();
     let mut opaque_frame_roots: Vec<String> = Vec::new();
@@ -5138,23 +5195,23 @@ async fn enumerate_frames_impl(
             .ok_or(ObservationError::StaleReference)?
             .to_owned();
         if !visited.insert(id.clone()) {
-            return Err(ObservationError::StaleReference);
+            return Err(ObservationError::StaleReference.into());
         }
         if let Some(owned) = owned_trees.remove(&id) {
             if let Some(loader) = tree["frame"]["loaderId"].as_str().filter(|v| !v.is_empty()) {
                 if owned["frame"]["loaderId"].as_str() != Some(loader) {
-                    return Err(ObservationError::StaleReference);
+                    return Err(ObservationError::StaleReference.into());
                 }
             }
             tree = owned;
         }
         if let Some(declared) = tree["frame"]["parentId"].as_str() {
             if parent.map(|index| frames[index].binding.frame.as_str()) != Some(declared) {
-                return Err(ObservationError::StaleReference);
+                return Err(ObservationError::StaleReference.into());
             }
         }
         if frames.len() >= 256 {
-            return Err("Frame limit exceeded".into());
+            return Err(ObservationError::from("Frame limit exceeded").into());
         }
         let frame = &tree["frame"];
         let id = frame["id"]
@@ -5172,7 +5229,7 @@ async fn enumerate_frames_impl(
                 .unwrap_or_else(|| page_session.into())
         });
         // Prove this session owns the document before issuing any metadata read.
-        command(
+        session_command(
             client,
             &session,
             "Page.createIsolatedWorld",
@@ -5197,6 +5254,13 @@ async fn enumerate_frames_impl(
         };
         if let Some(parent) = parent {
             let parent = &frames[parent];
+            // A child frame the page detached makes its parent answer
+            // "Frame with the given id was not found". That failure belongs to
+            // the detached child's session, not to the parent renderer.
+            let owner_session = iframe_sessions
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or(&parent.binding.session);
             let owner = command(
                 client,
                 &parent.binding.session,
@@ -5204,11 +5268,12 @@ async fn enumerate_frames_impl(
                 json!({"frameId":id}),
                 lease,
             )
-            .await?;
+            .await
+            .map_err(|error| EnumerateFailure::session(owner_session, error))?;
             let backend = owner["backendNodeId"]
                 .as_i64()
                 .ok_or("Frame owner identity unavailable")?;
-            let world=command(client,&parent.binding.session,"Page.createIsolatedWorld",json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
+            let world=session_command(client,&parent.binding.session,"Page.createIsolatedWorld",json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
             let value = if readonly_disposal {
                 let group = client
                     .readonly_group_instance(&format!("native-frame-owner-{}", lease.sequence))
@@ -5230,7 +5295,8 @@ async fn enumerate_frames_impl(
                     lease,
                     &capture,
                 )
-                .await?
+                .await
+                .map_err(|error| EnumerateFailure::session(&parent.binding.session, error))?
             } else {
                 let resolved = resolve_page_object(
                     client,
@@ -5252,7 +5318,9 @@ async fn enumerate_frames_impl(
                         Ok(value)
                     }
                 });
-                settle_owner_object(client, &parent.binding.session, object, value).await?
+                settle_owner_object(client, &parent.binding.session, object, value)
+                    .await
+                    .map_err(|error| EnumerateFailure::session(&parent.binding.session, error))?
             };
             let data = &value["result"]["value"];
             // <object>/<embed> child documents are opaque plugin content, not
@@ -5295,10 +5363,12 @@ async fn enumerate_frames_impl(
                 .filter(|v| v["frame"]["parentId"].is_string())
                 .count()
         );
-        return Err(ObservationError::StaleReference);
+        return Err(ObservationError::StaleReference.into());
     }
     for frame in &frames {
-        validate_frame(client, frame, lease).await?;
+        validate_frame(client, frame, lease)
+            .await
+            .map_err(|error| EnumerateFailure::session(&frame.binding.session, error))?;
     }
     Ok(EnumeratedFrames {
         frames,

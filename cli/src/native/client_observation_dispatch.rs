@@ -2840,7 +2840,41 @@ impl ObservationDispatch {
                             // fallback pixels can observe current application state.
                             return Ok((Value::Null, None, Some(SemanticDeadline)));
                         }
-                        Err(error) => return Err(map_observation(error)),
+                        Err(error) => {
+                            let refused = map_observation(error);
+                            // A page-created frame target can detach while the
+                            // semantic read walks the frame inventory it was
+                            // admitted with. The page inventory moved, not the
+                            // scope: a read-only observe dispatched nothing, so
+                            // it settles as a stale scope the engine re-reads.
+                            if refused == ProtocolError::BrowserFailure {
+                                let mut lost = None;
+                                if let Ok((_, targets)) =
+                                    capture_context.page.targets.inventory()
+                                {
+                                    let owned = targets
+                                        .iter()
+                                        .map(|target| target.session_id.as_str())
+                                        .collect::<HashSet<_>>();
+                                    lost = capture_context
+                                        .frames
+                                        .iter()
+                                        .map(|frame| frame.binding.session.as_str())
+                                        .find(|session| !owned.contains(*session));
+                                }
+                                if let Some(session) = lost {
+                                    if capture_context
+                                        .page
+                                        .targets
+                                        .wait_read_session_retired(&operation, session)
+                                        .await?
+                                    {
+                                        return Err(ProtocolError::StaleScope);
+                                    }
+                                }
+                            }
+                            return Err(refused);
+                        }
                     };
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
@@ -4145,6 +4179,18 @@ async fn single_root_fields_after(
     same_frames(std::slice::from_ref(frame), std::slice::from_ref(&current))?;
     check(page, operation)
 }
+/// One frame inventory attempt either completes or reports that a frame target
+/// the page retired was addressed. A retired session is not a scope failure:
+/// the browser has already reported its detach, and the registry applies it
+/// through the normal event path. The caller waits for that exact evidence and
+/// takes a fresh attempt under the same operation deadline.
+enum FrameInventoryAttempt {
+    Ready(VerifiedFrameInventory),
+    Retired {
+        session: String,
+        error: ProtocolError,
+    },
+}
 async fn frame_inventory_attempt_impl(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
@@ -4156,6 +4202,50 @@ async fn frame_inventory_attempt_impl(
         &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
     >,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
+    match frame_inventory_attempt_once(
+        page,
+        operation,
+        cleanup,
+        screenshot,
+        readonly_disposal,
+        partition,
+        #[cfg(test)]
+        initial_probe,
+    )
+    .await?
+    {
+        FrameInventoryAttempt::Ready(inventory) => Ok(inventory),
+        FrameInventoryAttempt::Retired { session, error } => {
+            if page
+                .targets
+                .wait_read_session_retired(operation, &session)
+                .await?
+            {
+                // The page's own frame target detached while this inventory was
+                // being read: the page inventory moved, not the scope. The read
+                // dispatched nothing, so it settles as a stale scope that the
+                // engine re-reads once after the churn has settled.
+                Err(ProtocolError::StaleScope.into())
+            } else {
+                // The registry never observed the detach before the operation's
+                // own deadline: the failure was not target churn, so its
+                // original classification is kept.
+                Err(error.into())
+            }
+        }
+    }
+}
+async fn frame_inventory_attempt_once(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+    readonly_disposal: bool,
+    partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+    #[cfg(test)] initial_probe: Option<
+        &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
+    >,
+) -> Result<FrameInventoryAttempt, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = if let Some(partition) = partition {
         partition
@@ -4218,14 +4308,29 @@ async fn frame_inventory_attempt_impl(
         if !matches!(target.kind.as_str(), "page" | "iframe") {
             continue;
         }
-        let tree = command(
+        let tree = match command(
             page,
             operation,
             &target.session_id,
             "Page.getFrameTree",
             json!({}),
         )
-        .await?;
+        .await
+        {
+            Ok(tree) => tree,
+            Err(error) => {
+                if partition.is_none()
+                    && target.kind == "iframe"
+                    && error == ProtocolError::BrowserFailure
+                {
+                    return Ok(FrameInventoryAttempt::Retired {
+                        session: target.session_id.clone(),
+                        error,
+                    });
+                }
+                return Err(error.into());
+            }
+        };
         trees.push((target.session_id.clone(), target.kind == "page", tree));
     }
     let mut lineage = page_lineage(&trees, &page.page_session_id)?;
@@ -4245,11 +4350,29 @@ async fn frame_inventory_attempt_impl(
             operation,
         )
         .await
-    }
-    .map_err(|error| match cleanup {
-        Some(cleanup) => observation_error_with_cleanup(error, cleanup),
-        None => observation_error(error),
-    })?;
+    };
+    let enumerated = match enumerated {
+        Ok(enumerated) => enumerated,
+        Err(failure) => {
+            let retired_session = failure.retired_session().and_then(|session| {
+                (partition.is_none()
+                    && targets
+                        .iter()
+                        .any(|target| target.session_id == session && target.kind == "iframe"))
+                .then(|| session.to_owned())
+            });
+            let error = match cleanup {
+                Some(cleanup) => {
+                    observation_error_with_cleanup(failure.into_observation(), cleanup)
+                }
+                None => observation_error(failure.into_observation()),
+            };
+            if let Some(session) = retired_session {
+                return Ok(FrameInventoryAttempt::Retired { session, error });
+            }
+            return Err(error.into());
+        }
+    };
     // The plugin documents are opaque: the inventory omits them and everything
     // only reachable through them, so the author lineage must omit the same
     // subtrees before the two are compared. Native parent edges and renderer
@@ -4319,14 +4442,14 @@ async fn frame_inventory_attempt_impl(
         }
     }
     check(page, operation)?;
-    Ok(VerifiedFrameInventory {
+    Ok(FrameInventoryAttempt::Ready(VerifiedFrameInventory {
         frames,
         iframe_sessions: mapping,
         opaque_frames: enumerated
             .opaque_frame_roots
             .into_iter()
             .collect::<HashSet<_>>(),
-    })
+    }))
 }
 /// Page roots and renderer roots are different identities. Merge exact native
 /// parent edges first, then attribute every renderer root to one owned page.
