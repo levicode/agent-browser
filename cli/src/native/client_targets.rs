@@ -2919,6 +2919,29 @@ impl ClientTargets {
     ) -> Result<(), ProtocolError> {
         self.wait_read_inventory(operation, false).await.map(|_| ())
     }
+    /// The target inventory a command takes immediately before dispatch. A
+    /// fixed read addresses only the page session, never a frame session, so
+    /// the page's own target enrollment is readiness rather than an unavailable
+    /// scope: it waits exactly like a protected read. Every other command keeps
+    /// the immediate completeness refusal, because its frame-session authority
+    /// and fail-closed admission require the complete inventory up front.
+    ///
+    /// The wait is the same registry notification #72 uses, bounded by the
+    /// caller's existing operation deadline and cancellation. A sealed or
+    /// accounting-lost registry still fails closed at once.
+    pub(crate) async fn dispatch_inventory(
+        &self,
+        operation: &super::client_session::OperationLease,
+        fixed_read: bool,
+    ) -> Result<Vec<OwnedTarget>, ProtocolError> {
+        if fixed_read {
+            self.wait_read_inventory(operation, false)
+                .await
+                .map(|(_, targets, _)| targets)
+        } else {
+            self.inventory().map(|(_, targets)| targets)
+        }
+    }
     /// A read-only inventory can hold a frame session the page has already
     /// retired: the browser destroyed that target, but the registry still lists
     /// it until the supervisor applies the queued `Target.detachedFromTarget`.
@@ -6061,6 +6084,59 @@ mod owned_inventory_diagnostic_opt_in_tests {
             read_operation(std::time::Instant::now() + std::time::Duration::from_millis(40));
         let result = registry.wait_read_inventory(&operation, false).await;
         assert!(matches!(result, Err(ProtocolError::DeadlineExceeded)));
+    }
+
+    /// `page.url` and the other fixed reads take this exact inventory. During a
+    /// session restore the page's own iframe can still be enrolling, and the
+    /// fixed read must wait for it instead of settling `scope-unavailable`.
+    #[tokio::test]
+    async fn fixed_read_dispatch_inventory_waits_for_a_page_created_target() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "late".into(), "late-session".into(), "iframe".into())
+            .unwrap();
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.dispatch_inventory(&operation, true).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !waiting.is_finished(),
+            "a fixed read must wait for the page's own target enrollment"
+        );
+        registry.configured("late").unwrap();
+        registry
+            .resume_permit("late")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let targets = waiting.await.unwrap().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .all(|target| target.configured && target.resumed));
+    }
+
+    /// Every other command keeps the immediate completeness refusal: a frame
+    /// session it may address needs the complete inventory up front.
+    #[tokio::test]
+    async fn non_fixed_read_dispatch_inventory_keeps_the_immediate_refusal() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "late".into(), "late-session".into(), "iframe".into())
+            .unwrap();
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.dispatch_inventory(&operation, false),
+        )
+        .await
+        .expect("a non-read command must not wait for enrollment");
+        assert!(matches!(result, Err(ProtocolError::ScopeUnavailable)));
     }
 
     async fn retired_read_registry() -> std::sync::Arc<ClientTargets> {
