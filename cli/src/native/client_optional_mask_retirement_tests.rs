@@ -846,3 +846,76 @@ async fn i10_t06_detached_page_before_optional_cutoff_never_publishes_sealed_tre
 async fn sealed_tree_keeps_unacknowledged_resource_failure_in_retained_join() {
     optional_mask_retirement(Case::OptionalResourceShortDeadline).await;
 }
+
+/// A page-created frame target can retire between the inventory that admitted a
+/// read and the command that addresses it. The browser then answers at the
+/// browser level that the exact session does not exist. The read reports a
+/// stale reference the enclosing observation can re-read, and the ledger
+/// discharges that retired session's exact obligations instead of losing the
+/// whole scope's integrity.
+#[tokio::test]
+async fn retired_frame_session_reply_settles_as_a_stale_reference_without_integrity_loss() {
+    use crate::native::client_debt::{
+        command_scope, CommandCategory, OperationKey, OwnerDebtLedger,
+    };
+    use crate::native::client_observation::{
+        retained_read_command, with_capture_retirement, CaptureRetirement, ObservationError,
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        while let Some(Ok(message)) = ws.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let Some(id) = request.get("id") else {
+                continue;
+            };
+            // The exact session is gone, so the answer cannot carry its id.
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id": id, "error": {"code": -32000,
+                    "message": "Session with given id not found."}})
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+    });
+    let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+    let ledger = OwnerDebtLedger::new(1, "scope".into());
+    client.install_debt_ledger(ledger.clone()).unwrap();
+    let journal = ledger
+        .operation(
+            OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            "target".into(),
+            "session".into(),
+        )
+        .unwrap();
+    let (operation, _cancel) = operation(1);
+    let (retirement_sender, retirement) = tokio::sync::watch::channel(false);
+    let sender = client.clone();
+    let result = journal
+        .scope(with_capture_retirement(
+            Some(CaptureRetirement::new(retirement)),
+            command_scope(
+                CommandCategory::ApplicationRead,
+                false,
+                retained_read_command(&sender, "frame", "Page.getFrameTree", json!({}), &operation),
+            ),
+        ))
+        .await;
+    assert_eq!(result, Err(ObservationError::StaleReference));
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot.outstanding_commands, 0);
+    assert_eq!(snapshot.object_debt, 0);
+    assert!(!snapshot.integrity_lost);
+    drop(retirement_sender);
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
