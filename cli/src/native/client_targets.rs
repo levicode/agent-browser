@@ -1051,6 +1051,22 @@ impl Registry {
                 .values()
                 .all(|target| target.purpose.is_some() && target.configured)
     }
+    /// Read admission waits for the scope's own enrollment instead of treating
+    /// a page's background target work as an unavailable scope. A target that
+    /// is still being attached/configured, a resume still in flight, a creation
+    /// reservation, or a pending auxiliary/popup claim is normal churn created
+    /// by the page being read; it is not evidence that the scope cannot be read.
+    /// A configured target whose resume is withheld stays a fail-closed
+    /// readiness refusal, a sealed or accounting-lost registry still fails
+    /// closed, and the caller's operation deadline still bounds the wait.
+    fn read_enrollment_settled(&self) -> bool {
+        self.inventory_complete()
+            && self.resuming == 0
+            && self
+                .auxiliary
+                .values()
+                .all(|entry| entry.detached || entry.claimed_session.is_some())
+    }
     fn lose_integrity(&mut self, reason: diagnostic::InventoryFirstLoss) {
         self.first_loss.get_or_insert(reason);
         self.sealed = true;
@@ -2846,6 +2862,62 @@ impl ClientTargets {
             state.targets.values().cloned().collect(),
             snapshot,
         ))
+    }
+    /// The inventory a protected read may take, waiting out the page's own
+    /// target enrollment. The registry notification is the only wait source;
+    /// the caller's operation deadline and cancellation still bound it, and a
+    /// sealed or accounting-lost registry returns immediately. This is a
+    /// readiness wait, never an extended or re-issued operation.
+    pub(crate) async fn wait_read_inventory(
+        &self,
+        operation: &super::client_session::OperationLease,
+        observe: bool,
+    ) -> Result<(u64, Vec<OwnedTarget>, Option<RevisionSnapshot>), ProtocolError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.sealed || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if let Some(error) = (*operation.cancellation.borrow()).error() {
+                    return Err(error);
+                }
+                if state.read_enrollment_settled() {
+                    let snapshot = observe.then(|| state.revision_snapshot());
+                    return Ok((
+                        state.revision,
+                        state.targets.values().cloned().collect(),
+                        snapshot,
+                    ));
+                }
+            }
+            let mut cancellation = operation.cancellation.clone();
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = cancellation.changed() => {
+                    return Err((*operation.cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled));
+                }
+                _ = tokio::time::sleep_until(operation.deadline.into()) => {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+            }
+        }
+    }
+    /// Wait until the scope's own enrollment has settled without taking an
+    /// inventory. The protected-read barrier uses the same wait as the frame
+    /// inventory, so a target the page creates during the read's enumeration
+    /// cannot turn a readable scope into an unavailable one.
+    pub(crate) async fn wait_read_enrollment(
+        &self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.wait_read_inventory(operation, false).await.map(|_| ())
     }
     /// Restart alone may wait for exact, already-observed enrollment work. Keep
     /// the full registry guard through publication; ordinary settlement remains
@@ -5834,5 +5906,107 @@ mod owned_inventory_diagnostic_opt_in_tests {
         );
         assert!(state.targets["target"].diagnostic.unwrap().attachment > 0);
         assert!(untouched.state.lock().unwrap().targets.is_empty());
+    }
+
+    fn ready_read_registry() -> std::sync::Arc<ClientTargets> {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached("ctx", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        {
+            let mut state = registry.state.lock().unwrap();
+            let target = state.targets.get_mut("target").unwrap();
+            target.configured = true;
+            target.resumed = true;
+            state.enrollment_ready = true;
+        }
+        registry
+    }
+
+    /// The returned sender keeps the operation's cancellation channel open for
+    /// the test's lifetime; dropping it would look like a closed session.
+    fn read_operation(
+        deadline: std::time::Instant,
+    ) -> (
+        tokio::sync::watch::Sender<super::super::client_session::CancelSignal>,
+        super::super::client_session::OperationLease,
+    ) {
+        let (cancel, cancellation) =
+            tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
+        (
+            cancel,
+            super::super::client_session::OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline,
+                cancellation,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn read_inventory_waits_for_a_page_created_target_to_finish_enrollment() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "late".into(), "late-session".into(), "iframe".into())
+            .unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            let late = state.targets.get("late").expect("late target registered");
+            assert_eq!(late.purpose, Some(super::TargetPurpose::Application));
+            assert!(!late.configured && !late.resumed);
+            assert!(!state.read_enrollment_settled());
+        }
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let waiting = {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.wait_read_inventory(&operation, false).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the read must wait for the page's own target enrollment"
+        );
+        registry.configured("late").unwrap();
+        registry
+            .resume_permit("late")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let (_, targets, _) = waiting.await.unwrap().unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .all(|target| target.configured && target.resumed));
+    }
+
+    #[tokio::test]
+    async fn read_inventory_refuses_immediately_when_the_registry_sealed() {
+        let registry = ready_read_registry();
+        registry.seal();
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.wait_read_inventory(&operation, false),
+        )
+        .await
+        .expect("a sealed registry must not wait for enrollment");
+        assert!(matches!(result, Err(ProtocolError::ScopeUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn read_inventory_honours_the_operations_existing_deadline() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "late".into(), "late-session".into(), "iframe".into())
+            .unwrap();
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_millis(40));
+        let result = registry.wait_read_inventory(&operation, false).await;
+        assert!(matches!(result, Err(ProtocolError::DeadlineExceeded)));
     }
 }

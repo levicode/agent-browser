@@ -184,6 +184,25 @@ impl<'a> ProtectedReadJournal<'a> {
         partition: Option<&super::client_enrollment::PageAcquisitionProof>,
     ) -> Result<Self, ProtectedReadFailure> {
         if partition.is_none() {
+            // A target the page created during the read's frame enumeration is
+            // the same enrollment churn the inventory wait already covers; the
+            // barrier below must not refuse the read while that target settles.
+            page.targets
+                .wait_read_enrollment(operation)
+                .await
+                .map_err(|error| ProtectedReadFailure {
+                    reason: match error {
+                        super::client_protocol::ProtocolError::Cancelled => {
+                            ProtectedReadReason::Cancelled
+                        }
+                        super::client_protocol::ProtocolError::DeadlineExceeded => {
+                            ProtectedReadReason::Deadline
+                        }
+                        _ => ProtectedReadReason::IncompleteInventory,
+                    },
+                    identity_scope: page.identity_scope.clone(),
+                    cleanup_integrity_lost: false,
+                })?;
             return Self::begin_query(page, operation, None);
         }
         let failure = |reason| ProtectedReadFailure {

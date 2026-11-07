@@ -4146,7 +4146,8 @@ async fn frame_inventory_attempt_impl(
         (0, partition.targets().to_vec(), None)
     } else {
         page.targets
-            .inventory_with_diagnostic(screenshot.is_some())?
+            .wait_read_inventory(operation, screenshot.is_some())
+            .await?
     };
     #[cfg(test)]
     if let Some(probe) = initial_probe {
