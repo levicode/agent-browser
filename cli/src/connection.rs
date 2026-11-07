@@ -970,11 +970,15 @@ fn isolated_client_env_allowed(key: &str) -> bool {
                 | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
                 | "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE"
                 | "AGENT_BROWSER_INVOCATION_CUSTODY"
+                // Browser launch defaults for the browser this transport
+                // starts. Only these exact names cross the isolated boundary;
+                // every other AGENT_BROWSER_* value stays scrubbed.
                 | "AGENT_BROWSER_CA_CERT"
                 | "AGENT_BROWSER_IGNORE_HTTPS_ERRORS"
                 | "AGENT_BROWSER_PROXY"
                 | "AGENT_BROWSER_PROXY_BYPASS"
                 | "AGENT_BROWSER_ARGS"
+                | "AGENT_BROWSER_EXECUTABLE_PATH"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
         // Only the Linux acceptance binary may transport the four reviewed
@@ -991,6 +995,14 @@ fn isolated_client_env_allowed(key: &str) -> bool {
 
 /// New opt-in protocol mode never reuses/restarts another named daemon and
 /// never loads browser launch/plugin configuration before negotiation.
+///
+/// The caller's browser launch defaults (`AGENT_BROWSER_CA_CERT`,
+/// `AGENT_BROWSER_IGNORE_HTTPS_ERRORS`, `AGENT_BROWSER_PROXY`,
+/// `AGENT_BROWSER_PROXY_BYPASS`, `AGENT_BROWSER_ARGS`, and
+/// `AGENT_BROWSER_EXECUTABLE_PATH`) survive the environment scrub and are
+/// inherited by the dedicated daemon, which applies them when the negotiated
+/// launch starts a browser. An explicit field in the launch command still
+/// wins over the corresponding default.
 pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Result<(), String> {
     #[cfg(feature = "acceptance-faults")]
     settlement_capture::initialize_proxy();
@@ -1063,6 +1075,49 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_INVOCATION_CUSTODY_EXTRA",
     ] {
         assert!(!isolated_client_env_allowed(removed));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_isolated_client_env_forwards_only_exact_browser_launch_options() {
+    for key in [
+        "AGENT_BROWSER_CA_CERT",
+        "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+        "AGENT_BROWSER_PROXY",
+        "AGENT_BROWSER_PROXY_BYPASS",
+        "AGENT_BROWSER_ARGS",
+        "AGENT_BROWSER_EXECUTABLE_PATH",
+    ] {
+        assert!(isolated_client_env_allowed(key));
+        for altered in [
+            format!("{key}_EXTRA"),
+            format!("{key}_ROOT"),
+            format!("{key}2"),
+        ] {
+            assert!(
+                !isolated_client_env_allowed(&altered),
+                "{altered} must not cross the isolated boundary"
+            );
+        }
+    }
+    // Configuration that changes daemon identity, policy, plugins, or shared
+    // session state stays scrubbed; only the launch defaults above travel.
+    for key in [
+        "AGENT_BROWSER_HEADED",
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_ENGINE",
+        "AGENT_BROWSER_PLUGINS",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_CONFIRM_ACTIONS",
+        "AGENT_BROWSER_ACTION_POLICY",
+        "AGENT_BROWSER_DEBUG",
+    ] {
+        assert!(
+            !isolated_client_env_allowed(key),
+            "{key} must stay scrubbed"
+        );
     }
 }
 

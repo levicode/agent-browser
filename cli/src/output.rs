@@ -3152,6 +3152,12 @@ Environment:
   AGENT_BROWSER_SESSION    Default session name
   AGENT_BROWSER_NAMESPACE  Namespace for daemon sockets and restore state
 
+Browser launch defaults forwarded to the dedicated daemon:
+  AGENT_BROWSER_CA_CERT, AGENT_BROWSER_IGNORE_HTTPS_ERRORS,
+  AGENT_BROWSER_PROXY, AGENT_BROWSER_PROXY_BYPASS, AGENT_BROWSER_ARGS,
+  AGENT_BROWSER_EXECUTABLE_PATH
+  Other AGENT_BROWSER_* configuration is removed before the daemon starts.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -3994,6 +4000,8 @@ Sessions:
   session                    Show current session name
   session list               List active sessions
   session connect --json     Persistent protocol; explicit one-use --session required
+                             Forwards CA_CERT, IGNORE_HTTPS_ERRORS, PROXY,
+                             PROXY_BYPASS, ARGS and EXECUTABLE_PATH launch env
                              Negotiated trace captures do not publish semantic observations
                              terminal.close/1: cleanup-only close after quarantine
                              browser.observe-continuation/1: one exact-owner fresh read
