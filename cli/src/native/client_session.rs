@@ -1137,6 +1137,30 @@ impl ClientSession {
         effects: Effects,
         proof: Option<&super::client_operation_state::OperationRetentionProof>,
     ) -> Result<(ScopeState, Option<ObservationSettlement>), ProtocolError> {
+        self.settle_with_observation_proof_classified(generation, sequence, effects, proof, false)
+    }
+    /// An unknown outcome whose only uncertainty is a stale-scope refusal keeps
+    /// the scope usable. The browser, its context and the operation's cleanup
+    /// are intact; the operation's evidence moved, so a fresh read reconciles
+    /// the page. Genuine lost cleanup reaches the transport as a quarantined
+    /// broker already, and unclassified Unknown outcomes still seal here.
+    pub(crate) fn settle_stale_scope_refusal(
+        &self,
+        generation: u64,
+        sequence: u64,
+        effects: Effects,
+        proof: Option<&super::client_operation_state::OperationRetentionProof>,
+    ) -> Result<(ScopeState, Option<ObservationSettlement>), ProtocolError> {
+        self.settle_with_observation_proof_classified(generation, sequence, effects, proof, true)
+    }
+    fn settle_with_observation_proof_classified(
+        &self,
+        generation: u64,
+        sequence: u64,
+        effects: Effects,
+        proof: Option<&super::client_operation_state::OperationRetentionProof>,
+        stale_scope_keeps_usable: bool,
+    ) -> Result<(ScopeState, Option<ObservationSettlement>), ProtocolError> {
         let mut inner = self.lock()?;
         if inner.generation != generation {
             return Err(ProtocolError::StaleGeneration);
@@ -1181,7 +1205,7 @@ impl ClientSession {
             .ok_or(ProtocolError::OperationMissing)?;
         Self::cancel_decisions(&mut inner, sequence);
         if effects == Effects::Unknown {
-            if !retained && inner.health != ScopeState::Closed {
+            if !retained && !stale_scope_keeps_usable && inner.health != ScopeState::Closed {
                 Self::seal(&mut inner, ScopeState::Quarantined);
             }
             // Never apply the old selected decision after an uncertain child.
@@ -3563,6 +3587,28 @@ mod tests {
             broker.admit(1, 2, 1000),
             Err(ProtocolError::ScopeUnavailable)
         ));
+    }
+
+    #[test]
+    fn a_stale_scope_unknown_keeps_the_scope_usable() {
+        // A stale-scope refusal is a moved evidence boundary, not a lost
+        // cleanup proof: its honest unknown effect survives without destroying
+        // the scope, while every unclassified unknown still seals it.
+        for (settle_stale, expected) in
+            [(false, ScopeState::Quarantined), (true, ScopeState::Usable)]
+        {
+            let broker = ClientSession::new();
+            let _lease = broker.admit(1, 1, 1000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let settled = if settle_stale {
+                broker.settle_stale_scope_refusal(1, 1, Effects::Unknown, None)
+            } else {
+                broker.settle_with_observation_proof(1, 1, Effects::Unknown, None)
+            };
+            assert_eq!(settled.unwrap().0, expected);
+            assert_eq!(broker.health().unwrap().1, expected);
+            assert_eq!(broker.admit(1, 2, 1000).is_ok(), settle_stale);
+        }
     }
 
     #[tokio::test]

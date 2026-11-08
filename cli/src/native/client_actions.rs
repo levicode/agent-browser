@@ -837,10 +837,24 @@ async fn release_accounted_inner(
     let reservation = match client.reserve_tracked_command(method, Some(&params), Some(session)) {
         Ok(reservation) => reservation,
         Err(_) => {
+            // A session the ledger has already applied as retired cannot still
+            // own a browser object, so this release has nothing left to reach.
+            // The exact applied-detach proof settles it; every other refusal
+            // keeps the strict accounting failure.
+            if client
+                .debt_ledger()
+                .is_some_and(|ledger| ledger.exact_session_retired(session))
+            {
+                return ObjectReleaseOutcome {
+                    accepted: true,
+                    settled: false,
+                    not_reserved: false,
+                };
+            }
             return ObjectReleaseOutcome {
                 not_reserved: true,
                 ..Default::default()
-            }
+            };
         }
     };
     let status = reservation.as_ref().map(|reservation| reservation.status());
@@ -849,8 +863,15 @@ async fn release_accounted_inner(
         client.send_reserved_command(method, Some(params), Some(session), reservation),
     )
     .await;
+    // The browser's own closed answer proves the exact session or object is
+    // gone; the ledger may not have applied that retirement yet, so the reply
+    // is the proof. A release of an absent object is complete, not lost.
+    let absent = matches!(&result, Ok(Err(message))
+        if super::cdp::types::is_session_not_found_message(message)
+            || super::cdp::types::is_object_not_found_message(message));
     ObjectReleaseOutcome {
-        accepted: matches!(result, Ok(Ok(_)))
+        accepted: absent
+            || matches!(&result, Ok(Ok(_)))
             || (status
                 .as_ref()
                 .is_some_and(|status| status.settled() || status.accountably_retained())
@@ -5030,6 +5051,7 @@ mod tests {
             "settled",
             "held",
             "rejected",
+            "session-not-found",
             "wrong-session",
             "untracked",
             "eof-before-reserve",
@@ -5062,6 +5084,11 @@ mod tests {
                         "Runtime.releaseObject" if mode == "held" => continue,
                         "Runtime.releaseObject" if mode == "rejected" => {
                             json!({"id":request["id"],"sessionId":"page","error":{"code":-32000,"message":"synthetic release rejection"}})
+                        }
+                        "Runtime.releaseObject" if mode == "session-not-found" => {
+                            // Browser-level answer for a session the browser
+                            // already destroyed: the reply carries no session.
+                            json!({"id":request["id"],"error":{"code":-32001,"message":"Session with given id not found."}})
                         }
                         "Runtime.releaseObject" => {
                             json!({"id":request["id"],"sessionId":"page","result":{}})
@@ -5128,15 +5155,22 @@ mod tests {
                 !matches!(mode, "eof-before-reserve" | "eof-after-submit"),
                 "legacy accountable release acceptance changed for {mode}"
             );
-            assert_eq!(outcome.settled, mode == "settled", "{mode}");
+            // A browser-level "session not found" reply is the exact settled
+            // proof that the session and its objects are gone.
+            assert_eq!(
+                outcome.settled,
+                mode == "settled" || mode == "session-not-found",
+                "{mode}"
+            );
             assert_eq!(outcome.not_reserved, mode == "eof-before-reserve", "{mode}");
             if matches!(mode, "eof-before-reserve" | "eof-after-submit") {
                 assert!(*client.remote_connection_closed().borrow());
                 assert_eq!(ledger.snapshot().object_debt, 1);
                 assert!(ledger.snapshot().integrity_lost);
             }
-            if mode == "settled" {
-                assert_eq!(ledger.snapshot().object_debt, 0);
+            if mode == "settled" || mode == "session-not-found" {
+                assert_eq!(ledger.snapshot().object_debt, 0, "{mode}");
+                assert!(!ledger.snapshot().integrity_lost, "{mode}");
             }
             if matches!(mode, "held" | "rejected") {
                 assert!(ledger.snapshot().object_debt > 0);

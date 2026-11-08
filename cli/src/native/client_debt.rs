@@ -3693,6 +3693,21 @@ impl OwnerDebtLedger {
         }
         !state.groups.values().any(|group| group.name == name)
     }
+    /// The exact session left the ledger's applied target map while the scope
+    /// kept its integrity. `Target.detachedFromTarget` removal is the same
+    /// applied-retirement proof a read wait accepts; a session the ledger no
+    /// longer owns cannot still hold a live browser object, so an exact read or
+    /// release addressed to it is moot rather than evidence of lost cleanup.
+    /// A retired or contaminated ledger never grants the proof.
+    pub(crate) fn exact_session_retired(&self, session: &str) -> bool {
+        if session.is_empty() {
+            return false;
+        }
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        !state.integrity_lost && !state.retired && !state.targets.contains_key(session)
+    }
     /// Exact reader destruction, not aggregate zero debt or lifecycle absence.
     /// The caller holds the transport owner lock across this synchronous check.
     pub(crate) fn network_command_destroyed_active(&self, status: &CommandStatusHandle) -> bool {
@@ -5189,6 +5204,28 @@ pub(crate) mod tests {
             .unwrap();
         (ledger, journal)
     }
+    #[test]
+    fn exact_session_retirement_requires_the_applied_detach_and_intact_ledger() {
+        let (ledger, _journal) = owner();
+        assert!(!ledger.exact_session_retired("page"));
+        ledger.observe_event(&CdpEvent {
+            method: "Target.detachedFromTarget".into(),
+            session_id: None,
+            params: json!({"sessionId":"page","targetId":"target"}),
+        });
+        assert!(ledger.exact_session_retired("page"));
+        // Absence is not proof once the ledger lost its accounting integrity.
+        let (contaminated, _journal) = owner();
+        contaminated.connection_lost();
+        contaminated.observe_event(&CdpEvent {
+            method: "Target.detachedFromTarget".into(),
+            session_id: None,
+            params: json!({"sessionId":"page","targetId":"target"}),
+        });
+        assert!(!contaminated.exact_session_retired("page"));
+        assert!(!contaminated.exact_session_retired(""));
+    }
+
     pub(crate) fn eval_fixture() -> (
         Arc<OwnerDebtLedger>,
         OperationJournalHandle,

@@ -98,15 +98,38 @@ impl CdpError {
 /// The same closed browser answer as it survives the client's legacy string
 /// error channel (`CDP error (<method>): <browser text>`). No other command
 /// failure carries it, and the wrapper is native text, not page content.
-pub(crate) fn is_session_not_found_message(message: &str) -> bool {
-    const ANSWER: &str = "session with given id not found";
+fn cdp_error_answer(message: &str) -> &str {
     let trimmed = message.trim_end_matches(['.', ' ']);
     if let Some(wrapped) = trimmed.strip_prefix("CDP error (") {
         if let Some((method, answer)) = wrapped.split_once("): ") {
-            return !method.is_empty() && answer.eq_ignore_ascii_case(ANSWER);
+            if !method.is_empty() {
+                return answer;
+            }
         }
     }
-    trimmed.eq_ignore_ascii_case(ANSWER)
+    trimmed
+}
+fn is_closed_browser_answer(message: &str, answers: &[&str]) -> bool {
+    let answer = cdp_error_answer(message);
+    answers
+        .iter()
+        .any(|candidate| answer.eq_ignore_ascii_case(candidate))
+}
+pub(crate) fn is_session_not_found_message(message: &str) -> bool {
+    is_closed_browser_answer(message, &["session with given id not found"])
+}
+/// A resolved object id the browser no longer knows. Only the exact document or
+/// realm could have destroyed the handle owned by a native capture group, so
+/// the object cannot still hold page content; a release against it has nothing
+/// left to prove. Any other answer keeps the strict cleanup classification.
+pub(crate) fn is_object_not_found_message(message: &str) -> bool {
+    is_closed_browser_answer(
+        message,
+        &[
+            "could not find object with given id",
+            "cannot find object with given id",
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -640,5 +663,29 @@ mod tests {
             data: None,
         }
         .is_session_not_found());
+    }
+
+    #[test]
+    fn object_not_found_is_its_own_closed_browser_answer() {
+        for message in [
+            "Could not find object with given id",
+            "Could not find object with given id.",
+            "Cannot find object with given id",
+            "CDP error (Runtime.releaseObject): Could not find object with given id.",
+        ] {
+            assert!(is_object_not_found_message(message), "{message}");
+        }
+        for message in [
+            "Session with given id not found.",
+            "Cannot find context with specified id",
+            "Object is gone",
+            "CDP error (Runtime.releaseObject): synthetic release rejection",
+        ] {
+            assert!(!is_object_not_found_message(message), "{message}");
+            assert!(
+                !is_session_not_found_message(message) || message.contains("Session"),
+                "{message}"
+            );
+        }
     }
 }
