@@ -1758,6 +1758,26 @@ async fn read_exact_box_with_evidence(
         && client.debt_ledger().is_some()
         && super::client_debt::OperationJournalHandle::current().is_some()
     {
+        // A readonly geometry group is released through the bounded cleanup
+        // command pool. Do not acquire another group while that pool is
+        // saturated: the release of the next group could not even be admitted,
+        // and a full pool must not be turned into a lost cleanup proof. This
+        // waits on the same operation budget and never retries a failed command.
+        if let Some(ledger) = client.debt_ledger() {
+            ledger
+                .wait_cleanup_object_capacity(operation)
+                .await
+                .map_err(|error| match error {
+                    super::client_protocol::ProtocolError::Cancelled => GeometryError::Cancelled,
+                    super::client_protocol::ProtocolError::DeadlineExceeded => {
+                        GeometryError::DeadlineExceeded
+                    }
+                    super::client_protocol::ProtocolError::StaleScope => {
+                        GeometryError::StaleIdentity
+                    }
+                    _ => GeometryError::BackendFailure,
+                })?;
+        }
         // A group, not a textual objectId, owns this complete readonly read.
         // Never reuse its name while an earlier release is queued or unacked.
         let group = client

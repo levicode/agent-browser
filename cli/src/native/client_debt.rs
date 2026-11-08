@@ -2733,6 +2733,59 @@ impl OwnerDebtLedger {
             }
         }
     }
+    /// Read-only geometry acquires one cleanup group per exact node and hands
+    /// its release to the bounded disposal lane. When that lane's command pool
+    /// is saturated, the release cannot even be admitted; the group is still
+    /// owned and accounted by the ledger, so this is local backpressure, not a
+    /// lost cleanup proof. Wait for the pool to drain within the operation's own
+    /// deadline before acquiring the next group. No timeout is extended and no
+    /// failed browser command is retried.
+    pub(crate) async fn wait_cleanup_object_capacity(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        // Leave room for this read's own release envelope and a small amount of
+        // concurrent cleanup work, so a successful read is not immediately
+        // turned into an unprovable cleanup by a full disposal pool.
+        const RESERVED_COMMANDS: usize = 4;
+        const RESERVED_BYTES: usize = 4 * 1024;
+        let index = CommandCategory::CleanupObject.index();
+        let (maximum_count, maximum_bytes) = CommandCategory::CleanupObject.limits();
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
+            }
+            if Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if operation.generation != self.generation {
+                return Err(ProtocolError::StaleScope);
+            }
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.retired || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if state.counts[index] + RESERVED_COMMANDS <= maximum_count
+                    && state.bytes[index] + RESERVED_BYTES <= maximum_bytes
+                {
+                    return Ok(());
+                }
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
+                _ = &mut changed => {},
+            }
+        }
+    }
     fn operation_counts(&self, key: OperationKey) -> (u32, u32, bool) {
         match self.state.lock() {
             Ok(state) => (
@@ -6126,6 +6179,52 @@ pub(crate) mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn cleanup_object_capacity_waits_for_the_bounded_pool_to_drain() {
+        let (ledger, _journal) = owner();
+        let index = CommandCategory::CleanupObject.index();
+        let (_cancel, operation) = admission_operation(10_000);
+        {
+            let mut state = ledger.state.lock().unwrap();
+            state.counts[index] = 29;
+            state.bytes[index] = 0;
+        }
+        let mut waiting = Box::pin(ledger.wait_cleanup_object_capacity(&operation));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                .await
+                .is_err(),
+            "a saturated cleanup pool is not admitted"
+        );
+        {
+            let mut state = ledger.state.lock().unwrap();
+            state.counts[index] = 27;
+            state.bytes[index] = 0;
+        }
+        ledger.changed.notify_waiters();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+                .await
+                .unwrap(),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_object_capacity_uses_the_operation_deadline() {
+        let (ledger, _journal) = owner();
+        let index = CommandCategory::CleanupObject.index();
+        let (_cancel, operation) = admission_operation(10);
+        {
+            let mut state = ledger.state.lock().unwrap();
+            state.counts[index] = 32;
+        }
+        assert_eq!(
+            ledger.wait_cleanup_object_capacity(&operation).await,
+            Err(ProtocolError::DeadlineExceeded)
+        );
+    }
+
     #[test]
     fn submission_not_waiter_lifetime_owns_debt_and_ack_does_not_erase_dispatch() {
         let (ledger, journal) = owner();
