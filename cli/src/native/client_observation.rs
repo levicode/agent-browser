@@ -44,6 +44,16 @@ mod selector;
 #[path = "client_observation/selector_expression_tests.rs"]
 mod selector_expression_tests;
 
+/// Semantic geometry resolves one exact node per task. Every exact resolution
+/// creates its own isolated realm and holds a readonly object group plus the
+/// resolved node until its release is acknowledged, all of it counted by the
+/// owner ledger's bounded object pool. A 16-wide fan-out can therefore refuse
+/// its own next `Page.createIsolatedWorld` with `capacity-exceeded`. That local
+/// admission refusal is backpressure, not evidence that a node or frame moved,
+/// so it must never surface as a stale scope. Keep the fan-out well below the
+/// pool so the geometry read can never saturate its own admission.
+const SEMANTIC_GEOMETRY_FANOUT: usize = 8;
+
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -6770,7 +6780,7 @@ pub async fn project_geometry(
                 },
             ))
         }))
-        .buffered(16)
+        .buffered(SEMANTIC_GEOMETRY_FANOUT)
         .collect()
         .await;
     if let Some(error) = rectangles.iter().find_map(|result| match result {
@@ -6970,7 +6980,7 @@ pub(crate) async fn project_observe_geometry(
         }
         (result, evidence)
     }))
-    .buffered(16)
+    .buffered(SEMANTIC_GEOMETRY_FANOUT)
     .collect::<Vec<_>>()
     .await;
     let rectangles = merge_observe_rectangles(rectangles)?;
@@ -6988,6 +6998,24 @@ pub(crate) async fn project_observe_geometry(
 
 #[cfg(test)]
 mod tests {
+    /// A geometry fan-out at or above the owned-object pool lets a read refuse
+    /// its own admission: the ledger then reports `capacity-exceeded`, the
+    /// readonly resolver maps it to a moved identity, and the observation
+    /// settles as a stale scope on a usable scope. Each lane can own a group,
+    /// a resolved node, a pending creation slot and a queued release, so bound
+    /// the fan-out to a quarter of the pool.
+    #[test]
+    fn semantic_geometry_fanout_cannot_saturate_its_own_object_pool() {
+        let lane_debt = 4;
+        assert!(
+            super::SEMANTIC_GEOMETRY_FANOUT * lane_debt
+                <= super::client_debt::MAX_OBJECT_DEBT as usize,
+            "semantic geometry fan-out {} can own more objects than the ledger pool of {}",
+            super::SEMANTIC_GEOMETRY_FANOUT * lane_debt,
+            super::client_debt::MAX_OBJECT_DEBT,
+        );
+    }
+
     #[test]
     fn observation_check_preserves_typed_stop_before_clock() {
         for signal in [

@@ -3538,7 +3538,7 @@ impl OwnerDebtLedger {
                 .is_none_or(|bytes| bytes > maximum_bytes)
             || object_count(&state)
                 .checked_add(creation_slots + usize::from(new_group_footprint > 0))
-                .is_none_or(|count| count > 32)
+                .is_none_or(|count| count > MAX_OBJECT_DEBT as usize)
             || descriptor_usage(&state)
                 .saturating_add(footprint)
                 .saturating_add(new_group_footprint)
