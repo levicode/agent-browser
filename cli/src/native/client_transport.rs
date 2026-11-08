@@ -1472,8 +1472,21 @@ where
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
                     let Some((id, generation, callback, scope, _read_only)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
-                    let (state, observation_settlement) = broker.settle_with_observation_proof(generation, sequence, outcome.effects,
-                        if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or((ScopeState::Quarantined, None));
+                    // A stale-scope refusal settles with its honest effects but
+                    // never seals the scope by itself: the operation's evidence
+                    // moved, not the browser or its cleanup. A genuinely lost
+                    // cleanup already quarantined the broker before this point.
+                    let stale_scope_keeps_usable = !callback
+                        && outcome.effects == Effects::Unknown
+                        && matches!(&outcome.result, Err(ProtocolError::StaleScope));
+                    let settled = if stale_scope_keeps_usable {
+                        broker.settle_stale_scope_refusal(generation, sequence, outcome.effects,
+                            if continuation_negotiated { outcome.retention.as_ref() } else { None })
+                    } else {
+                        broker.settle_with_observation_proof(generation, sequence, outcome.effects,
+                            if continuation_negotiated { outcome.retention.as_ref() } else { None })
+                    };
+                    let (state, observation_settlement) = settled.unwrap_or((ScopeState::Quarantined, None));
                     executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
                     // A replacement refused before staging any candidate (for
                     // example a different browser or scope identity) ends the

@@ -1806,13 +1806,36 @@ async fn read_exact_box_with_evidence(
 // A positive native negative identity proof refuses this exact node. In the
 // readonly path the outer group still owns every acquired object on refusal;
 // only its failed disposal may turn this clean stale result into cleanup loss.
-// Strict action geometry and all backend/cleanup failures keep their old fence.
+// Strict action geometry keeps its old fence.
+//
+// A page-created frame target can also retire between the frame inventory and
+// this exact read. Chromium then answers the session-addressed resolver at the
+// browser level with its closed "session not found" reply, which the resolver
+// reports as BackendFailure without page content. A session the ledger has
+// already applied as retired cannot hold the exact node or any object acquired
+// for it: that is a moved identity, not a lost cleanup proof, and it must not
+// turn a read-only observation into an unknown page effect.
 fn box_resolution_failure(
     error: element::ExactResolutionError,
     interrupted: Option<GeometryError>,
     readonly_group: bool,
+    session_retired: bool,
 ) -> GeometryError {
-    if readonly_group && error == element::ExactResolutionError::StaleReference {
+    // In a readonly group every acquired object belongs to the caller's exact
+    // group owner, so the resolver's own failure is never a cleanup proof: the
+    // group's disposal, which the caller performs on every path, is. A moved
+    // document therefore surfaces as a stale identity even when the resolver
+    // reports a backend failure; only an explicit resolver cleanup loss stays
+    // dirty here.
+    let clean_identity = (readonly_group
+        && !matches!(error, element::ExactResolutionError::CleanupFailed { .. }))
+        || (session_retired
+            && matches!(
+                error,
+                element::ExactResolutionError::StaleReference
+                    | element::ExactResolutionError::BackendFailure
+            ));
+    if clean_identity {
         return interrupted.unwrap_or(GeometryError::StaleIdentity);
     }
     GeometryError::CleanupFailed {
@@ -1903,7 +1926,14 @@ async fn read_exact_box_inner(
         element::ExactResolutionError::Superseded => {
             check(operation).err().unwrap_or(GeometryError::Superseded)
         }
-        error => box_resolution_failure(error, interrupted.clone(), readonly_group.is_some()),
+        error => box_resolution_failure(
+            error,
+            interrupted.clone(),
+            readonly_group.is_some(),
+            client
+                .debt_ledger()
+                .is_some_and(|ledger| ledger.exact_session_retired(&binding.session)),
+        ),
     })?;
     if let Some(primary) = interrupted {
         return if readonly_group.is_some()
@@ -2018,33 +2048,89 @@ mod tests {
     fn readonly_box_negative_identity_is_not_cleanup_loss() {
         use element::ExactResolutionError as Exact;
         assert_eq!(
-            box_resolution_failure(Exact::StaleReference, None, true),
+            box_resolution_failure(Exact::StaleReference, None, true, false),
             GeometryError::StaleIdentity
         );
         for stopped in [GeometryError::Cancelled, GeometryError::DeadlineExceeded] {
             assert_eq!(
-                box_resolution_failure(Exact::StaleReference, Some(stopped.clone()), true),
+                box_resolution_failure(Exact::StaleReference, Some(stopped.clone()), true, false),
                 stopped
             );
         }
     }
     #[test]
-    fn readonly_box_backend_and_cleanup_failures_stay_dirty() {
+    fn readonly_box_only_a_resolver_cleanup_failure_stays_dirty() {
         use element::ExactResolutionError as Exact;
-        for error in [
-            Exact::BackendFailure,
-            Exact::CleanupFailed {
-                primary: Some(Box::new(Exact::StaleReference)),
-            },
-        ] {
+        // The outer group owner disposes every acquired object, so a resolver
+        // backend refusal in a readonly group is a moved identity the read can
+        // repeat; it is not lost cleanup.
+        assert_eq!(
+            box_resolution_failure(Exact::BackendFailure, None, true, false),
+            GeometryError::StaleIdentity
+        );
+        // An explicit resolver cleanup loss still keeps the old fence.
+        assert_eq!(
+            box_resolution_failure(
+                Exact::CleanupFailed {
+                    primary: Some(Box::new(Exact::StaleReference)),
+                },
+                None,
+                true,
+                false
+            ),
+            GeometryError::CleanupFailed {
+                primary: Some(Box::new(GeometryError::StaleIdentity))
+            }
+        );
+    }
+    #[test]
+    fn a_retired_exact_session_makes_a_resolver_failure_a_stale_identity() {
+        use element::ExactResolutionError as Exact;
+        for readonly_group in [false, true] {
+            for error in [Exact::BackendFailure, Exact::StaleReference] {
+                assert_eq!(
+                    box_resolution_failure(error, None, readonly_group, true),
+                    GeometryError::StaleIdentity,
+                    "a session the ledger applied as retired cannot hold the node"
+                );
+            }
+            // A genuine cleanup loss stays dirty even when the session retired.
             assert_eq!(
-                box_resolution_failure(error, None, true),
+                box_resolution_failure(
+                    Exact::CleanupFailed { primary: None },
+                    None,
+                    readonly_group,
+                    true
+                ),
                 GeometryError::CleanupFailed {
                     primary: Some(Box::new(GeometryError::StaleIdentity))
                 }
             );
         }
+        // Without the applied-retirement proof a strict resolver failure keeps
+        // its old fence; a readonly group's disposal remains the proof instead.
+        assert_eq!(
+            box_resolution_failure(Exact::BackendFailure, None, false, false),
+            GeometryError::CleanupFailed {
+                primary: Some(Box::new(GeometryError::StaleIdentity))
+            }
+        );
+        assert_eq!(
+            box_resolution_failure(Exact::BackendFailure, None, true, false),
+            GeometryError::StaleIdentity
+        );
+        // A stop observed before the resolution keeps its own classification.
+        assert_eq!(
+            box_resolution_failure(
+                Exact::BackendFailure,
+                Some(GeometryError::Cancelled),
+                false,
+                true
+            ),
+            GeometryError::Cancelled
+        );
     }
+
     #[test]
     fn strict_box_negative_identity_keeps_its_existing_fence() {
         use element::ExactResolutionError as Exact;
@@ -2054,7 +2140,7 @@ mod tests {
             Some(GeometryError::DeadlineExceeded),
         ] {
             assert_eq!(
-                box_resolution_failure(Exact::StaleReference, stopped.clone(), false),
+                box_resolution_failure(Exact::StaleReference, stopped.clone(), false, false),
                 GeometryError::CleanupFailed {
                     primary: Some(Box::new(stopped.unwrap_or(GeometryError::StaleIdentity)))
                 }

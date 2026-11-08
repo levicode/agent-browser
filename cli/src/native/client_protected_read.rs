@@ -53,6 +53,16 @@ enum ReadBarrier {
     Global(ProtectedTargetBarrier),
     Selected(Box<super::client_enrollment::SelectedPageReadBarrier>),
 }
+/// A protected-read cleanup command can no longer reach its document when the
+/// browser answers at the browser level that the exact session or resolved
+/// object does not exist. The injected source style and animation playback
+/// rate die with that document, so the cleanup is proven, not lost. Any other
+/// failure keeps the strict lost-cleanup classification.
+fn cleanup_answer_retired(message: &str) -> bool {
+    super::cdp::types::is_session_not_found_message(message)
+        || super::cdp::types::is_object_not_found_message(message)
+}
+
 fn query_wait_reason(
     error: super::client_protocol::ProtocolError,
     fallback: ProtectedReadReason,
@@ -589,6 +599,18 @@ impl<'a> ProtectedReadJournal<'a> {
                         self.page.client.send_command("Runtime.callFunctionOn", Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":mask.group})), Some(&mask.session)))).await;
                     if !matches!(&result, Ok(Ok(value)) if value.get("exceptionDetails").is_none() && value["result"]["value"] == true)
                     {
+                        if matches!(&result, Ok(Err(message)) if cleanup_answer_retired(message)) {
+                            // The exact document that owned this holder is gone;
+                            // its injected style cannot survive it.
+                            self.records()?
+                                .masks
+                                .iter_mut()
+                                .find(|owned| {
+                                    owned.session == mask.session && owned.group == mask.group
+                                })
+                                .ok_or(ProtectedReadReason::CleanupFailed)?
+                                .step = MaskStep::GroupReleased;
+                        }
                         continue;
                     }
                 }
@@ -611,7 +633,9 @@ impl<'a> ProtectedReadJournal<'a> {
                 ),
             )
             .await;
-            if matches!(released, Ok(Ok(_))) {
+            let released_retired =
+                matches!(&released, Ok(Err(message)) if cleanup_answer_retired(message));
+            if matches!(released, Ok(Ok(_))) || released_retired {
                 self.records()?
                     .masks
                     .iter_mut()
@@ -671,22 +695,21 @@ impl<'a> ProtectedReadJournal<'a> {
                 complete = false;
                 break;
             }
-            let acknowledged = matches!(
-                tokio::time::timeout_at(
-                    command_deadline.into(),
-                    command_scope(
-                        CommandCategory::CleanupOther,
-                        false,
-                        self.page.client.send_command(
-                            "Animation.setPlaybackRate",
-                            Some(json!({"playbackRate":rate.original})),
-                            Some(session)
-                        )
-                    )
-                )
-                .await,
-                Ok(Ok(_))
-            );
+            let rate_result = tokio::time::timeout_at(
+                command_deadline.into(),
+                command_scope(
+                    CommandCategory::CleanupOther,
+                    false,
+                    self.page.client.send_command(
+                        "Animation.setPlaybackRate",
+                        Some(json!({"playbackRate":rate.original})),
+                        Some(session),
+                    ),
+                ),
+            )
+            .await;
+            let acknowledged = matches!(&rate_result, Ok(Ok(_)))
+                || matches!(&rate_result, Ok(Err(message)) if cleanup_answer_retired(message));
             complete &= acknowledged;
             if acknowledged {
                 if let Ok(mut records) = self.records() {
@@ -883,6 +906,23 @@ mod tests {
         };
         (page, operation, sender, server, records)
     }
+    #[test]
+    fn protected_cleanup_only_accepts_the_closed_retirement_answers() {
+        assert!(super::cleanup_answer_retired(
+            "Session with given id not found."
+        ));
+        assert!(super::cleanup_answer_retired(
+            "CDP error (Runtime.callFunctionOn): Could not find object with given id"
+        ));
+        for message in [
+            "synthetic source cleanup failure",
+            "CDP error (Runtime.releaseObjectGroup): synthetic group release refusal",
+            "Cannot find context with specified id",
+        ] {
+            assert!(!super::cleanup_answer_retired(message), "{message}");
+        }
+    }
+
     #[tokio::test]
     async fn trace_restore_receipt_requires_exact_owner_and_clean_ledger() {
         use super::super::client_browser::{settle_observation_dispatch, settle_trace_screenshot};

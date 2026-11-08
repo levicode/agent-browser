@@ -3233,6 +3233,16 @@ impl CdpClient {
         capture: Option<&crate::native::client_debt::ReadonlyGroupCapture>,
     ) -> Result<(), String> {
         self.ensure_open()?;
+        // A session the ledger has already applied as retired cannot still own
+        // a browser object group. The disposal has nothing left to reach, so it
+        // is proven complete rather than lost. A retired or contaminated
+        // ledger never grants the proof.
+        if self
+            .debt_ledger()
+            .is_some_and(|ledger| ledger.exact_session_retired(session))
+        {
+            return Ok(());
+        }
         let params = serde_json::json!({"objectGroup": group});
         let captured = if let Some(capture) = capture {
             let ledger = self
