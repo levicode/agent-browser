@@ -4044,11 +4044,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let receive = self
                 .tasks
                 .start_operation_prepared_evidence(
-                    context.scope.identity_scope.clone(),
-                    context.page.targets.clone(),
-                    self.broker.clone(),
-                    journal,
-                    lease.cancellation.clone(),
+                    super::client_tasks::OperationStartContext {
+                        identity_scope: context.scope.identity_scope.clone(),
+                        targets: context.page.targets.clone(),
+                        broker: self.broker.clone(),
+                        journal,
+                        cancellation: lease.cancellation.clone(),
+                    },
                     evidence,
                     move || {
                         // The registry has accepted capacity, but has not spawned

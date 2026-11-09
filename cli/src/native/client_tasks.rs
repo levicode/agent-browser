@@ -28,6 +28,16 @@ pub(crate) enum SettlementEvidence {
     Ordinary,
     OptionalTrace,
 }
+/// Everything a retained operation needs from the scope that starts it. The
+/// evidence-aware entry points take this context so adding a settlement mode
+/// does not grow another positional argument list.
+pub(crate) struct OperationStartContext {
+    pub(crate) identity_scope: String,
+    pub(crate) targets: Arc<ClientTargets>,
+    pub(crate) broker: Arc<super::client_session::ClientSession>,
+    pub(crate) journal: super::client_debt::OperationJournalHandle,
+    pub(crate) cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+}
 #[derive(Default)]
 struct Tasks {
     closing: bool,
@@ -199,11 +209,13 @@ impl RetainedTasks {
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
     {
         self.start_operation_evidence(
-            identity_scope,
-            targets,
-            broker,
-            journal,
-            cancellation,
+            OperationStartContext {
+                identity_scope,
+                targets,
+                broker,
+                journal,
+                cancellation,
+            },
             SettlementEvidence::Ordinary,
             future,
         )
@@ -212,29 +224,18 @@ impl RetainedTasks {
 
     pub(crate) async fn start_operation_evidence<F>(
         &self,
-        identity_scope: String,
-        targets: Arc<ClientTargets>,
-        broker: Arc<super::client_session::ClientSession>,
-        journal: super::client_debt::OperationJournalHandle,
-        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        context: OperationStartContext,
         evidence: SettlementEvidence,
         future: F,
     ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
     where
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
     {
-        self.start_operation_prepared_evidence(
-            identity_scope,
-            targets,
-            broker,
-            journal,
-            cancellation,
-            evidence,
-            || Ok(future),
-        )
-        .await
+        self.start_operation_prepared_evidence(context, evidence, || Ok(future))
+            .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_operation_prepared<F, P>(
         &self,
         identity_scope: String,
@@ -249,11 +250,13 @@ impl RetainedTasks {
         P: FnOnce() -> Result<F, ProtocolError>,
     {
         self.start_operation_prepared_evidence(
-            identity_scope,
-            targets,
-            broker,
-            journal,
-            cancellation,
+            OperationStartContext {
+                identity_scope,
+                targets,
+                broker,
+                journal,
+                cancellation,
+            },
             SettlementEvidence::Ordinary,
             prepare,
         )
@@ -262,11 +265,7 @@ impl RetainedTasks {
 
     pub(crate) async fn start_operation_prepared_evidence<F, P>(
         &self,
-        identity_scope: String,
-        targets: Arc<ClientTargets>,
-        broker: Arc<super::client_session::ClientSession>,
-        journal: super::client_debt::OperationJournalHandle,
-        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        context: OperationStartContext,
         evidence: SettlementEvidence,
         prepare: P,
     ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
@@ -274,6 +273,13 @@ impl RetainedTasks {
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
         P: FnOnce() -> Result<F, ProtocolError>,
     {
+        let OperationStartContext {
+            identity_scope,
+            targets,
+            broker,
+            journal,
+            cancellation,
+        } = context;
         let optional_trace = evidence == SettlementEvidence::OptionalTrace;
         let operations = self.operations.clone();
         let task_targets = targets.clone();
@@ -300,11 +306,11 @@ impl RetainedTasks {
                     }
                     if let Some(deadline) = monitor_registry.retire(key) {
                         tokio::time::sleep_until(deadline.into()).await;
-                        if monitor_registry.expire(key, std::time::Instant::now()) {
-                            if !optional_trace {
-                                monitor_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedDeadlineSeal);
-                                let _ = monitor_broker.quarantine();
-                            }
+                        if monitor_registry.expire(key, std::time::Instant::now())
+                            && !optional_trace
+                        {
+                            monitor_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedDeadlineSeal);
+                            let _ = monitor_broker.quarantine();
                         }
                     }
                 });
@@ -1299,11 +1305,13 @@ mod fixed_read_eof_tests {
             journal.bind_operation(&lease).unwrap();
             let receive = tasks
                 .start_operation_evidence(
-                    "scope".into(),
-                    targets.clone(),
-                    broker.clone(),
-                    journal,
-                    lease.cancellation.clone(),
+                    OperationStartContext {
+                        identity_scope: "scope".into(),
+                        targets: targets.clone(),
+                        broker: broker.clone(),
+                        journal,
+                        cancellation: lease.cancellation.clone(),
+                    },
                     evidence,
                     async {
                         (

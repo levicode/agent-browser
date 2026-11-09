@@ -46,7 +46,9 @@ impl ClientBrowser {
             return refused(ProtocolError::InvalidArguments);
         }
         enum Request {
-            Prepare(String, OpenRequest),
+            // OpenRequest is the largest wire payload; boxing it keeps every
+            // preparation request from paying its size.
+            Prepare(String, Box<OpenRequest>),
             Adopt(AdoptWire),
             Abort(AbortWire),
             Identify(IdentifyWire),
@@ -79,7 +81,7 @@ impl ClientBrowser {
                     }
                     _ => {}
                 }
-                Request::Prepare(id, request)
+                Request::Prepare(id, Box::new(request))
             }
             "scope.interop.adopt" => {
                 match serde_json::from_value(serde_json::Value::Object(args)) {
@@ -140,7 +142,7 @@ impl ClientBrowser {
                 }
             }
             Request::Prepare(id, request) => {
-                self.prepare_interop_scope(id, request, operation).await
+                self.prepare_interop_scope(id, *request, operation).await
             }
             Request::Adopt(request) => {
                 self.interop_preparation

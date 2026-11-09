@@ -2708,15 +2708,13 @@ pub async fn observe(
         // of a suppressed node.
         let mut suppressed: HashMap<i64, (i64, String)> = HashMap::new();
         collect_suppressed(&dom["root"], false, &mut suppressed);
-        let probed = match semantic_capture_stage!(
+        let probed = semantic_capture_stage!(
             witness,
             Metadata,
             frame_kind,
             display_none_subtrees(client, frame, &dom, lease).await
-        ) {
-            Ok(probed) => probed,
-            Err(_) => HashMap::new(),
-        };
+        )
+        .unwrap_or_default();
         for (id, fact) in probed {
             suppressed.entry(id).or_insert(fact);
         }

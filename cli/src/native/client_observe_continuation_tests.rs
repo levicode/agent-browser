@@ -8,6 +8,9 @@ use crate::native::client_protocol::{Effects, ObserveContinuationDescriptor, Sco
 use crate::native::client_session::ClientSession;
 use crate::native::client_tasks::RetainedTasks;
 
+// The joint bridge fixture binds a private Unix-domain socket, so it is only
+// compiled where Unix sockets exist.
+#[cfg(unix)]
 #[path = "client_observe_continuation_bridge_tests.rs"]
 mod bridge_tests;
 
