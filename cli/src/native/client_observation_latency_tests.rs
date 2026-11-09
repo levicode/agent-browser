@@ -52,6 +52,45 @@ async fn observe_run(
         .map_err(|error| format!("{command}: {error:?}"))
 }
 
+/// The bed's page is still moving when the observation starts: Chrome attaches
+/// the three plugin frames after the page script returns, and a dense
+/// 1,502-node capture can lose its layout proof while the page settles. The
+/// observation reports those as the documented clean refusals
+/// (`stale-reference` for a moved frame inventory, `stale-scope` for a moved
+/// layout proof) on a usable scope, which a caller resolves by taking a fresh
+/// capture. Retry only those, up to `attempts` observations, so the bed
+/// measures a settled capture; any other outcome fails immediately and no
+/// budget is extended.
+async fn observe_settled(
+    browser: &crate::native::client_browser::ClientBrowser,
+    operations: &mut FixtureOperations,
+    sink: &crate::native::client_transport::ClientEventSink,
+    args: Value,
+    attempts: usize,
+) -> (Value, usize, Duration) {
+    for attempt in 1..=attempts {
+        let start = Instant::now();
+        let outcome = operations
+            .execute_written(browser, sink, "browser.observe", args.clone(), 120)
+            .await
+            .expect("browser.observe admission/settlement");
+        let elapsed = start.elapsed();
+        match outcome.result {
+            Ok(snapshot) => return (snapshot, attempt, elapsed),
+            Err(
+                crate::native::client_protocol::ProtocolError::StaleReference
+                | crate::native::client_protocol::ProtocolError::StaleScope,
+            ) if attempt < attempts => {
+                // A clean refusal means the page is still settling, not that
+                // the read was denied. Let the pending attachment land.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            Err(error) => panic!("browser.observe: {error:?}"),
+        }
+    }
+    unreachable!("the loop returns a snapshot or panics")
+}
+
 fn semantic_node_count(node: &Value) -> usize {
     let mut count = usize::from(node.is_object());
     if let Some(children) = node["children"].as_array() {
@@ -263,26 +302,22 @@ async fn e2e_observe_dense_light_page_prints_phase_baseline() {
     eprintln!("OBSERVE dense page={}", built["value"]);
     assert_eq!(built["value"]["objects"], 3, "the dense page must keep the three opaque plugin frames");
 
-    let start = Instant::now();
-    let snapshot = observe_run(
+    let (snapshot, attempts, elapsed) = observe_settled(
         &browser,
         &mut operations,
         &sink,
-        "browser.observe",
         json!({
             "identityScope":scope,
             "testIdAttribute":"data-testid",
             "secureFieldSelector":FIXTURE_SECURE_SELECTOR,
             "options":{}
         }),
-        120,
+        4,
     )
-    .await
-    .unwrap();
-    let elapsed = start.elapsed();
+    .await;
     let bytes = serde_json::to_vec(&snapshot).map(|value| value.len()).unwrap_or(0);
     eprintln!(
-        "OBSERVE [dense-light] elapsed_ms={} nodes={} bytes={} phases={}",
+        "OBSERVE [dense-light] attempts={attempts} elapsed_ms={} nodes={} bytes={} phases={}",
         elapsed.as_millis(),
         semantic_node_count(&snapshot["root"]),
         bytes,

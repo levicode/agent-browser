@@ -481,6 +481,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "NetworkServiceInProcess".to_string(),
     ];
     if options.webmcp {
+        // Chrome renamed the page-facing feature: current builds expose
+        // document.modelContext only under `WebMCP`, while the older
+        // `WebMCPTesting`/`DevToolsWebMCPSupport` names stay for builds that
+        // still know them.
+        enable_features.push("WebMCP".to_string());
         enable_features.push("WebMCPTesting".to_string());
         enable_features.push("DevToolsWebMCPSupport".to_string());
     }
@@ -2505,6 +2510,7 @@ exec sleep 60
             .iter()
             .find(|arg| arg.starts_with("--enable-features="))
             .unwrap();
+        assert!(features.contains("WebMCP,"));
         assert!(features.contains("WebMCPTesting"));
         assert!(features.contains("DevToolsWebMCPSupport"));
     }
@@ -2521,6 +2527,7 @@ exec sleep 60
             .iter()
             .find(|arg| arg.starts_with("--enable-features="))
             .unwrap();
+        assert!(!features.contains("WebMCP"));
         assert!(!features.contains("WebMCPTesting"));
         assert!(!features.contains("DevToolsWebMCPSupport"));
     }

@@ -114,15 +114,15 @@ Runs all unit tests. These are fast and don't require Chrome. At `57c45914` the 
 The default-configuration native gate is the same crate built with the `ci` profile:
 
 ```bash
-cd cli && CARGO_PROFILE_CI_LTO=false cargo test --profile ci
+cd cli && RUST_MIN_STACK=33554432 CARGO_PROFILE_CI_LTO=false cargo test --profile ci
 ```
 
-See `cli/docs/native-default-gate.md` for how to report it, what the historical "43/110" figure refers to, and the checkout-path limit that affects `native::stream::http::tests`.
+See `cli/docs/native-default-gate.md` for how to report it, what the historical "43/110" figure refers to, the test-thread stack budget and the checkout-path limit that affects `native::stream::http::tests`.
 
 ### End-to-End Tests
 
 ```bash
-cd cli && cargo test e2e -- --ignored --test-threads=1
+cd cli && RUST_MIN_STACK=33554432 cargo test e2e -- --ignored --test-threads=1
 ```
 
 Runs 18 e2e tests that launch real headless Chrome instances and exercise the full native daemon command pipeline. Requirements:

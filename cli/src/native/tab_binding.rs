@@ -440,6 +440,11 @@ mod tests {
             let mut child = std::process::Command::new("true").spawn().unwrap();
             let pid = child.id();
             child.wait().unwrap();
+            // Reaping alone removes the pid on Unix, but Windows keeps a
+            // terminated process object alive while any handle to it is open,
+            // and std's Child holds that handle until it is dropped. Drop it
+            // so the pin really refers to a missing pid on both platforms.
+            drop(child);
             write_pin("dead", "TARGET1", true, Some(pid));
             assert_eq!(pinned_owner("TARGET1", "b"), None);
         });

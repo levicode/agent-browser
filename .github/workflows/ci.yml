@@ -7,6 +7,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The native test binaries drive deep async state machines through the real
+# dispatcher, and libtest spawns every test on a thread that inherits std's
+# 2 MiB default stack. That budget is not portable: Windows x64 frames are
+# larger, and the ignored dense-DOM observation fixture exceeds it everywhere.
+# Export the stack size the suite is developed against (see
+# cli/docs/native-default-gate.md) instead of skipping or weakening any test.
+env:
+  RUST_MIN_STACK: "33554432"
+
 jobs:
   version-sync:
     name: Version Sync Check
@@ -190,6 +199,10 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
+      # One platform's failure must not cancel the other platforms: the run
+      # before this change lost the macOS results to a Windows failure and,
+      # after the stack fix, lost the Windows result to a macOS failure.
+      fail-fast: false
       matrix:
         include:
           - os: macos-latest
