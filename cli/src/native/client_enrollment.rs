@@ -10296,9 +10296,14 @@ mod tests {
                             "Runtime.getProperties" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]}),
                             "Runtime.callFunctionOn" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>{
                                 let declaration=request["params"]["functionDeclaration"].as_str().unwrap();
-                                if declaration.contains("Array.from(result)") {json!({"result":{"objectId":"security"}})}
+                                // The receiver-security selector owns its own declaration
+                                // prefix. The metadata batch also contains
+                                // `Array.from(result)`, so matching that substring first
+                                // would answer the batch with an objectId instead of
+                                // the node value array.
+                                if declaration.starts_with("function(selector") {json!({"result":{"objectId":"security"}})}
                                 else if declaration.starts_with("function(expression") {json!({"result":{"value":{"indices":[0],"redacted":[]}}})}
-                                else if declaration.contains("const read=") {json!({"result":{"value":[{"attributes":{},"labels":[],"states":{"secure":false,"hidden":false},"text":"Selected","rect":{"x":10,"y":20,"width":20,"height":20}}]}})}
+                                else if declaration.contains("const read=") {json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Selected","rect":{"x":10,"y":20,"width":20,"height":20}}]}})}
                                 else if declaration.contains("frameOwner") {json!({"result":{"value":{"connected":true,"frameOwner":false}}})}
                                 else {json!({"result":{"value":true}})}
                             },
