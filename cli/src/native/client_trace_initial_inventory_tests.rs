@@ -792,7 +792,13 @@ async fn trace_initial_inventory_reacquisition_is_independent_of_diagnostics() {
         .await;
     assert_eq!(outcome.error, ProtocolError::BrowserFailure);
     assert_eq!(outcome.samples, 2);
-    assert!(outcome.first.is_none());
+    // 28a28944 keeps the phase witness for every trace regardless of the
+    // diagnostic sink, so the terminal refusal is retained here as well. The
+    // reacquisition itself still happens without a diagnostic inventory sample.
+    assert_eq!(
+        outcome.first.as_ref().map(|failure| failure.error.clone()),
+        Some(ProtocolError::BrowserFailure)
+    );
     assert!(outcome.inventory.is_none());
     settled(&outcome);
     no_capture_or_input(&outcome.log);
