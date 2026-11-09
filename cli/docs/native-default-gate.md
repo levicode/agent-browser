@@ -38,6 +38,19 @@ Report the explicit selection and counts (for example "default gate: X passed / 
 - A test that passes idle but fails under load is a test-budget problem, not a product defect, and must not be made green by widening a timeout. Report it as its own class.
 - `native::stream::http::tests` binds an AF_UNIX socket under `<crate>/target/t`. A checkout whose absolute path is too long fails both tests with `path must be shorter than SUN_LEN`. That is a limit of the checkout path, not a test failure; run the gate from a short path (or CI) before attributing those two tests.
 
+## Test-thread stack budget
+
+The native fixtures drive deep async state machines through the real dispatcher, and libtest spawns every test on a thread with std's default 2 MiB stack. That default is not portable. At `a2c60702` the Windows x64 `Rust` job aborted with `STATUS_STACK_OVERFLOW` in `native::client_browser::missing_root_observer_tests::p08_control_missing_root_without_observer_allows_final_local_cleanup`, and the ignored `e2e_observe_dense_light_page_prints_phase_baseline` bed aborted with a stack overflow on Linux and macOS.
+
+CI exports `RUST_MIN_STACK=33554432` (32 MiB) for every job, the value the suite is developed against. Export the same value before running the gate or the ignored e2e selection locally:
+
+```bash
+RUST_MIN_STACK=33554432 cargo test --profile ci
+RUST_MIN_STACK=33554432 cargo test e2e -- --ignored --test-threads=1
+```
+
+This is a stack budget for the test harness, not a relaxed assertion: the same tests, assertions and selections run.
+
 ## Test peers must model every production CDP command
 
 Most native tests drive the real dispatcher through a hand-written WebSocket peer that answers CDP frames and often asserts the exact command sequence. A new production command on a capture path must be modeled by every peer that reaches it. An unmodeled command usually panics the peer task, and the operation then fails with an unrelated-looking timeout, stale-reference or browser-failure. When a capture-path command is added, grep the native test peers for the method name and for the operation script they assert, not only the module the change targets.

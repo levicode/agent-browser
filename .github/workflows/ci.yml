@@ -7,6 +7,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The native test binaries drive deep async state machines through the real
+# dispatcher, and libtest spawns every test on a thread that inherits std's
+# 2 MiB default stack. That budget is not portable: Windows x64 frames are
+# larger, and the ignored dense-DOM observation fixture exceeds it everywhere.
+# Export the stack size the suite is developed against (see
+# cli/docs/native-default-gate.md) instead of skipping or weakening any test.
+env:
+  RUST_MIN_STACK: "33554432"
+
 jobs:
   version-sync:
     name: Version Sync Check
