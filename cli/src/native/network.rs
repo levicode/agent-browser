@@ -200,20 +200,33 @@ async fn install_domain_filter_runtime_script(
     }
 
     let script = domain_filter_script(allowed_domains);
-    let evaluation = match client
-        .send_command(
-            "Runtime.evaluate",
-            Some(json!({ "expression": &script })),
-            Some(session_id),
-        )
-        .await
-    {
+    let params = json!({ "expression": &script });
+    // An auto-attached target is paused before its first document, so it has
+    // no context to patch; the new-document script above covers the document
+    // it loads once resumed. Older Chrome answered that read with the explicit
+    // error the match below tolerates. Current Chrome never answers it, so the
+    // paused target waits only briefly before treating silence as "no context
+    // yet" instead of blocking installation until the generic CDP deadline. A
+    // real error still fails closed.
+    let evaluation = match if paused_before_document {
+        client
+            .send_command_until(
+                "Runtime.evaluate",
+                Some(params),
+                Some(session_id),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+    } else {
+        client
+            .send_command("Runtime.evaluate", Some(params), Some(session_id))
+            .await
+    } {
         Ok(evaluation) => evaluation,
-        // An auto-attached target is paused before its first document, so it
-        // has no context to patch; the new-document script above covers it.
         Err(error)
             if paused_before_document
-                && error.contains("Cannot find default execution context") =>
+                && (error.contains("Cannot find default execution context")
+                    || error.contains("CDP command timed out")) =>
         {
             return Ok(())
         }
