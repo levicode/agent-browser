@@ -5544,7 +5544,10 @@ mod tests {
     #[test]
     fn screenshot_witness_is_disabled_for_opt_out_nontrace_and_success() {
         let op = operation();
-        assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &op, false).is_none());
+        // 28a28944 made every observe/trace report a bounded phase map, so the
+        // witness exists regardless of the diagnostic sink. Only the sink is
+        // opt-in; a request that is not a trace or observation never gets one.
+        assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &op, false).is_some());
         let pixels = DispatchRequest::Screenshot(ScreenshotRequest {
             secure_field_selector: "input[type=password]".into(),
             purpose: ScreenshotPurpose::PixelsOnly,
@@ -5556,7 +5559,7 @@ mod tests {
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
         });
-        assert!(ScreenshotFailureWitness::new(&observe, &op, false).is_none());
+        assert!(ScreenshotFailureWitness::new(&observe, &op, false).is_some());
         assert!(ScreenshotFailureWitness::new(&observe, &op, true).is_some());
         let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &op, true).unwrap();
         assert!(witness
@@ -5590,21 +5593,26 @@ mod tests {
             secure_field_selector: "input[type=password]".into(),
         });
         let operation = operation();
-        assert!(ScreenshotFailureWitness::new(&request, &operation, false).is_none());
-        let witness = ScreenshotFailureWitness::new(&request, &operation, true).unwrap();
-        witness.enter(ScreenshotStage::Geometry);
-        witness.failure(&ProtocolError::DeadlineExceeded);
-        witness.enter(ScreenshotStage::Restoration);
-        witness.failure(&ProtocolError::CleanupFailed);
-        let failure = witness
-            .take_failure(|| panic!("no inventory read for absent baseline"))
-            .unwrap();
-        assert_eq!(failure.stage, ScreenshotStage::Geometry);
-        assert_eq!(failure.capture_phase, ScreenshotCapturePhase::NotEntered);
-        assert_eq!(failure.error, ProtocolError::DeadlineExceeded);
-        assert!(witness
-            .take_failure(|| panic!("only one refusal"))
-            .is_none());
+        // 28a28944: every observation reports phase timings, so the witness is
+        // constructed without the diagnostic sink. The sink stays opt-in; the
+        // first-refusal retention below must be identical either way.
+        for enabled in [false, true] {
+            let witness = ScreenshotFailureWitness::new(&request, &operation, enabled)
+                .expect("every observation reports phases");
+            witness.enter(ScreenshotStage::Geometry);
+            witness.failure(&ProtocolError::DeadlineExceeded);
+            witness.enter(ScreenshotStage::Restoration);
+            witness.failure(&ProtocolError::CleanupFailed);
+            let failure = witness
+                .take_failure(|| panic!("no inventory read for absent baseline"))
+                .unwrap();
+            assert_eq!(failure.stage, ScreenshotStage::Geometry);
+            assert_eq!(failure.capture_phase, ScreenshotCapturePhase::NotEntered);
+            assert_eq!(failure.error, ProtocolError::DeadlineExceeded);
+            assert!(witness
+                .take_failure(|| panic!("only one refusal"))
+                .is_none());
+        }
     }
 
     #[test]
@@ -5731,7 +5739,13 @@ mod tests {
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
         });
-        assert!(ScreenshotFailureWitness::new(&trace, &operation(), false).is_none());
+        // 28a28944: the phase witness exists without the diagnostic sink. A
+        // successful trace still records no failure and samples no inventory.
+        let opt_out = ScreenshotFailureWitness::new(&trace, &operation(), false)
+            .expect("every trace reports phases");
+        assert!(opt_out
+            .take_failure(|| panic!("success must not sample inventory"))
+            .is_none());
         let success = ScreenshotFailureWitness::new(&trace, &operation(), true).unwrap();
         assert!(success
             .take_failure(|| panic!("success must not sample inventory"))
@@ -8269,7 +8283,13 @@ mod tests {
     }
     #[test]
     fn observe_initial_second_sample_is_distinct_and_diagnostics_stay_opt_in() {
-        assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), false).is_none());
+        // 28a28944: every trace/observe reports phases, so the witness exists
+        // without the diagnostic sink; only the sink is opt-in.
+        let opt_out = ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), false)
+            .expect("every trace reports phases");
+        assert!(opt_out
+            .take_failure(|| panic!("no refusal was recorded"))
+            .is_none());
         let witness =
             ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
         witness.initial_sample(1);

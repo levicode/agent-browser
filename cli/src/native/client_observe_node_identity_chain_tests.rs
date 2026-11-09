@@ -559,12 +559,17 @@ async fn frozen_input_layered_malformed_envelopes_and_document_negative_do_not_m
 async fn frozen_input_layered_concurrent_backend_refusal_dominates_positive_node_negative() {
     let fixture = fixture(ReplyCase::ConcurrentHard, false).await;
     let failure = project(&fixture).await;
-    assert!(matches!(failure.error, GeometryError::CleanupFailed { .. }));
+    // 9075ccdc keeps a readonly group's resolver refusal as a stale identity:
+    // the group's own disposal still owns cleanup, so a concurrent browser
+    // refusal is not a lost cleanup proof. The refusal still wins over the
+    // positive node, and nothing was dispatched.
+    assert_eq!(failure.error, GeometryError::StaleIdentity);
     assert!(failure.negatives.is_empty());
     assert_eq!(failure.origin, NodeGeometryOrigin::MixedHard);
     let (outcome, dirty) = settle(classify(&fixture, failure).await);
-    assert!(dirty);
-    assert_eq!(outcome.effects, Effects::Unknown);
+    assert!(!dirty);
+    assert_eq!(outcome.effects, Effects::NotDispatched);
+    assert_eq!(outcome.result, Err(ProtocolError::StaleScope));
     close(fixture).await;
 }
 #[tokio::test]
