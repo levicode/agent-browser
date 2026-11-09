@@ -6,6 +6,15 @@ use super::*;
 use base64::Engine;
 use futures_util::SinkExt;
 
+/// Test-side scheduler-jitter budget for the optional acceptance cut.
+/// Production reserves 3 ms for the timer's rounding plus publication; on a
+/// loaded host the cutoff timer can nevertheless wake 0.1-4 ms after that cut
+/// (see the `native-optional-mask-timing` diagnostics). This module widens only
+/// the test cut to 12 ms, three times the observed worst-case lateness and
+/// still below the 80 ms cases' existing `deadline / 5` = 16 ms earliest-result
+/// floor, so neither an assertion nor a production deadline changes.
+const OPTIONAL_CUTOFF_HEADROOM: Duration = Duration::from_millis(12);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {
     OptionalDeadline,
@@ -234,6 +243,7 @@ async fn optional_mask_retirement(case: Case) {
     let owner = Owner::new(client, "session", "target", "scope").await;
     let refs = Arc::new(Mutex::new(RefMap::new()));
     let dispatch = ObservationDispatch::new(refs.clone());
+    dispatch.set_optional_observe_headroom_for_test(OPTIONAL_CUTOFF_HEADROOM);
     let (mut op, cancel) = operation(1);
     // Preserve the original 80ms deadline for the value-only mask boundary.
     // Keep separate generous-budget cases and paired 80ms resource/dirty
