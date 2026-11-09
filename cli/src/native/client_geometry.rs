@@ -13,6 +13,19 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+/// A local cleanup-lane wait only stops on the operation's own cancellation,
+/// deadline or scope retirement. None of those is evidence that a node moved,
+/// so the geometry read keeps its existing stop classification.
+fn geometry_wait_error(error: super::client_protocol::ProtocolError) -> GeometryError {
+    use super::client_protocol::ProtocolError;
+    match error {
+        ProtocolError::Cancelled => GeometryError::Cancelled,
+        ProtocolError::DeadlineExceeded => GeometryError::DeadlineExceeded,
+        ProtocolError::StaleScope => GeometryError::StaleIdentity,
+        _ => GeometryError::BackendFailure,
+    }
+}
+
 const MAX_FRAMES: usize = 256;
 const MAX_POLYGON_POINTS: usize = 2048;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1767,16 +1780,7 @@ async fn read_exact_box_with_evidence(
             ledger
                 .wait_cleanup_object_capacity(operation)
                 .await
-                .map_err(|error| match error {
-                    super::client_protocol::ProtocolError::Cancelled => GeometryError::Cancelled,
-                    super::client_protocol::ProtocolError::DeadlineExceeded => {
-                        GeometryError::DeadlineExceeded
-                    }
-                    super::client_protocol::ProtocolError::StaleScope => {
-                        GeometryError::StaleIdentity
-                    }
-                    _ => GeometryError::BackendFailure,
-                })?;
+                .map_err(geometry_wait_error)?;
         }
         // A group, not a textual objectId, owns this complete readonly read.
         // Never reuse its name while an earlier release is queued or unacked.
@@ -1798,14 +1802,30 @@ async fn read_exact_box_with_evidence(
                 ),
             ))
             .await;
-        if super::client_actions::release_captured_readonly_group_accounted(
+        // The read is complete, but its readonly group is still owned by the
+        // ledger. Promise this lane one cleanup slot before reserving its
+        // release: without the promise, concurrent lanes can pass the wait and
+        // over-subscribe the pool, and the refused reservation would be
+        // reported as a lost cleanup proof even though the group is retained.
+        // The wait uses the operation's own budget and retries no command.
+        let permit = match client.debt_ledger() {
+            Some(ledger) => Some(
+                ledger
+                    .acquire_cleanup_release_permit(operation)
+                    .await
+                    .map_err(geometry_wait_error)?,
+            ),
+            None => None,
+        };
+        let released = super::client_actions::release_captured_readonly_group_accounted(
             client,
             &binding.session,
             &group,
             &capture,
         )
-        .await
-        {
+        .await;
+        drop(permit);
+        if released {
             return result;
         }
         return Err(GeometryError::CleanupFailed {

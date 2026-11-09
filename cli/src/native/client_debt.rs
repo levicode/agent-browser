@@ -1188,6 +1188,10 @@ struct LedgerState {
     targets: HashMap<String, String>,
     counts: [usize; 11],
     bytes: [usize; 11],
+    // Cleanup-object slots promised to lanes that have passed the release wait
+    // but have not reserved their release command yet. Counted with `counts` so
+    // concurrent admission cannot over-subscribe the pool.
+    cleanup_release_permits: usize,
     object_bytes: usize,
     journal_bytes: usize,
     integrity_lost: bool,
@@ -1238,6 +1242,28 @@ impl LedgerState {
             && self.realms.is_empty()
             && self.created_targets.is_empty()
             && self.recording_targets.is_empty()
+    }
+}
+/// One cleanup-object command slot promised to a lane whose readonly group
+/// release has not been reserved yet. The ledger counts it with the command
+/// pool, so a lane admitted by `acquire_cleanup_release_permit` can always
+/// reserve its release even while the pool is otherwise full. The permit is
+/// dropped after that reservation (or when the lane gives up), which wakes the
+/// next lane waiting for a slot.
+pub(crate) struct CleanupReleasePermit {
+    ledger: Arc<OwnerDebtLedger>,
+    released: bool,
+}
+impl Drop for CleanupReleasePermit {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        if let Ok(mut state) = self.ledger.state.lock() {
+            state.cleanup_release_permits = state.cleanup_release_permits.saturating_sub(1);
+        }
+        self.ledger.changed.notify_waiters();
     }
 }
 struct CommandAdmissionContext<'a> {
@@ -2773,10 +2799,62 @@ impl OwnerDebtLedger {
                 if state.retired || state.integrity_lost {
                     return Err(ProtocolError::ScopeUnavailable);
                 }
-                if state.counts[index] + RESERVED_COMMANDS <= maximum_count
+                if state.counts[index] + state.cleanup_release_permits + RESERVED_COMMANDS
+                    <= maximum_count
                     && state.bytes[index] + RESERVED_BYTES <= maximum_bytes
                 {
                     return Ok(());
+                }
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
+                _ = &mut changed => {},
+            }
+        }
+    }
+    /// Reserve one cleanup-object slot for a release that has not been sent yet.
+    /// The permit is counted by the ledger, so concurrent lanes cannot
+    /// over-subscribe the pool between the admission wait and the reservation;
+    /// the slot is released when the permit drops, after the caller's release
+    /// command has been reserved. One permit per lane lets lanes proceed as
+    /// individual commands are acknowledged, instead of requiring a whole
+    /// fan-out's worth of free slots at once. No timeout is extended and no
+    /// browser command is retried.
+    pub(crate) async fn acquire_cleanup_release_permit(
+        self: &Arc<Self>,
+        operation: &OperationLease,
+    ) -> Result<CleanupReleasePermit, ProtocolError> {
+        let index = CommandCategory::CleanupObject.index();
+        let (maximum_count, _) = CommandCategory::CleanupObject.limits();
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
+            }
+            if Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if operation.generation != self.generation {
+                return Err(ProtocolError::StaleScope);
+            }
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.retired || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if state.counts[index] + state.cleanup_release_permits < maximum_count {
+                    state.cleanup_release_permits += 1;
+                    return Ok(CleanupReleasePermit {
+                        ledger: self.clone(),
+                        released: false,
+                    });
                 }
             }
             tokio::select! { biased;
@@ -6223,6 +6301,59 @@ pub(crate) mod tests {
             ledger.wait_cleanup_object_capacity(&operation).await,
             Err(ProtocolError::DeadlineExceeded)
         );
+    }
+
+    /// A readonly geometry lane learns that its release will fit before it
+    /// reserves it. The permit counts with the pool, so N lanes cannot promise
+    /// themselves more releases than the pool can hold, and a lane proceeds as
+    /// soon as one command is acknowledged instead of waiting for a whole
+    /// fan-out's worth of free slots.
+    #[tokio::test]
+    async fn cleanup_release_permits_admit_lanes_as_slots_free_without_oversubscribing() {
+        let (ledger, _journal) = owner();
+        let index = CommandCategory::CleanupObject.index();
+        let (_cancel, operation) = admission_operation(10_000);
+        {
+            let mut state = ledger.state.lock().unwrap();
+            state.counts[index] = 30;
+        }
+        let first = ledger
+            .acquire_cleanup_release_permit(&operation)
+            .await
+            .unwrap();
+        let second = ledger
+            .acquire_cleanup_release_permit(&operation)
+            .await
+            .unwrap();
+        let mut third = Box::pin(ledger.acquire_cleanup_release_permit(&operation));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), third.as_mut())
+                .await
+                .is_err(),
+            "30 commands plus two permits fill the 32-command pool"
+        );
+        {
+            let mut state = ledger.state.lock().unwrap();
+            state.counts[index] = 29;
+            assert_eq!(state.cleanup_release_permits, 2);
+        }
+        ledger.changed.notify_waiters();
+        let third = tokio::time::timeout(std::time::Duration::from_millis(100), third)
+            .await
+            .expect("one acknowledged release admits the next lane")
+            .unwrap();
+        {
+            let state = ledger.state.lock().unwrap();
+            assert_eq!(state.counts[index] + state.cleanup_release_permits, 32);
+        }
+        drop(first);
+        {
+            let state = ledger.state.lock().unwrap();
+            assert_eq!(state.cleanup_release_permits, 2);
+        }
+        drop(second);
+        drop(third);
+        assert_eq!(ledger.state.lock().unwrap().cleanup_release_permits, 0);
     }
 
     #[test]
