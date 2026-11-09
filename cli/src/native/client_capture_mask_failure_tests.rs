@@ -245,6 +245,24 @@ impl MaskFailurePeer {
                         }
                         json!({})
                     }
+                    "Runtime.evaluate" => {
+                        // ab#69's display:none pre-filter: one isolated-world
+                        // walk per observed frame, outside every object group
+                        // and before the metadata batch. The fixture's document
+                        // has no html element for the child-path mapping, so an
+                        // empty walk prunes nothing.
+                        assert!(semantic, "the display probe belongs to the semantic read");
+                        assert!(request["params"].get("objectGroup").is_none());
+                        assert_eq!(request["params"]["contextId"], 1);
+                        assert_eq!(request["params"]["returnByValue"].as_bool(), Some(true));
+                        assert_eq!(request["params"]["awaitPromise"].as_bool(), Some(false));
+                        let expression = request["params"]["expression"].as_str().unwrap();
+                        assert!(
+                            expression.contains("getComputedStyle(child).display === 'none'"),
+                            "unexpected evaluated expression: {expression}"
+                        );
+                        json!({"result":{"value":[]}})
+                    }
                     "DOMSnapshot.captureSnapshot" => {
                         assert!(stabilized);
                         json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[1],"backendNodeId":[7]}}]})
@@ -310,9 +328,14 @@ impl MaskFailurePeer {
             assert!(!log
                 .iter()
                 .any(|request| request["method"] == "Page.captureScreenshot"));
-            assert!(!log
-                .iter()
-                .any(|request| request["method"] == "Runtime.evaluate"));
+            // ab#69's display:none pre-filter is a group-less Runtime.evaluate
+            // in the semantic read. The source-mask holder, which must not be
+            // installed here, is the only grouped evaluate; the next assertion
+            // still proves it never ran.
+            assert!(!log.iter().any(|request| {
+                request["method"] == "Runtime.evaluate"
+                    && request["params"].get("objectGroup").is_some()
+            }));
             assert!(!log.iter().any(|request| request["params"]["objectGroup"]
                 .as_str()
                 .is_some_and(|group| group.starts_with("capture-source-"))));

@@ -7535,6 +7535,21 @@ mod tests {
                             json!({"result":{"value":true}})
                         }
                     }
+                    "Runtime.evaluate" => {
+                        // ab#69's display:none pre-filter: one isolated-world
+                        // walk per observed frame, outside every object group.
+                        // The fixture document has no html element for the
+                        // child-path mapping, so an empty walk prunes nothing.
+                        assert_eq!(request["params"]["contextId"], 1);
+                        assert_eq!(request["params"]["returnByValue"].as_bool(), Some(true));
+                        assert_eq!(request["params"]["awaitPromise"].as_bool(), Some(false));
+                        let expression = request["params"]["expression"].as_str().unwrap();
+                        assert!(
+                            expression.contains("getComputedStyle(child).display === 'none'"),
+                            "unexpected evaluated expression: {expression}"
+                        );
+                        json!({"result":{"value":[]}})
+                    }
                     "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
                     method => panic!("unexpected zero-area dispatch command: {method}"),
                 };
@@ -7693,6 +7708,21 @@ mod tests {
                         } else {
                             json!({"result":{"value":true}})
                         }
+                    }
+                    "Runtime.evaluate" => {
+                        // ab#69's display:none pre-filter: one isolated-world
+                        // walk per observed frame, outside every object group.
+                        // The fixture document has no html element for the
+                        // child-path mapping, so an empty walk prunes nothing.
+                        assert_eq!(request["params"]["contextId"], 1);
+                        assert_eq!(request["params"]["returnByValue"].as_bool(), Some(true));
+                        assert_eq!(request["params"]["awaitPromise"].as_bool(), Some(false));
+                        let expression = request["params"]["expression"].as_str().unwrap();
+                        assert!(
+                            expression.contains("getComputedStyle(child).display === 'none'"),
+                            "unexpected evaluated expression: {expression}"
+                        );
+                        json!({"result":{"value":[]}})
                     }
                     "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
                     method => panic!("unexpected zero-area dispatch command: {method}"),
