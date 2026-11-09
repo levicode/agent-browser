@@ -3050,10 +3050,22 @@ mod tests {
                     .unwrap_err(),
                 GeometryError::StaleIdentity
             );
+            // ef4ec9b7c makes `excluded` the proven-omission set (policy,
+            // budget, hidden and opaque plugin frames), so a child listed there
+            // is a legitimate omission. Prove the completeness check with no
+            // proven omissions instead of relying on the old ignore-the-set
+            // semantics.
             assert_eq!(
-                read_proofs(&client, "page", &inputs[..1], &excluded, None, &operation)
-                    .await
-                    .unwrap_err(),
+                read_proofs(
+                    &client,
+                    "page",
+                    &inputs[..1],
+                    &HashSet::new(),
+                    None,
+                    &operation
+                )
+                .await
+                .unwrap_err(),
                 GeometryError::IncompleteInventory
             );
             assert!(

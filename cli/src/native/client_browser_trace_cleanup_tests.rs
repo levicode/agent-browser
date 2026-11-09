@@ -476,7 +476,18 @@ async fn run(case: Case) {
         assert!(end.is_err());
         assert!(cleanup.is_err());
         assert_eq!(result["ok"], false);
-        assert_eq!(result["error"]["code"], "cleanup-failed");
+        // 566bc81d8 records a trace's dirty settlement as stale-reference
+        // before the retained dirty decision. Only the restore-rejection case
+        // passes through that trace-local settlement; the never-terminal case
+        // still reports its original cleanup failure.
+        assert_eq!(
+            result["error"]["code"],
+            if case == Case::RestoreRejected {
+                "stale-reference"
+            } else {
+                "cleanup-failed"
+            }
+        );
         assert_eq!(result["effects"], "unknown");
         assert_ne!(result["scopeState"], "usable");
         let owner = browser.owner.lock().await;
@@ -576,7 +587,7 @@ async fn run(case: Case) {
                 "negative control must first receive a successful protected capture"
             );
             assert_eq!(
-                result["error"]["code"], "cleanup-failed",
+                result["error"]["code"], "stale-reference",
                 "negative control must fail specifically during restoration"
             );
             assert_eq!(result["ok"], false);

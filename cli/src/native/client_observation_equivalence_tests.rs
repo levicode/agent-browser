@@ -1299,7 +1299,10 @@ async fn metadata_acquisition_error_drains_started_sibling_before_group_release(
         None,
     )
     .await;
-    assert_eq!(result.unwrap_err(), ObservationError::BackendFailure);
+    // a3ea20564: an unresolvable observation node is a stale reference to the
+    // screen the caller read, not a backend failure. Sibling draining below is
+    // unchanged.
+    assert_eq!(result.unwrap_err(), ObservationError::StaleReference);
     server.await.unwrap();
 }
 

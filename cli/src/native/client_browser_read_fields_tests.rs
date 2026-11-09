@@ -310,7 +310,9 @@ fn application_reply(
             );
             // Nonempty positive data matters: a test that always samples []
             // cannot distinguish refusal from an accidentally empty success.
-            json!({"result":{"value":{"values":[{"value":"London","attributes":{},"labels":[],"states":{"secure":false}}]}}})
+            // 7d002e9c2 added the required safePublicNameFromContent proof to
+            // every metadata row; projection rejects a row without it.
+            json!({"result":{"value":{"values":[{"value":"London","attributes":{},"labels":[],"states":{"secure":false},"safePublicNameFromContent":false}]}}})
         }
         method => panic!("unexpected application read: {method}"),
     }
@@ -805,7 +807,10 @@ async fn public_read_fields_foreign_inventory_acks_never_publish_values_or_refs(
             },
             "an eventual original deadline is not the authority refusal"
         );
-        assert_eq!(value["effects"], "unknown");
+        // 0bc39f2b0 settles a read-only dispatch whose cleanup proof was lost
+        // as a retryable non-dispatch; the lost proof still quarantines the
+        // scope through the dirty decision.
+        assert_eq!(value["effects"], "not-dispatched");
         assert_eq!(value["scopeState"], "quarantined");
         let snapshot = ledger.snapshot();
         assert!(
