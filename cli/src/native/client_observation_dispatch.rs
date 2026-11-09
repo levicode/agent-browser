@@ -1761,6 +1761,7 @@ impl ObservationDispatch {
             screenshot,
             true,
             None,
+            UnpartitionedInventory::WaitForEnrollment,
             #[cfg(test)]
             initial_probe.as_ref(),
         )
@@ -1808,6 +1809,7 @@ impl ObservationDispatch {
             screenshot,
             true,
             None,
+            UnpartitionedInventory::WaitForEnrollment,
             #[cfg(test)]
             initial_probe.as_ref(),
         )
@@ -3660,6 +3662,7 @@ async fn verified_semantic_frames_with_cleanup(
         screenshot,
         true,
         None,
+        UnpartitionedInventory::WaitForEnrollment,
         #[cfg(test)]
         None,
     )
@@ -3841,6 +3844,7 @@ async fn frame_inventory_attempt(
         screenshot,
         false,
         None,
+        UnpartitionedInventory::WaitForEnrollment,
         #[cfg(test)]
         None,
     )
@@ -4048,6 +4052,13 @@ pub(crate) async fn warm_query_worlds_for_test(
 ) -> Result<(), ProtocolError> {
     prepare_query_worlds(page, operation, partition, ui, true).await
 }
+/// Frame inventory for a query dispatch. A partitioned query reads exactly the
+/// admission proof's targets. The unpartitioned fallback has no page-query
+/// authority, so it takes the immediate completeness list and fails closed
+/// while the registry is incomplete: waiting on registry-global enrollment
+/// here would let an unrelated popup's held initializer block a read of this
+/// page. The #72 enrollment wait stays with observation, trace, fixed reads and
+/// the protected-read barrier.
 async fn query_frames(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
@@ -4062,6 +4073,7 @@ async fn query_frames(
         screenshot,
         false,
         partition,
+        UnpartitionedInventory::Immediate,
         #[cfg(test)]
         None,
     )
@@ -4217,6 +4229,18 @@ enum FrameInventoryAttempt {
         error: ProtocolError,
     },
 }
+/// How an unpartitioned frame inventory takes its target list. A partitioned
+/// query reads exactly the admission proof's targets and ignores this mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnpartitionedInventory {
+    /// A protected read waits for the page's own enrollment, so a target the
+    /// page creates during the read cannot turn a readable scope into an
+    /// unavailable one (#72).
+    WaitForEnrollment,
+    /// A query with no page-query authority keeps the immediate completeness
+    /// list: an incomplete registry is an unavailable scope, not readiness.
+    Immediate,
+}
 async fn frame_inventory_attempt_impl(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
@@ -4224,6 +4248,7 @@ async fn frame_inventory_attempt_impl(
     screenshot: Option<&ScreenshotFailureWitness>,
     readonly_disposal: bool,
     partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+    unpartitioned: UnpartitionedInventory,
     #[cfg(test)] initial_probe: Option<
         &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
     >,
@@ -4235,6 +4260,7 @@ async fn frame_inventory_attempt_impl(
         screenshot,
         readonly_disposal,
         partition,
+        unpartitioned,
         #[cfg(test)]
         initial_probe,
     )
@@ -4268,6 +4294,7 @@ async fn frame_inventory_attempt_once(
     screenshot: Option<&ScreenshotFailureWitness>,
     readonly_disposal: bool,
     partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+    unpartitioned: UnpartitionedInventory,
     #[cfg(test)] initial_probe: Option<
         &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
     >,
@@ -4279,9 +4306,20 @@ async fn frame_inventory_attempt_once(
             .await?;
         (0, partition.targets().to_vec(), None)
     } else {
-        page.targets
-            .wait_read_inventory(operation, screenshot.is_some())
-            .await?
+        match unpartitioned {
+            UnpartitionedInventory::WaitForEnrollment => {
+                page.targets
+                    .wait_read_inventory(operation, screenshot.is_some())
+                    .await?
+            }
+            // The unpartitioned query fallback has no admission proof to
+            // attribute a wait to, so an incomplete registry is unavailable
+            // rather than readiness: a registry-global wait would block on an
+            // unrelated popup's held initializer.
+            UnpartitionedInventory::Immediate => page
+                .targets
+                .inventory_with_diagnostic(screenshot.is_some())?,
+        }
     };
     #[cfg(test)]
     if let Some(probe) = initial_probe {
