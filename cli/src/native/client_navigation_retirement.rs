@@ -415,6 +415,7 @@ pub(super) async fn trigger(
     retirement: Option<(&RetainedTasks, &mut Option<NavigationInterruptionProof>)>,
     acknowledged: &mut Option<AcknowledgedNavigation>,
     committed: &mut bool,
+    submitted: &mut bool,
 ) -> Result<Value, ProtocolError> {
     let Some((tasks, receipt)) = retirement else {
         return command(page, operation, Some(&page.page_session_id), method, args).await;
@@ -486,6 +487,9 @@ pub(super) async fn trigger(
             match checked {
                 Ok(()) => {
                     let response = value.map_err(|_| ProtocolError::BrowserFailure)?;
+                    // A returned original response proves this exact command
+                    // reached the transport, whatever its ACK class.
+                    *submitted = true;
                     if status.snapshot() == CommandStatus::Acknowledged && !status.is_error_ack() {
                         *acknowledged = AcknowledgedBoundary::from_ack(
                             &response, &page.page_session_id, frame, previous_loader,
@@ -524,10 +528,14 @@ pub(super) async fn trigger(
     };
     // Reserved/abandoned work never grants stop authority. A submitted command
     // remains owned by the exact CDP reader even if this waiter later expires.
-    if !matches!(
+    // The caller needs this exact distinction: an interrupted command that was
+    // never submitted cannot have committed an application effect.
+    let was_submitted = matches!(
         status.snapshot(),
         CommandStatus::Submitted | CommandStatus::Acknowledged
-    ) {
+    );
+    *submitted = was_submitted;
+    if !was_submitted {
         return Err(reason);
     }
     let key = journal.key();

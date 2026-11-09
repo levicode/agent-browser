@@ -690,7 +690,7 @@ impl PageActivation {
             .activation_diagnostic("ensure-navigation", None, "entered", None, None);
         let arguments = serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"});
         let navigation = if let Some((tasks, receipt)) = retirement {
-            let (result, proof, committed) = self
+            let (result, proof, committed, _submitted) = self
                 .page_state
                 .execute_with_retirement(
                     page,
@@ -2609,6 +2609,23 @@ fn command_is_fixed_read(command: &str) -> bool {
         command,
         "page.title" | "page.url" | "session.environment" | "context.cookies.get"
     )
+}
+
+/// A caller cancellation of the requested navigation before its exact CDP
+/// command was submitted cannot have committed an application effect. The
+/// activation prefix and session setup are not this command's dispatch, so the
+/// generic `dispatched` flag alone would otherwise report `Unknown`.
+fn navigation_cancelled_before_submit(
+    command: &str,
+    submitted: bool,
+    result: &Result<serde_json::Value, ProtocolError>,
+) -> bool {
+    command == "page.navigate"
+        && !submitted
+        && matches!(
+            result,
+            Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+        )
 }
 
 /// Commands that only read application state: no input, DOM or browser
@@ -4835,6 +4852,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let mut request_dispatched = false;
                 let mut activation_completed = false;
                 let mut navigation_committed = false;
+                let mut navigation_submitted = false;
                 let mut navigation_interruption = None;
                 let result = async {
                         if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
@@ -5024,14 +5042,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             if command == "context.media" {
                                 (page_state.execute_media_with_owner(
                                     &page, &lease, &arguments, &enrollment, &attachments,
-                                ).await, None, false)
+                                ).await, None, false, false)
                             } else {
                                 page_state.execute_with_retirement(
                                     &page, &sessions, &lease, &command, &arguments, &dispatch_tasks,
                                 ).await
                             }
                         };
-                        let (output, interruption, committed) = if let Some(grant) = eval_grant {
+                        let (output, interruption, committed, submitted) = if let Some(grant) = eval_grant {
                             super::client_debt::eval_command_scope(grant, execution).await
                         } else { execution.await };
                         // One oversized evaluation result must never end the
@@ -5046,6 +5064,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             )
                         } else { output };
                         navigation_committed = committed;
+                        navigation_submitted = submitted;
                         navigation_interruption = interruption.map(NavigationInterruption::Requested);
                         if navigation.is_some() {
                             let flushed = enrollment.flush_app_events(&page, &lease).await;
@@ -5073,6 +5092,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         result,
                         Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
                     );
+                // The requested navigation was interrupted before its CDP
+                // command was submitted: no application effect can have been
+                // committed even though the generic dispatch flag is set.
+                let unsubmitted_navigation =
+                    navigation_cancelled_before_submit(&command, navigation_submitted, &result);
                 let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
                     Effects::NotDispatched
                 } else if navigation_settled
@@ -5084,6 +5108,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         ))
                 {
                     Effects::Completed
+                } else if unsubmitted_navigation {
+                    Effects::NotDispatched
                 } else if expired || (result.is_err() && mutating) {
                     // An interrupted read has no mutation to be uncertain
                     // about: a command that cannot commit input or browser
@@ -6694,6 +6720,46 @@ mod tests {
                 purpose: ScreenshotPurpose::PixelsOnly,
             }
         )));
+    }
+
+    #[test]
+    fn navigation_cancelled_before_submit_is_never_possibly_committed() {
+        let cancelled: Result<serde_json::Value, ProtocolError> = Err(ProtocolError::Cancelled);
+        let deadline: Result<serde_json::Value, ProtocolError> =
+            Err(ProtocolError::DeadlineExceeded);
+        assert!(navigation_cancelled_before_submit(
+            "page.navigate",
+            false,
+            &cancelled
+        ));
+        assert!(navigation_cancelled_before_submit(
+            "page.navigate",
+            false,
+            &deadline
+        ));
+        // A submitted navigation remains ambiguous until its own stop proof
+        // settles it; this fallback must never claim no dispatch there.
+        assert!(!navigation_cancelled_before_submit(
+            "page.navigate",
+            true,
+            &cancelled
+        ));
+        // Other navigation commands do not carry the submitted receipt.
+        assert!(!navigation_cancelled_before_submit(
+            "page.reload",
+            false,
+            &cancelled
+        ));
+        assert!(!navigation_cancelled_before_submit(
+            "page.navigate",
+            false,
+            &Err(ProtocolError::BrowserFailure)
+        ));
+        assert!(!navigation_cancelled_before_submit(
+            "page.navigate",
+            false,
+            &Ok(serde_json::json!(null))
+        ));
     }
 
     #[test]

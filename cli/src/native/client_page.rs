@@ -1286,16 +1286,19 @@ impl ClientPageState {
         Result<Value, ProtocolError>,
         Option<NavigationInterruptionProof>,
         bool,
+        bool,
     ) {
         if name != "page.navigate" {
             return (
                 self.execute(page, sessions, op, name, args).await,
                 None,
                 false,
+                false,
             );
         }
         let mut proof = None;
         let mut committed = false;
+        let mut submitted = false;
         let result = async {
             self.validate(page, op)?;
             let a = decode_navigation(args)?;
@@ -1307,12 +1310,13 @@ impl ClientPageState {
                 &a.wait_until,
                 Some((tasks, &mut proof)),
                 &mut committed,
+                &mut submitted,
             )
             .await?;
             Ok(Value::Null)
         }
         .await;
-        (result, proof, committed)
+        (result, proof, committed, submitted)
     }
     /// The native dispatcher supplies only sessions proven owned by context_id.
     pub async fn execute(
@@ -1372,6 +1376,7 @@ impl ClientPageState {
             "page.navigate" => {
                 let a = decode_navigation(args)?;
                 let mut committed = false;
+                let mut submitted = false;
                 self.navigate(
                     page,
                     op,
@@ -1380,6 +1385,7 @@ impl ClientPageState {
                     &a.wait_until,
                     None,
                     &mut committed,
+                    &mut submitted,
                 )
                 .await?;
                 Ok(Value::Null)
@@ -1387,6 +1393,7 @@ impl ClientPageState {
             "page.reload" => {
                 let _: Empty = decode(args)?;
                 let mut committed = false;
+                let mut submitted = false;
                 self.navigate(
                     page,
                     op,
@@ -1395,6 +1402,7 @@ impl ClientPageState {
                     "load",
                     None,
                     &mut committed,
+                    &mut submitted,
                 )
                 .await?;
                 Ok(Value::Null)
@@ -1418,6 +1426,7 @@ impl ClientPageState {
                         .and_then(Value::as_i64)
                         .ok_or(ProtocolError::BrowserFailure)?;
                     let mut committed = false;
+                    let mut submitted = false;
                     self.navigate(
                         page,
                         op,
@@ -1426,6 +1435,7 @@ impl ClientPageState {
                         "load",
                         None,
                         &mut committed,
+                        &mut submitted,
                     )
                     .await?;
                 }
@@ -1552,6 +1562,7 @@ impl ClientPageState {
             &mut Option<NavigationInterruptionProof>,
         )>,
         committed: &mut bool,
+        submitted: &mut bool,
     ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         page.client
@@ -1650,6 +1661,7 @@ impl ClientPageState {
                 .map(|(tasks, receipt)| (*tasks, &mut **receipt)),
             &mut acknowledged,
             committed,
+            submitted,
         )
         .await;
         #[cfg(test)]
