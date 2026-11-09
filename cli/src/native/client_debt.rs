@@ -13,6 +13,15 @@ use std::time::Instant;
 
 pub(crate) const MAX_INPUT_DEBT: u32 = 32;
 pub(crate) const MAX_OBJECT_DEBT: u32 = 32;
+/// One semantic geometry lane creates its own isolated realm, one readonly
+/// object group, one resolved node and up to two pending creation slots, so it
+/// can own this many object-pool entries at once.
+pub(crate) const SEMANTIC_GEOMETRY_LANE_DEBT: usize = 4;
+/// Concurrent semantic geometry lanes a single owner scope admits. The fan-out
+/// is only a concurrency hint: this bound times `SEMANTIC_GEOMETRY_LANE_DEBT`
+/// stays below the object pool, and the rest of the pool stays available to
+/// every other producer in the same scope.
+pub(crate) const SEMANTIC_GEOMETRY_LANES: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct OperationKey {
@@ -1278,6 +1287,10 @@ pub(crate) struct OwnerDebtLedger {
     state: Mutex<LedgerState>,
     eval_preparation_stream: std::sync::OnceLock<super::cdp::client::BoundedEventWatermark>,
     changed: Arc<tokio::sync::Notify>,
+    /// Bounds how many exact semantic reads own the object pool at once; see
+    /// `SEMANTIC_GEOMETRY_LANES`. It is owner-scoped, so concurrent producers
+    /// share the same room instead of each assuming the whole pool.
+    geometry_lanes: tokio::sync::Semaphore,
     pub(crate) cleanup_diagnostics: Arc<super::client_settlement_trace::CleanupDiagnostics>,
 }
 /// Explicit completion is required after publish_bounded returns, before any await.
@@ -2275,6 +2288,7 @@ impl OwnerDebtLedger {
             generation,
             identity_scope,
             changed: Arc::new(tokio::sync::Notify::new()),
+            geometry_lanes: tokio::sync::Semaphore::new(SEMANTIC_GEOMETRY_LANES),
             cleanup_diagnostics: super::client_settlement_trace::CleanupDiagnostics::new(
                 generation,
             ),
@@ -2804,6 +2818,71 @@ impl OwnerDebtLedger {
                     && state.bytes[index] + RESERVED_BYTES <= maximum_bytes
                 {
                     return Ok(());
+                }
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
+                _ = &mut changed => {},
+            }
+        }
+    }
+    /// Read-only semantic geometry reads one exact box per lane, and every lane
+    /// creates its own isolated realm, readonly group, resolved node and pending
+    /// creation slots. That local debt shares the owner's bounded object pool
+    /// with every other producer in the scope. The scope admits only a bounded
+    /// number of lanes at once, and a lane that still finds the pool full waits
+    /// inside the operation's own budget for accounted reads to release. A
+    /// reservation refused here never reached Chromium, but the resolver reports
+    /// it as a backend failure and the readonly box proof turns that into a moved
+    /// identity, which the observation then settles as a stale scope on a
+    /// usable scope. Waiting is local backpressure: no timeout is extended and
+    /// no page evidence is re-read.
+    pub(crate) async fn admit_geometry_lane(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, ProtocolError> {
+        let mut cancellation = operation.cancellation.clone();
+        if let Some(error) = (*cancellation.borrow()).error() {
+            return Err(error);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let permit = tokio::select! { biased;
+            permit = self.geometry_lanes.acquire() => {
+                permit.map_err(|_| ProtocolError::ScopeUnavailable)?
+            },
+            _ = cancellation.changed() => {
+                return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled))
+            },
+            _ = tokio::time::sleep_until(operation.deadline.into()) => {
+                return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded))
+            },
+        };
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
+            }
+            if Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if operation.generation != self.generation {
+                return Err(ProtocolError::StaleScope);
+            }
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.retired || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if object_count(&state) + SEMANTIC_GEOMETRY_LANE_DEBT <= MAX_OBJECT_DEBT as usize {
+                    return Ok(permit);
                 }
             }
             tokio::select! { biased;
@@ -6301,6 +6380,105 @@ pub(crate) mod tests {
             ledger.wait_cleanup_object_capacity(&operation).await,
             Err(ProtocolError::DeadlineExceeded)
         );
+    }
+
+    /// A scope admits only a bounded number of exact geometry lanes, so their
+    /// combined local debt cannot saturate the object pool. A lane still waits
+    /// for room when other producers hold it, and the wait uses the operation's
+    /// own deadline.
+    #[tokio::test]
+    async fn geometry_lane_admission_bounds_concurrent_exact_reads() {
+        let (ledger, _journal) = owner();
+        let (_cancel, operation) = admission_operation(10_000);
+        let mut held = Vec::new();
+        for _ in 0..SEMANTIC_GEOMETRY_LANES {
+            held.push(ledger.admit_geometry_lane(&operation).await.unwrap());
+        }
+        let mut blocked = Box::pin(ledger.admit_geometry_lane(&operation));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), blocked.as_mut())
+                .await
+                .is_err(),
+            "one more lane than the owner admits must wait"
+        );
+        held.pop();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), blocked)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn geometry_lane_admission_waits_for_object_room() {
+        let (ledger, _journal) = owner();
+        let (_cancel, operation) = admission_operation(10_000);
+        hold_test_objects(&ledger, MAX_OBJECT_DEBT as usize - 1);
+        let mut blocked = Box::pin(ledger.admit_geometry_lane(&operation));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), blocked.as_mut())
+                .await
+                .is_err(),
+            "a pool without one lane's room is not admitted"
+        );
+        {
+            let mut state = ledger.state.lock().unwrap();
+            for _ in 0..4 {
+                state.objects.pop();
+            }
+        }
+        ledger.changed.notify_waiters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), blocked)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn geometry_lane_admission_uses_the_operation_deadline() {
+        let (ledger, _journal) = owner();
+        let (_cancel, operation) = admission_operation(10_000);
+        let mut held = Vec::new();
+        for _ in 0..SEMANTIC_GEOMETRY_LANES {
+            held.push(ledger.admit_geometry_lane(&operation).await.unwrap());
+        }
+        let (_cancel, short) = admission_operation(10);
+        assert_eq!(
+            ledger.admit_geometry_lane(&short).await.err(),
+            Some(ProtocolError::DeadlineExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn geometry_lane_admission_never_admits_a_retired_scope() {
+        let (ledger, _journal) = owner();
+        let (_cancel, operation) = admission_operation(10_000);
+        ledger.connection_lost();
+        assert_eq!(
+            ledger.admit_geometry_lane(&operation).await.err(),
+            Some(ProtocolError::ScopeUnavailable)
+        );
+    }
+
+    fn hold_test_objects(ledger: &Arc<OwnerDebtLedger>, count: usize) {
+        let mut state = ledger.state.lock().unwrap();
+        for serial in 0..count as u64 {
+            state.objects.push(ObjectObligation {
+                provenance: Provenance {
+                    operation: None,
+                    target: None,
+                    session: None,
+                    realm: None,
+                },
+                object: Some(format!("held-{serial}")),
+                group: None,
+                serial,
+                footprint: 32,
+            });
+        }
     }
 
     /// A readonly geometry lane learns that its release will fit before it

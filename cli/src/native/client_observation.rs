@@ -47,11 +47,13 @@ mod selector_expression_tests;
 /// Semantic geometry resolves one exact node per task. Every exact resolution
 /// creates its own isolated realm and holds a readonly object group plus the
 /// resolved node until its release is acknowledged, all of it counted by the
-/// owner ledger's bounded object pool. A 16-wide fan-out can therefore refuse
-/// its own next `Page.createIsolatedWorld` with `capacity-exceeded`. That local
-/// admission refusal is backpressure, not evidence that a node or frame moved,
-/// so it must never surface as a stale scope. Keep the fan-out well below the
-/// pool so the geometry read can never saturate its own admission.
+/// owner ledger's bounded object pool. The fan-out is therefore only a
+/// concurrency hint: the owner admits a bounded number of exact lanes
+/// (`admit_geometry_lane`) and keeps the rest of the pool for other producers,
+/// so a wider fan-out can never refuse its own next `Page.createIsolatedWorld`
+/// with `capacity-exceeded`. That local admission refusal is backpressure, not
+/// evidence that a node or frame moved, so it must never surface as a stale
+/// scope, and the lane bound, not this number, enforces the pool limit.
 const SEMANTIC_GEOMETRY_FANOUT: usize = 8;
 
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
@@ -6996,22 +6998,28 @@ pub(crate) async fn project_observe_geometry(
 
 #[cfg(test)]
 mod tests {
-    /// A geometry fan-out at or above the owned-object pool lets a read refuse
-    /// its own admission: the ledger then reports `capacity-exceeded`, the
-    /// readonly resolver maps it to a moved identity, and the observation
-    /// settles as a stale scope on a usable scope. Each lane can own a group,
-    /// a resolved node, a pending creation slot and a queued release, so bound
-    /// the fan-out to a quarter of the pool.
+    /// A lane admitted without room is refused by the reservation before any
+    /// command reaches Chromium; the readonly resolver then reports a backend
+    /// failure, the box proof maps it to a moved identity, and the observation
+    /// settles as a stale scope on a usable scope. The owner therefore admits
+    /// only a bounded number of lanes and keeps the rest of the pool, so the
+    /// exact read can never saturate its own admission.
     #[test]
-    fn semantic_geometry_fanout_cannot_saturate_its_own_object_pool() {
-        let lane_debt = 4;
+    fn semantic_geometry_lane_admission_leaves_object_pool_headroom() {
+        let lane = super::client_debt::SEMANTIC_GEOMETRY_LANE_DEBT;
+        let lanes = super::client_debt::SEMANTIC_GEOMETRY_LANES;
+        let pool = super::client_debt::MAX_OBJECT_DEBT as usize;
+        let headroom = pool - lanes * lane;
         assert!(
-            super::SEMANTIC_GEOMETRY_FANOUT * lane_debt
-                <= super::client_debt::MAX_OBJECT_DEBT as usize,
-            "semantic geometry fan-out {} can own more objects than the ledger pool of {}",
-            super::SEMANTIC_GEOMETRY_FANOUT * lane_debt,
-            super::client_debt::MAX_OBJECT_DEBT,
+            headroom >= lane * 2,
+            "the {headroom}-entry headroom must absorb another producer's lane-sized debt"
         );
+        assert!(
+            lanes * lane < pool,
+            "{lanes} lanes of {lane} must stay strictly below the pool of {pool}"
+        );
+        // The fan-out stays a concurrency hint: the owner's lane bound, not
+        // this number, decides how many exact reads actually run at once.
     }
 
     #[test]
