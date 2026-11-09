@@ -152,10 +152,31 @@ async fn optional_mask_retirement(case: Case) {
                     json!({})
                 }
                 "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
-                "Runtime.evaluate" if screenshot => {
+                "Runtime.evaluate" if group.is_some() => {
+                    // Raw capture installs its page-side source-mask holder in
+                    // the frame's isolated world before any screenshot.
+                    assert!(screenshot, "only raw capture installs a source holder");
                     assert_eq!(group, Some("capture-source-1-frame"));
                     assert_eq!(request["params"]["contextId"], 1);
                     json!({"result":{"objectId":"source-holder"}})
+                }
+                "Runtime.evaluate" => {
+                    // The semantic read's display:none pre-filter (ab#69): one
+                    // isolated-world walk per frame, before any metadata batch
+                    // and outside every object group. This fixture's DOM
+                    // snapshot has no html element for the probe's child path
+                    // mapping, so an empty walk prunes nothing and the tree
+                    // stays exactly as the accessibility read reported it.
+                    assert!(group.is_none());
+                    assert_eq!(request["params"]["contextId"], 1);
+                    assert_eq!(request["params"]["returnByValue"].as_bool(), Some(true));
+                    assert_eq!(request["params"]["awaitPromise"].as_bool(), Some(false));
+                    let expression = request["params"]["expression"].as_str().unwrap();
+                    assert!(
+                        expression.contains("getComputedStyle(child).display === 'none'"),
+                        "unexpected evaluated expression: {expression}"
+                    );
+                    json!({"result":{"value":[]}})
                 }
                 "Page.captureScreenshot" => {
                     assert!(
@@ -618,6 +639,14 @@ async fn optional_mask_retirement(case: Case) {
                     .as_str()
                     .is_some_and(|g| g.starts_with("capture-source-"))));
         }
+        assert_eq!(
+            log.iter()
+                .filter(|r| r["method"] == "Runtime.evaluate"
+                    && r["params"].get("objectGroup").is_none())
+                .count(),
+            1,
+            "one display-none pre-filter probe per observed frame"
+        );
         assert_eq!(
             log.iter()
                 .filter(|r| r["method"] == "Animation.setPlaybackRate"
