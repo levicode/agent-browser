@@ -551,11 +551,17 @@ impl ClientSession {
         if inner.health == ScopeState::Usable {
             return Ok(None);
         }
+        // A quarantined scope without an offered recovery receipt is a stale
+        // scope, not an unavailable one: the caller's exact scope is gone and
+        // the clean refusal matches the one a refused replacement receives.
+        // Check it before the general live-operation control, which would
+        // otherwise answer ScopeUnavailable for this exact state and make the
+        // client report a refused reconnect as a protocol failure.
+        if inner.health == ScopeState::Quarantined && inner.recovery.is_none() {
+            return Err(ProtocolError::StaleScope);
+        }
         Self::check_live_operation(&inner, operation)?;
-        let recovery = inner
-            .recovery
-            .as_ref()
-            .ok_or(ProtocolError::ScopeUnavailable)?;
+        let recovery = inner.recovery.as_ref().ok_or(ProtocolError::StaleScope)?;
         recovery.source.check()?;
         Ok(Some(recovery.source.clone()))
     }
@@ -2339,6 +2345,24 @@ mod tests {
             broker
                 .admit_disconnected_reconnect(1, 2, 1_000, "scope")
                 .err(),
+            Some(ProtocolError::StaleScope)
+        );
+    }
+
+    #[test]
+    fn quarantined_recovery_lookup_without_a_receipt_is_a_clean_stale_scope() {
+        let broker = ClientSession::new();
+        let operation = broker.admit(1, 1, 10_000).unwrap();
+        {
+            let mut inner = broker.lock().unwrap();
+            inner.health = ScopeState::Quarantined;
+            inner.recovery = None;
+        }
+        // The executor-side lookup must answer the same clean refusal the
+        // admission path does, or a refused reconnect reads as a protocol
+        // failure instead of the contract's stale-scope.
+        assert_eq!(
+            broker.disconnected_recovery(&operation).err(),
             Some(ProtocolError::StaleScope)
         );
     }
