@@ -1771,12 +1771,31 @@ async fn read_exact_box_with_evidence(
         && client.debt_ledger().is_some()
         && super::client_debt::OperationJournalHandle::current().is_some()
     {
-        // A readonly geometry group is released through the bounded cleanup
-        // command pool. Do not acquire another group while that pool is
-        // saturated: the release of the next group could not even be admitted,
-        // and a full pool must not be turned into a lost cleanup proof. This
-        // waits on the same operation budget and never retries a failed command.
-        if let Some(ledger) = client.debt_ledger() {
+        // Every lane creates its own isolated realm, readonly group, resolved
+        // node and pending creation slots. That local debt shares the owner's
+        // bounded object pool with every other producer, so a lane admitted
+        // without room is refused by the reservation before any command reaches
+        // Chromium; the resolver reports that refusal as a backend failure and
+        // the readonly box proof turns it into a moved identity. The owner
+        // admits only a bounded number of lanes and a lane that finds the pool
+        // full waits inside the operation's own budget for accounted reads to
+        // release. The permit is held for the whole exact read.
+        let ledger = client.debt_ledger();
+        let _geometry_lane = match ledger.as_ref() {
+            Some(ledger) => Some(
+                ledger
+                    .admit_geometry_lane(operation)
+                    .await
+                    .map_err(geometry_wait_error)?,
+            ),
+            None => None,
+        };
+        if let Some(ledger) = ledger.as_ref() {
+            // A readonly geometry group is released through the bounded cleanup
+            // command pool. Do not acquire another group while that pool is
+            // saturated: the release of the next group could not even be admitted,
+            // and a full pool must not be turned into a lost cleanup proof. This
+            // waits on the same operation budget and never retries a failed command.
             ledger
                 .wait_cleanup_object_capacity(operation)
                 .await
