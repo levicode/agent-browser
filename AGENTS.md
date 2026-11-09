@@ -109,7 +109,15 @@ This is a Rust codebase. The browser automation daemon lives in `cli/src/native/
 cd cli && cargo test
 ```
 
-Runs all unit tests (~320 tests). These are fast and don't require Chrome.
+Runs all unit tests. These are fast and don't require Chrome. At `57c45914` the test binary lists 3,770 test functions (3,516 non-ignored, 254 ignored); the count is not stable across revisions, so quote the three counts with the revision.
+
+The default-configuration native gate is the same crate built with the `ci` profile:
+
+```bash
+cd cli && CARGO_PROFILE_CI_LTO=false cargo test --profile ci
+```
+
+See `cli/docs/native-default-gate.md` for how to report it, what the historical "43/110" figure refers to, and the checkout-path limit that affects `native::stream::http::tests`.
 
 ### End-to-End Tests
 
