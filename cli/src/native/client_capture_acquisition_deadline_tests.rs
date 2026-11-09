@@ -305,6 +305,21 @@ async fn acquisition_deadline(boundary: Boundary) {
                     assert!(fallback_started);
                     json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
                 }
+                "Runtime.evaluate" if group.is_none() => {
+                    // ab#69's display:none pre-filter: one isolated-world walk
+                    // per observed frame, outside every object group and before
+                    // the metadata batch. An empty walk prunes nothing here
+                    // because the fixture document has no html element.
+                    assert_eq!(request["params"]["contextId"], 1);
+                    assert_eq!(request["params"]["returnByValue"].as_bool(), Some(true));
+                    assert_eq!(request["params"]["awaitPromise"].as_bool(), Some(false));
+                    let expression = request["params"]["expression"].as_str().unwrap();
+                    assert!(
+                        expression.contains("getComputedStyle(child).display === 'none'"),
+                        "unexpected evaluated expression: {expression}"
+                    );
+                    json!({"result":{"value":[]}})
+                }
                 "Runtime.evaluate" => {
                     assert!(fallback_started);
                     let group = group.unwrap();
