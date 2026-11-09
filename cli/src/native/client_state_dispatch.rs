@@ -104,6 +104,9 @@ impl<'a> CapturedStateContext<'a> {
             .map_err(|error| self.failure(error))?;
         if targets.iter().any(|target| {
             target.purpose == Some(TargetPurpose::Application)
+                // Auxiliary browser targets are not captured; their own
+                // configuration churn is not a reason to refuse the export.
+                && !super::client_enrollment::capture_auxiliary_kind(&target.kind)
                 && (!target.configured || !target.resumed)
         }) {
             return Err(self.failure(ProtocolError::ScopeUnavailable));

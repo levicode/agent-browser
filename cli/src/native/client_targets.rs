@@ -2403,6 +2403,46 @@ impl ClientTargets {
         }
         Ok(tickets)
     }
+    /// A saved state is attributed to page/iframe documents only. Auxiliary
+    /// browser targets (browser/tab/browser_ui) render no page document and own
+    /// no origin storage, so their retirement or replacement must not
+    /// invalidate an otherwise stable capture; every document ticket is still
+    /// checked exactly, including the sealed and attachment-tenure fence.
+    pub(crate) fn check_capture_document_tickets(
+        &self,
+        tickets: &[OwnedTarget],
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state
+                .targets
+                .values()
+                .filter(|target| {
+                    target.purpose == Some(TargetPurpose::Application)
+                        && !super::client_enrollment::capture_auxiliary_kind(&target.kind)
+                })
+                .count()
+                != tickets.len()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut seen = HashSet::new();
+        for ticket in tickets {
+            let unique = seen.insert(&ticket.target_id);
+            let ready = ticket.capture_ready();
+            let same = state
+                .targets
+                .get(&ticket.target_id)
+                .is_some_and(|current| current.same_attachment(ticket));
+            if !unique || !ready || !same {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        Ok(())
+    }
     /// No registry-wide revision fence: unrelated StateBootstrap churn is valid.
     pub(crate) fn check_capture_tickets(
         &self,

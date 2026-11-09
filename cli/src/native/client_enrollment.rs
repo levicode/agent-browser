@@ -285,6 +285,12 @@ struct Index {
     frames: HashMap<String, FrameOwner>,
     failure: Option<ProtocolError>,
     application_epoch: u64,
+    // Mirrors application_epoch except for auxiliary browser targets
+    // (browser/tab/browser_ui), which are not part of a saved page's storage
+    // attribution. Capture staleness compares this counter, so a browser UI
+    // target attaching or retiring during an export cannot invalidate the
+    // snapshot while every page/iframe movement still does.
+    document_epoch: u64,
     applied_watermark: u64,
     pending_enrollment: HashMap<String, Option<QueuedIframe>>,
     // Same bounded existing tasks; receipts survive removal in a captured cohort.
@@ -800,13 +806,13 @@ pub struct EnrollmentAttestation {
     coordinator: std::sync::Weak<ClientEnrollment>,
     targets: Arc<ClientTargets>,
     generation: u64,
-    application_epoch: u64,
+    document_epoch: u64,
     frames: Vec<(String, String, String, String)>,
     watermark: BoundedEventWatermark,
     snapshot: CaptureSnapshot,
 }
 struct CaptureSnapshot {
-    epoch: u64,
+    document_epoch: u64,
     entries: Vec<Attribution>,
     // All original Application insertions, including initially enumerable ones.
     // A second inventory must never replace these tickets with matching strings.
@@ -2799,7 +2805,7 @@ impl ClientEnrollment {
         }
         result
     }
-    fn bump_application_epoch(&self) -> Result<(), ProtocolError> {
+    fn bump_application_epoch(&self, entry: &Attribution) -> Result<(), ProtocolError> {
         let mut index = self
             .index
             .lock()
@@ -2809,6 +2815,12 @@ impl ClientEnrollment {
             .application_epoch
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        if !capture_auxiliary_kind(&entry.kind) {
+            index.document_epoch = index
+                .document_epoch
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+        }
         Ok(())
     }
     async fn drain_capture_watermark(
@@ -2870,21 +2882,35 @@ impl ClientEnrollment {
         let received = watermark
             .received()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if self.sealed.load(Ordering::Acquire)
+        let sealed = self.sealed.load(Ordering::Acquire);
+        let ready = capture_admission_ready(index, received);
+        let live_entries = index
+            .sessions
+            .values()
+            .filter(|entry| {
+                (entry.application || entry.observation_only)
+                    && !capture_auxiliary_kind(&entry.kind)
+            })
+            .count();
+        let snapshot_entries = snapshot
+            .entries
+            .iter()
+            .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+            .count();
+        if sealed
             || !index.reconciled
-            || !capture_admission_ready(index, received)
-            || index.application_epoch != snapshot.epoch
+            || !ready
+            || index.document_epoch != snapshot.document_epoch
             || index.borrowed_restart.is_some()
-            || index
-                .sessions
-                .values()
-                .filter(|entry| entry.application || entry.observation_only)
-                .count()
-                != snapshot.entries.len()
+            || live_entries != snapshot_entries
         {
             return Err(ProtocolError::StaleScope);
         }
-        for entry in &snapshot.entries {
+        for entry in snapshot
+            .entries
+            .iter()
+            .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+        {
             if !entry.resumed
                 || entry.application == entry.observation_only
                 || index.sessions.get(&entry.session) != Some(entry)
@@ -2903,7 +2929,14 @@ impl ClientEnrollment {
         }
         // The caller holds index. Keep the established index -> targets order;
         // no mutex survives a protocol read, drain, or other await.
-        self.targets.check_capture_tickets(&snapshot.owned)
+        let document_tickets = snapshot
+            .owned
+            .iter()
+            .filter(|ticket| !capture_auxiliary_kind(&ticket.kind))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.targets
+            .check_capture_document_tickets(&document_tickets)
     }
     fn check_capture_snapshot(
         &self,
@@ -2971,7 +3004,7 @@ impl ClientEnrollment {
             }
         }
         let snapshot = CaptureSnapshot {
-            epoch: index.application_epoch,
+            document_epoch: index.document_epoch,
             entries,
             owned,
         };
@@ -3090,16 +3123,13 @@ impl ClientEnrollment {
         let mut enumerated = HashMap::new();
         for info in infos {
             let target = field(info, "targetId")?;
-            field(info, "type")?;
+            let native_kind = field(info, "type")?;
             if enumerated.insert(target, info).is_some() {
                 return Err(ProtocolError::StaleScope);
             }
             if info.get("browserContextId").and_then(Value::as_str)
                 != Some(self.targets.context_id.as_str())
-                || matches!(
-                    info.get("type").and_then(Value::as_str),
-                    Some("browser" | "tab")
-                )
+                || matches!(native_kind, "browser" | "tab")
             {
                 continue;
             }
@@ -3116,8 +3146,11 @@ impl ClientEnrollment {
                 continue;
             }
             let owned = self.targets.owned_target(target)?;
+            // An auxiliary target that was not in the snapshot attached after
+            // it; it owns no captured storage, so it is not a contradiction.
             if owned.purpose == Some(TargetPurpose::Application)
                 && !entries.iter().any(|entry| entry.target == owned.target_id)
+                && !capture_auxiliary_kind(&owned.kind)
             {
                 return Err(ProtocolError::StaleScope);
             }
@@ -3204,7 +3237,7 @@ impl ClientEnrollment {
             coordinator: Arc::downgrade(self),
             targets: self.targets.clone(),
             generation: self.generation,
-            application_epoch: snapshot.epoch,
+            document_epoch: snapshot.document_epoch,
             frames,
             watermark,
             snapshot,
@@ -3239,15 +3272,33 @@ impl ClientEnrollment {
         // enumerable and the fresh attestation could prove only its newer tenure.
         self.fence_capture_snapshot(&previous.watermark, &previous.snapshot, op)
             .await?;
-        if current.application_epoch != previous.application_epoch
-            || current.frames != previous.frames
-            || current.snapshot.entries != previous.snapshot.entries
-            || current.snapshot.owned.len() != previous.snapshot.owned.len()
-            || !current
-                .snapshot
+        let document_entries = |snapshot: &CaptureSnapshot| {
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let document_tickets = |snapshot: &CaptureSnapshot| {
+            snapshot
                 .owned
                 .iter()
-                .zip(&previous.snapshot.owned)
+                .filter(|ticket| !capture_auxiliary_kind(&ticket.kind))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let current_entries = document_entries(&current.snapshot);
+        let previous_entries = document_entries(&previous.snapshot);
+        let current_tickets = document_tickets(&current.snapshot);
+        let previous_tickets = document_tickets(&previous.snapshot);
+        if current.document_epoch != previous.document_epoch
+            || current.frames != previous.frames
+            || current_entries != previous_entries
+            || current_tickets.len() != previous_tickets.len()
+            || !current_tickets
+                .iter()
+                .zip(&previous_tickets)
                 .all(|(current, previous)| current.same_attachment(previous))
         {
             return Err(ProtocolError::StaleScope);
@@ -5248,10 +5299,17 @@ impl ClientEnrollment {
                 .ok_or(ProtocolError::StaleReference)?;
             self.revoke_eval_authority();
             current.application = true;
+            let promoted_kind = current.kind.clone();
             index.application_epoch = index
                 .application_epoch
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
+            if !capture_auxiliary_kind(&promoted_kind) {
+                index.document_epoch = index
+                    .document_epoch
+                    .checked_add(1)
+                    .ok_or(ProtocolError::IdentifierExhausted)?;
+            }
             // No new blocking lock, await, error path or authority. Non-opt-in
             // execution retains no diagnostic receipt and does no checkpoint work.
             if super::client_settlement_trace::query_diagnostics_enabled()
@@ -7812,6 +7870,12 @@ impl ClientEnrollment {
             .application_epoch
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        if !capture_auxiliary_kind(&entry.kind) {
+            index.document_epoch = index
+                .document_epoch
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+        }
         Ok(Some(entry))
     }
     /// Same-context storage-origin observation is not Application ownership.
@@ -8238,10 +8302,20 @@ impl ClientEnrollment {
                     .any(|entry| entry.application || entry.observation_only)
                 {
                     self.revoke_eval_authority();
+                    let document_moved = removed.iter().any(|entry| {
+                        (entry.application || entry.observation_only)
+                            && !capture_auxiliary_kind(&entry.kind)
+                    });
                     index.application_epoch = index
                         .application_epoch
                         .checked_add(1)
                         .ok_or(ProtocolError::IdentifierExhausted)?;
+                    if document_moved {
+                        index.document_epoch = index
+                            .document_epoch
+                            .checked_add(1)
+                            .ok_or(ProtocolError::IdentifierExhausted)?;
+                    }
                 }
                 #[cfg(test)]
                 for entry in &removed {
@@ -8305,7 +8379,7 @@ impl ClientEnrollment {
                     info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
                 );
                 if entry.application {
-                    self.bump_application_epoch()?;
+                    self.bump_application_epoch(&entry)?;
                     self.targets.invalidate_inventory_for(
                         super::client_settlement_trace::InventoryRevisionEvent::Info,
                         target,
@@ -8350,7 +8424,7 @@ impl ClientEnrollment {
         if entry.observation_only {
             match event.method.as_str() {
                 "Page.frameNavigated" => {
-                    self.bump_application_epoch()?;
+                    self.bump_application_epoch(&entry)?;
                     self.record_frame(
                         &entry,
                         event
@@ -8361,7 +8435,7 @@ impl ClientEnrollment {
                     )?;
                 }
                 "Page.frameDetached" => {
-                    self.bump_application_epoch()?;
+                    self.bump_application_epoch(&entry)?;
                     let frame = field(&event.params, "frameId")?;
                     let mut index = self
                         .index
@@ -8386,7 +8460,7 @@ impl ClientEnrollment {
                     }
                 }
                 "Page.frameAttached" | "Page.navigatedWithinDocument" => {
-                    self.bump_application_epoch()?;
+                    self.bump_application_epoch(&entry)?;
                 }
                 _ => {}
             }
@@ -8405,7 +8479,7 @@ impl ClientEnrollment {
         }
         match event.method.as_str() {
             "Page.frameAttached" => {
-                self.bump_application_epoch()?;
+                self.bump_application_epoch(&entry)?;
                 let frame = field(&event.params, "frameId")?;
                 // This only restores counting of retained requests. Parent
                 // discovery may lag Page.enable; it grants no frame authority.
@@ -8413,7 +8487,7 @@ impl ClientEnrollment {
                     .reset_network_frame(&entry.root, &entry.session, frame)?;
             }
             "Page.frameNavigated" => {
-                self.bump_application_epoch()?;
+                self.bump_application_epoch(&entry)?;
                 self.targets.invalidate_inventory_for(
                     super::client_settlement_trace::InventoryRevisionEvent::Navigate,
                     &entry.target,
@@ -8428,14 +8502,14 @@ impl ClientEnrollment {
                 )?;
             }
             "Page.navigatedWithinDocument" => {
-                self.bump_application_epoch()?;
+                self.bump_application_epoch(&entry)?;
                 self.targets.invalidate_inventory_for(
                     super::client_settlement_trace::InventoryRevisionEvent::SameDocument,
                     &entry.target,
                 )?;
             }
             "Page.frameDetached" => {
-                self.bump_application_epoch()?;
+                self.bump_application_epoch(&entry)?;
                 self.targets.invalidate_inventory_for(
                     super::client_settlement_trace::InventoryRevisionEvent::FrameDetach,
                     &entry.target,
@@ -8620,6 +8694,12 @@ fn validate_capture_target_info(
         return Err(ProtocolError::StaleScope);
     }
     Ok(())
+}
+/// Auxiliary browser targets render no page document and own no origin storage
+/// in a saved state. They are browser chrome, so their asynchronous attach or
+/// retirement must not invalidate an otherwise stable page capture.
+pub(crate) fn capture_auxiliary_kind(kind: &str) -> bool {
+    matches!(kind, "browser" | "tab" | "browser_ui")
 }
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()
@@ -12761,8 +12841,7 @@ mod tests {
     async fn capture_owned_inventory_detach_before_ack_and_dead_session_refuse() {
         for protocol_failure in [false, true] {
             let f = CaptureWireFixture::new(false).await;
-            f.attach("missing-a", "missing-session-a", "browser_ui")
-                .await;
+            f.attach("missing-a", "missing-session-a", "page").await;
             let task = f.capture(f.owner.operation());
             let request = f.request("Target.getTargetInfo", 1).await;
             realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
@@ -12771,11 +12850,10 @@ mod tests {
                 f.inventory
                     .lock()
                     .unwrap()
-                    .push(capture_info("missing-a", "browser_ui"));
+                    .push(capture_info("missing-a", "page"));
                 f.emit.send(json!({"id":request["id"], "error":{"code":-32000, "message":"session not found"}})).await.unwrap();
             } else {
-                f.reply(&request, capture_info("missing-a", "browser_ui"))
-                    .await;
+                f.reply(&request, capture_info("missing-a", "page")).await;
             }
             assert_eq!(
                 task.await.unwrap().map(|_| ()),
@@ -12792,18 +12870,15 @@ mod tests {
     async fn capture_owned_inventory_same_id_aba_and_new_session_never_redirect() {
         for replacement_session in ["missing-session-a", "replacement-session"] {
             let f = CaptureWireFixture::new(false).await;
-            f.attach("missing-a", "missing-session-a", "browser_ui")
-                .await;
+            f.attach("missing-a", "missing-session-a", "page").await;
             let original = f.owner.targets.owned_target("missing-a").unwrap();
             let task = f.capture(f.owner.operation());
             let request = f.request("Target.getTargetInfo", 1).await;
             realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
-            f.attach("missing-a", replacement_session, "browser_ui")
-                .await;
+            f.attach("missing-a", replacement_session, "page").await;
             let replacement = f.owner.targets.owned_target("missing-a").unwrap();
             assert!(!replacement.same_attachment(&original));
-            f.reply(&request, capture_info("missing-a", "browser_ui"))
-                .await;
+            f.reply(&request, capture_info("missing-a", "page")).await;
             assert_eq!(
                 task.await.unwrap().map(|_| ()),
                 Err(ProtocolError::StaleScope)
@@ -12820,11 +12895,10 @@ mod tests {
         for changed_field in ["browserContextId", "type"] {
             for changed_reply in [false, true] {
                 let f = CaptureWireFixture::new(false).await;
-                f.attach("missing-a", "missing-session-a", "browser_ui")
-                    .await;
+                f.attach("missing-a", "missing-session-a", "page").await;
                 let task = f.capture(f.owner.operation());
                 let request = f.request("Target.getTargetInfo", 1).await;
-                let mut changed = capture_info("missing-a", "browser_ui");
+                let mut changed = capture_info("missing-a", "page");
                 changed[changed_field] = json!(if changed_field == "type" {
                     "worker"
                 } else {
@@ -12841,7 +12915,7 @@ mod tests {
                     if changed_reply {
                         changed
                     } else {
-                        capture_info("missing-a", "browser_ui")
+                        capture_info("missing-a", "page")
                     },
                 )
                 .await;
@@ -12859,8 +12933,7 @@ mod tests {
     #[tokio::test]
     async fn capture_owned_inventory_ack_waits_for_current_reader_watermark() {
         let f = CaptureWireFixture::new(false).await;
-        f.attach("missing-a", "missing-session-a", "browser_ui")
-            .await;
+        f.attach("missing-a", "missing-session-a", "page").await;
         let frames = f.requests("Page.getFrameTree").len();
         let ack = f.gate(CaptureTestPoint::AfterInfoAck);
         let event = f.gate(CaptureTestPoint::BeforeEventApply);
@@ -12871,10 +12944,9 @@ mod tests {
             request = f.request("Target.getTargetInfo", 1) => request,
             _ = &mut capture => panic!("capture completed before the held info request"),
         };
-        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("missing-a", "browser_ui")}})).await.unwrap();
+        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("missing-a", "page")}})).await.unwrap();
         event.wait_entered().await;
-        f.reply(&request, capture_info("missing-a", "browser_ui"))
-            .await;
+        f.reply(&request, capture_info("missing-a", "page")).await;
         tokio::select! {
             _ = ack.wait_entered() => {},
             _ = &mut capture => panic!("capture completed before the ACK gate"),
@@ -12907,7 +12979,7 @@ mod tests {
                 .unwrap()
                 .insert(("Runtime.enable".into(), "first-session".into()));
             f.emit
-                .send(capture_attach_event("first", "first-session", "browser_ui"))
+                .send(capture_attach_event("first", "first-session", "page"))
                 .await
                 .unwrap();
             let first = f.request("Runtime.enable", runtime_before + 1).await;
@@ -12925,11 +12997,7 @@ mod tests {
                 .unwrap()
                 .insert(("Runtime.enable".into(), "second-session".into()));
             f.emit
-                .send(capture_attach_event(
-                    "second",
-                    "second-session",
-                    "browser_ui",
-                ))
+                .send(capture_attach_event("second", "second-session", "page"))
                 .await
                 .unwrap();
             let second = if let Some(gate) = &event_gate {
@@ -12971,6 +13039,59 @@ mod tests {
                 .unwrap();
             f.finish().await;
         }
+    }
+
+    // A saved state is attributed to page/iframe documents. An auxiliary
+    // browser target the browser attaches while the export runs is browser
+    // chrome, not page state: it must not stale an otherwise stable capture.
+    // This is the setup save race, from the browser-UI target side.
+    #[tokio::test]
+    async fn capture_document_staleness_ignores_late_auxiliary_target() {
+        let f = CaptureWireFixture::new(false).await;
+        let proof = f.capture(f.owner.operation()).await.unwrap().unwrap();
+        f.attach("late-ui", "late-ui-session", "browser_ui").await;
+        f.owner
+            .targets
+            .wait_read_enrollment(&f.owner.operation())
+            .await
+            .unwrap();
+        f.inventory
+            .lock()
+            .unwrap()
+            .push(capture_info("late-ui", "browser_ui"));
+        f.owner
+            .verify_capture_attestation(&proof, &f.owner.operation())
+            .await
+            .unwrap();
+        f.finish().await;
+    }
+
+    // The boundary of that exclusion: a real page/iframe target that retires
+    // after the attestation is still stale. Browser-UI churn is not a licence
+    // to ignore document movement.
+    #[tokio::test]
+    async fn capture_document_target_retirement_after_snapshot_stays_stale() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("doc-b", "doc-b-session", "page").await;
+        let task = f.capture(f.owner.operation());
+        let request = f.request("Target.getTargetInfo", 1).await;
+        f.reply(&request, capture_info("doc-b", "page")).await;
+        let proof = task.await.unwrap().unwrap();
+        realm_emit(
+            &f.owner,
+            &f.emit,
+            json!({"method":"Target.detachedFromTarget", "params":{
+                "sessionId":"doc-b-session", "targetId":"doc-b"
+            }}),
+        )
+        .await;
+        assert_eq!(
+            f.owner
+                .verify_capture_attestation(&proof, &f.owner.operation())
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        f.finish().await;
     }
 
     #[tokio::test]
@@ -13083,8 +13204,7 @@ mod tests {
             "bootstrap",
         ] {
             let f = CaptureWireFixture::new(false).await;
-            f.attach("missing-a", "missing-session-a", "browser_ui")
-                .await;
+            f.attach("missing-a", "missing-session-a", "page").await;
             let task = f.capture(f.owner.operation());
             let request = f.request("Target.getTargetInfo", 1).await;
             let mut event_gate = None;
@@ -13136,10 +13256,10 @@ mod tests {
                 }
                 "overflow" => {
                     let gate = f.gate(CaptureTestPoint::BeforeEventApply);
-                    f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "browser_ui")}})).await.unwrap();
+                    f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "page")}})).await.unwrap();
                     gate.wait_entered().await;
                     for _ in 0..257 {
-                        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "browser_ui")}})).await.unwrap();
+                        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "page")}})).await.unwrap();
                     }
                     let watermark = f.owner.realm_watermark().unwrap();
                     tokio::time::timeout(Duration::from_secs(2), async {
@@ -13180,8 +13300,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            f.reply(&request, capture_info("missing-a", "browser_ui"))
-                .await;
+            f.reply(&request, capture_info("missing-a", "page")).await;
             let result = task.await.unwrap();
             assert_eq!(
                 result.is_ok(),
@@ -13301,19 +13420,16 @@ mod tests {
     async fn capture_owned_inventory_post_export_keeps_original_owner_when_enumerable() {
         for case in ["unchanged", "event-aba", "registry-aba", "context-event"] {
             let f = CaptureWireFixture::new(false).await;
-            f.attach("missing-a", "missing-session-a", "browser_ui")
-                .await;
+            f.attach("missing-a", "missing-session-a", "page").await;
             let task = f.capture(f.owner.operation());
             let request = f.request("Target.getTargetInfo", 1).await;
-            f.reply(&request, capture_info("missing-a", "browser_ui"))
-                .await;
+            f.reply(&request, capture_info("missing-a", "page")).await;
             let proof = task.await.unwrap().unwrap();
             let epoch = f.owner.index.lock().unwrap().application_epoch;
             match case {
                 "event-aba" => {
                     realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
-                    f.attach("missing-a", "missing-session-a", "browser_ui")
-                        .await;
+                    f.attach("missing-a", "missing-session-a", "page").await;
                 }
                 "registry-aba" => {
                     // Authoritative insertion only, no epoch edits: isolate tenure.
@@ -13324,7 +13440,7 @@ mod tests {
                             "owned-context",
                             "missing-a".into(),
                             "missing-session-a".into(),
-                            "browser_ui".into(),
+                            "page".into(),
                         )
                         .unwrap();
                     f.owner.targets.configured("missing-a").unwrap();
@@ -13338,7 +13454,7 @@ mod tests {
                     assert_eq!(f.owner.index.lock().unwrap().application_epoch, epoch);
                 }
                 "context-event" => {
-                    let mut info = capture_info("missing-a", "browser_ui");
+                    let mut info = capture_info("missing-a", "page");
                     info["browserContextId"] = json!("foreign");
                     realm_emit(
                         &f.owner,
@@ -13352,7 +13468,7 @@ mod tests {
             f.inventory
                 .lock()
                 .unwrap()
-                .push(capture_info("missing-a", "browser_ui"));
+                .push(capture_info("missing-a", "page"));
             let result = f
                 .owner
                 .verify_capture_attestation(&proof, &f.owner.operation())
@@ -13366,12 +13482,10 @@ mod tests {
     #[tokio::test]
     async fn capture_owned_inventory_fresh_second_attestation_cannot_replace_original_ticket() {
         let f = CaptureWireFixture::new(false).await;
-        f.attach("missing-a", "missing-session-a", "browser_ui")
-            .await;
+        f.attach("missing-a", "missing-session-a", "page").await;
         let first = f.capture(f.owner.operation());
         let request = f.request("Target.getTargetInfo", 1).await;
-        f.reply(&request, capture_info("missing-a", "browser_ui"))
-            .await;
+        f.reply(&request, capture_info("missing-a", "page")).await;
         let proof = first.await.unwrap().unwrap();
         let original = f.owner.targets.owned_target("missing-a").unwrap();
         let original_epoch = f.owner.index.lock().unwrap().application_epoch;
@@ -13395,7 +13509,7 @@ mod tests {
                 "owned-context",
                 "missing-a".into(),
                 "missing-session-a".into(),
-                "browser_ui".into(),
+                "page".into(),
             )
             .unwrap();
         f.owner.targets.configured("missing-a").unwrap();
@@ -13419,15 +13533,16 @@ mod tests {
         f.inventory
             .lock()
             .unwrap()
-            .push(capture_info("missing-a", "browser_ui"));
+            .push(capture_info("missing-a", "page"));
         before_fresh_snapshot.release();
         fresh_completed.wait_entered().await;
         // The fresh attestation succeeded with a new, now-enumerable ticket.
         // Its own final checks therefore cannot be the source of this refusal.
         f.server_barrier().await;
+        // Both page roots are fingerprinted by the fresh attestation.
         assert_eq!(
             f.requests("Page.getFrameTree").len(),
-            frames_before_verify + 1
+            frames_before_verify + 2
         );
         assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
         assert_eq!(
@@ -13446,12 +13561,10 @@ mod tests {
         for replace in [false, true] {
             for protocol_failure in [false, true] {
                 let f = CaptureWireFixture::new(false).await;
-                f.attach("missing-a", "missing-session-a", "browser_ui")
-                    .await;
+                f.attach("missing-a", "missing-session-a", "page").await;
                 let first = f.capture(f.owner.operation());
                 let request = f.request("Target.getTargetInfo", 1).await;
-                f.reply(&request, capture_info("missing-a", "browser_ui"))
-                    .await;
+                f.reply(&request, capture_info("missing-a", "page")).await;
                 let proof = tokio::time::timeout(Duration::from_secs(2), first)
                     .await
                     .unwrap()
@@ -13464,7 +13577,7 @@ mod tests {
                 f.inventory
                     .lock()
                     .unwrap()
-                    .push(capture_info("missing-a", "browser_ui"));
+                    .push(capture_info("missing-a", "page"));
                 f.held
                     .lock()
                     .unwrap()
@@ -13487,7 +13600,7 @@ mod tests {
                             "owned-context",
                             "missing-a".into(),
                             "missing-session-a".into(),
-                            "browser_ui".into(),
+                            "page".into(),
                         )
                         .unwrap();
                     f.owner.targets.configured("missing-a").unwrap();
