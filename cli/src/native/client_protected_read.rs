@@ -1062,10 +1062,13 @@ mod tests {
                 .unwrap();
             let outcome = receive.await.unwrap();
             let clean = mode == "clean" || mode == "earlier-cleanup";
+            // 566bc81d8 records the trace's dirty settlement as a stale
+            // reference before the retained dirty decision quarantines the
+            // scope; every other mode keeps its original result.
             assert_eq!(
                 outcome.result,
                 Err(if matches!(mode, "dirty-join" | "restore-loss") {
-                    ProtocolError::CleanupFailed
+                    ProtocolError::StaleReference
                 } else {
                     ProtocolError::Cancelled
                 }),
@@ -1093,9 +1096,12 @@ mod tests {
                 },
                 "{mode}"
             );
+            // 566bc81d8 settles a dirty trace join as trace-local, so it leaves
+            // no retained operation. A lost restore proof still retains the
+            // exact borrowed owner and keeps the drain refused.
             assert_eq!(
                 tasks.drain_current().await.is_ok(),
-                !matches!(mode, "dirty-join" | "restore-loss"),
+                !matches!(mode, "restore-loss"),
                 "{mode}"
             );
             assert!(requests

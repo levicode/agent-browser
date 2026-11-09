@@ -6535,37 +6535,25 @@ mod tests {
                             settle_trace_screenshot(outcome, lost, trace, &journal)
                         })
                         .await;
+                    // 566bc81d8 makes a trace's own cleanup loss a trace-local
+                    // clean refusal: stale reference, not-dispatched, no
+                    // retention, usable scope. The non-trace leg keeps its lost
+                    // proof (still quarantined through the `lost` decision).
+                    let trace_local_loss = trace && dirty;
                     assert_eq!(
                         outcome.result,
-                        Err(if trace && dirty {
-                            ProtocolError::CleanupFailed
+                        Err(if trace_local_loss {
+                            ProtocolError::StaleReference
                         } else {
                             ProtocolError::DeadlineExceeded
                         })
                     );
                     assert!(outcome.retention.is_none());
-                    assert_eq!(lost, dirty);
-                    // A trace capture installs page protection, so a lost
-                    // restore leaves the page uncertain. The non-trace leg is
-                    // the read-only control: a lost proof there settles as a
-                    // retryable non-dispatch and still quarantines through the
-                    // `lost` decision.
-                    let uncertain = dirty && trace;
-                    assert_eq!(
-                        outcome.effects,
-                        if uncertain {
-                            Effects::Unknown
-                        } else {
-                            Effects::NotDispatched
-                        }
-                    );
+                    assert_eq!(lost, dirty && !trace);
+                    assert_eq!(outcome.effects, Effects::NotDispatched);
                     assert_eq!(
                         broker.settle(1, 1, outcome.effects).unwrap(),
-                        if uncertain {
-                            ScopeState::Quarantined
-                        } else {
-                            ScopeState::Usable
-                        }
+                        ScopeState::Usable
                     );
                 }
             }
