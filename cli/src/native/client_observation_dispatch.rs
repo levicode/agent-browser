@@ -786,6 +786,13 @@ pub struct ObservationDispatch {
     #[cfg(test)]
     initial_inventory_probe_for_test:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>>>,
+    // Test-only scheduler-jitter budget for the optional acceptance cut. A
+    // real host can wake the cutoff timer after its deadline; the production
+    // reserve is not a stall guarantee, so timing tests opt into a wider cut
+    // instead of racing the last few milliseconds before the parent deadline.
+    // The production lease stays the default for every dispatch that opts out.
+    #[cfg(test)]
+    optional_observe_headroom_for_test: Mutex<Option<Duration>>,
 }
 /// Only the real-browser joint test can pause an initial sample after its actual
 /// revision snapshot. The receiver creates real browser events; this seam does
@@ -809,6 +816,8 @@ impl ObservationDispatch {
             observed_cleanup_for_test: AtomicBool::new(false),
             #[cfg(test)]
             initial_inventory_probe_for_test: Mutex::new(None),
+            #[cfg(test)]
+            optional_observe_headroom_for_test: Mutex::new(None),
             refs,
             captures: Mutex::new(CaptureAuthority::default()),
             publication: tokio::sync::Mutex::new(Publication {
@@ -829,6 +838,10 @@ impl ObservationDispatch {
             .unwrap()
             .replace(probe)
             .is_none());
+    }
+    #[cfg(test)]
+    pub(crate) fn set_optional_observe_headroom_for_test(&self, headroom: Duration) {
+        *self.optional_observe_headroom_for_test.lock().unwrap() = Some(headroom);
     }
     /// The existing publication authority owns one retirement counter; this
     /// never replaces scope generation, target tenure or the shared ref map.
@@ -1833,6 +1846,19 @@ impl ObservationDispatch {
         Self::clear_observe_continuation(capture);
         Ok(inventory)
     }
+    /// The optional acceptance cut for this dispatch: the production reserve,
+    /// or the wider scheduler-jitter budget a timing test opted into. The opt-in
+    /// only changes when optional pixel work must stop; the parent deadline and
+    /// every publication check still use the original operation.
+    fn optional_observe_lease_for(&self, operation: &OperationLease) -> OperationLease {
+        #[cfg(test)]
+        {
+            if let Some(headroom) = *self.optional_observe_headroom_for_test.lock().unwrap() {
+                return optional_observe_lease_with_at(operation, Instant::now(), headroom);
+            }
+        }
+        optional_observe_lease(operation)
+    }
     /// Enrich an independently sealed tree without giving its result deadline to
     /// raw-pixel settlement. This future stays inside the original retained run,
     /// with its UI/publication guards, journal and exact capture ticket alive.
@@ -1867,7 +1893,7 @@ impl ObservationDispatch {
                 identity_scope: identity.clone(),
             }
         };
-        let pixel_operation = optional_observe_lease(operation);
+        let pixel_operation = self.optional_observe_lease_for(operation);
         #[cfg(test)]
         {
             receipt.optional_timing.lock().unwrap().cutoff_deadline =
@@ -4791,22 +4817,27 @@ async fn viewport(
 fn optional_observe_lease(operation: &OperationLease) -> OperationLease {
     optional_observe_lease_at(operation, Instant::now())
 }
+/// Production headroom for the optional acceptance cut: two milliseconds for
+/// the locked Tokio timer's rounding and integer tick difference from
+/// floor(now), plus one millisecond for publication and receiver scheduling.
+/// This is bounded local headroom, not the strict-fallback cleanup reserve and
+/// not a guarantee against arbitrary scheduler stalls. At <=3ms the optional
+/// lease is already expired, so its first check cannot admit work.
+const OPTIONAL_OBSERVE_HEADROOM: Duration = Duration::from_millis(3);
 fn optional_observe_lease_at(operation: &OperationLease, now: Instant) -> OperationLease {
+    optional_observe_lease_with_at(operation, now, OPTIONAL_OBSERVE_HEADROOM)
+}
+fn optional_observe_lease_with_at(
+    operation: &OperationLease,
+    now: Instant,
+    headroom: Duration,
+) -> OperationLease {
     let remaining = operation.deadline.saturating_duration_since(now);
-    // Cleanup is independently retained. The locked Tokio timer rounds the
-    // deadline up to a millisecond, then parks for an integer tick difference
-    // from floor(now): together these can consume nearly two milliseconds.
-    // Keep a separate millisecond for publication and receiver scheduling.
-    // This is bounded local headroom, not the strict-fallback cleanup reserve
-    // and not a guarantee against arbitrary scheduler stalls. At <=3ms the
-    // optional lease is already expired, so its first check cannot admit work.
-    let timer_rounding = Duration::from_millis(2);
-    let publication = Duration::from_millis(1);
     OperationLease {
         is_callback: operation.is_callback,
         generation: operation.generation,
         sequence: operation.sequence,
-        deadline: operation.deadline - remaining.min(timer_rounding + publication),
+        deadline: operation.deadline - remaining.min(headroom),
         cancellation: operation.cancellation.clone(),
     }
 }
@@ -7855,6 +7886,29 @@ mod tests {
         let expired = optional_observe_lease_at(&parent, now + Duration::from_millis(81));
         assert_eq!(expired.deadline, parent.deadline);
         assert_eq!(parent.deadline, now + Duration::from_millis(80));
+    }
+    #[test]
+    fn optional_observe_test_headroom_is_opt_in_and_defaults_to_production() {
+        let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+        let now = Instant::now();
+        let mut parent = operation();
+        parent.deadline = now + Duration::from_secs(4);
+        // A dispatch that never opts in keeps the production three-millisecond
+        // acceptance cut, independent of this test-only seam.
+        assert_eq!(
+            dispatch.optional_observe_lease_for(&parent).deadline,
+            parent.deadline - OPTIONAL_OBSERVE_HEADROOM
+        );
+        dispatch.set_optional_observe_headroom_for_test(Duration::from_millis(12));
+        let leased = dispatch.optional_observe_lease_for(&parent);
+        assert_eq!(leased.deadline, parent.deadline - Duration::from_millis(12));
+        // The opt-in changes only the optional cut; parent ownership and the
+        // immutable result deadline keep their original values.
+        assert_eq!(leased.generation, parent.generation);
+        assert_eq!(leased.sequence, parent.sequence);
+        assert_eq!(leased.is_callback, parent.is_callback);
+        assert!(leased.cancellation.same_channel(&parent.cancellation));
+        assert_eq!(parent.deadline, now + Duration::from_secs(4));
     }
     #[test]
     fn prepared_semantic_cutoff_is_not_reminted_after_initial_work() {
