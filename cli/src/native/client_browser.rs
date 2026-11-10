@@ -2675,6 +2675,27 @@ pub struct ClientBrowser {
     #[cfg(feature = "acceptance-faults")]
     faults: Arc<super::client_test_faults::FaultController>,
 }
+/// A reconnect admitted while the scope still looked usable can meet the
+/// owner's lost application admission before the settlement that seals the
+/// broker runs. The admission never owned the quarantined transition, so the
+/// same clean refusal a receipt-less reconnect receives is the exact answer.
+/// Keep every other refusal, including the same protocol failure for ordinary
+/// work or for a healthy owner, exactly as it was.
+fn reconnect_admission_refusal(
+    command: &str,
+    error: ProtocolError,
+    owner_remote_closed: bool,
+) -> ProtocolError {
+    if command == "scope.reconnect"
+        && owner_remote_closed
+        && error == ProtocolError::ScopeUnavailable
+    {
+        ProtocolError::StaleScope
+    } else {
+        error
+    }
+}
+
 impl ClientBrowser {
     pub fn new(broker: Arc<super::client_session::ClientSession>) -> Self {
         let refs = Arc::new(Mutex::new(super::element::RefMap::new()));
@@ -3666,6 +3687,25 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             }
             .await;
             if let Err(error) = admission {
+                // A reconnect admitted while the scope still looked usable can
+                // meet the owner's already-lost application admission instead
+                // of a quarantined transition: the remote connection is gone,
+                // but the settlement that seals the broker (and later offers
+                // the replacement receipt) has not run yet. This admission
+                // never became the quarantined transition's operation, so the
+                // exact response is the same clean not-dispatched refusal a
+                // receipt-less reconnect receives. Reporting scope-unavailable
+                // instead would surface a refused reconnect as a protocol or
+                // publication failure.
+                let scope_closed = self
+                    .broker
+                    .health()
+                    .is_ok_and(|(_, state)| state == super::client_protocol::ScopeState::Closed);
+                let owner_remote_closed = !scope_closed
+                    && self.owner.lock().await.as_ref().is_some_and(|owner| {
+                        *owner.manager.client.remote_connection_closed().borrow()
+                    });
+                let error = reconnect_admission_refusal(&command, error, owner_remote_closed);
                 return NativeOutcome {
                     retention: None,
                     result: Err(error),

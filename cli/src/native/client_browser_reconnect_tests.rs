@@ -609,3 +609,55 @@ async fn reconnect_supervisor_old_cleanup_failure_closes_verified_candidate() {
 // retained replacement ownership and the existing eventual shutdown attempt;
 // it must not demand immediate disconnect after transfer or silently assert
 // startup_uncertain has been resolved.
+
+#[test]
+fn reconnect_admitted_before_the_scope_sealed_keeps_the_clean_stale_refusal() {
+    // The owner's remote connection is already gone and its application
+    // admission is closed, but the settlement that seals the broker has not
+    // run yet. This reconnect was admitted while the scope still looked usable,
+    // so it never owned the quarantined transition: the exact answer is the
+    // clean not-dispatched stale-scope refusal a receipt-less reconnect
+    // receives. Reporting scope-unavailable would make the client treat a
+    // refused reconnect as a failed publication and lose the whole scope.
+    assert_eq!(
+        super::reconnect_admission_refusal(
+            "scope.reconnect",
+            ProtocolError::ScopeUnavailable,
+            true
+        ),
+        ProtocolError::StaleScope
+    );
+    // Ordinary work over the same lost owner keeps its refusal.
+    assert_eq!(
+        super::reconnect_admission_refusal(
+            "browser.observe",
+            ProtocolError::ScopeUnavailable,
+            true
+        ),
+        ProtocolError::ScopeUnavailable
+    );
+    // A healthy owner did not lose its connection, so the reconnect keeps the
+    // failure it earned instead of borrowing the clean stale refusal.
+    assert_eq!(
+        super::reconnect_admission_refusal(
+            "scope.reconnect",
+            ProtocolError::ScopeUnavailable,
+            false
+        ),
+        ProtocolError::ScopeUnavailable
+    );
+    // Only an unavailable scope is reclassified; cancellation and deadlines
+    // keep their own exact meaning.
+    assert_eq!(
+        super::reconnect_admission_refusal("scope.reconnect", ProtocolError::Cancelled, true),
+        ProtocolError::Cancelled
+    );
+    assert_eq!(
+        super::reconnect_admission_refusal(
+            "scope.reconnect",
+            ProtocolError::DeadlineExceeded,
+            true
+        ),
+        ProtocolError::DeadlineExceeded
+    );
+}
