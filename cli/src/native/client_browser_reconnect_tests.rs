@@ -231,7 +231,7 @@ struct DisconnectedOwner {
     ui: Arc<crate::native::client_ui::UiGate>,
     directory: PathBuf,
     gate_state: (u64, bool, bool),
-    _notices: mpsc::Receiver<ServerMessage>,
+    notices: mpsc::Receiver<ServerMessage>,
 }
 
 impl DisconnectedOwner {
@@ -339,7 +339,7 @@ impl DisconnectedOwner {
             ui,
             directory,
             gate_state,
-            _notices: notices,
+            notices,
         }
     }
 
@@ -659,5 +659,79 @@ fn reconnect_admitted_before_the_scope_sealed_keeps_the_clean_stale_refusal() {
             true
         ),
         ProtocolError::DeadlineExceeded
+    );
+}
+
+#[tokio::test]
+async fn reconnect_refused_after_the_lost_owner_is_past_its_admission_keeps_the_clean_refusal() {
+    // DisconnectedOwner's real CDP reader recorded the remote EOF, so the
+    // owner's exact scope is gone. A peer retirement in progress refuses every
+    // non-end command after that scope was admitted. The refusal must reach the
+    // client as the clean not-dispatched stale-scope answer the disconnected
+    // recovery contract defines, never as an unavailable-scope protocol failure.
+    let owner = DisconnectedOwner::new().await;
+    {
+        let journal = owner.browser.owner.lock().await;
+        let runtime = journal
+            .as_ref()
+            .and_then(|journal| journal.runtime.as_ref())
+            .expect("old runtime must stay journaled");
+        runtime
+            .peer_retirement
+            .store(1, std::sync::atomic::Ordering::Release);
+    }
+    let operation = owner.operation();
+    let outcome = owner
+        .browser
+        .execute(
+            "scope.reconnect".into(),
+            json!({"identityScope": owner.scope})
+                .as_object()
+                .unwrap()
+                .clone(),
+            operation,
+        )
+        .await;
+    assert_eq!(outcome.result, Err(ProtocolError::StaleScope));
+    assert_eq!(outcome.effects, Effects::NotDispatched);
+    owner
+        .broker
+        .settle(1, 3, Effects::NotDispatched)
+        .expect("the refused operation stays settleable");
+}
+
+#[tokio::test]
+async fn a_producer_quarantine_still_publishes_the_remote_loss_notice() {
+    // A background producer (a failed network task or a dirty task settlement)
+    // can quarantine the scope before the reader's connection watcher runs.
+    // That quarantine owes the client the exact remote-loss notice: without it
+    // the client keeps believing the scope is usable and its explicit cleanup
+    // then meets a quarantined broker it was never told about.
+    let mut owner = DisconnectedOwner::new().await;
+    owner.broker.quarantine().unwrap();
+    let sink = owner
+        .browser
+        .event_sink
+        .get()
+        .cloned()
+        .expect("the owner event sink is installed");
+    assert_eq!(
+        sink.emit_disconnected(&owner.client, &owner.targets),
+        Ok(true)
+    );
+    let mut notice = None;
+    for _ in 0..32 {
+        match owner.notices.try_recv() {
+            Ok(ServerMessage::Event { event, .. }) if event == "browser.disconnected" => {
+                notice = Some(());
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        notice.is_some(),
+        "a quarantined owner must still publish its remote-loss notice"
     );
 }

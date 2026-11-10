@@ -2675,12 +2675,12 @@ pub struct ClientBrowser {
     #[cfg(feature = "acceptance-faults")]
     faults: Arc<super::client_test_faults::FaultController>,
 }
-/// A reconnect admitted while the scope still looked usable can meet the
-/// owner's lost application admission before the settlement that seals the
-/// broker runs. The admission never owned the quarantined transition, so the
-/// same clean refusal a receipt-less reconnect receives is the exact answer.
-/// Keep every other refusal, including the same protocol failure for ordinary
-/// work or for a healthy owner, exactly as it was.
+/// A reconnect refused before it stages a replacement never owned the
+/// quarantined transition: its admission, recovery lookup, start boundary or
+/// execution can each meet the lost scope after the fact. The same clean
+/// refusal a receipt-less reconnect receives is the exact answer. Keep every
+/// other refusal, including the same protocol failure for ordinary work or for
+/// a healthy owner, exactly as it was.
 fn reconnect_admission_refusal(
     command: &str,
     error: ProtocolError,
@@ -2693,6 +2693,30 @@ fn reconnect_admission_refusal(
         ProtocolError::StaleScope
     } else {
         error
+    }
+}
+
+impl ClientBrowser {
+    /// A `scope.reconnect` refused before it stages any replacement never used
+    /// the quarantined transition. When the owner's exact scope is already gone
+    /// (its CDP reader recorded the remote EOF) the contract answer is the same
+    /// clean not-dispatched stale-scope refusal a receipt-less reconnect
+    /// receives; reporting scope-unavailable would surface a refused reconnect
+    /// as a protocol or publication failure. A closed scope, a healthy owner,
+    /// cancellation and deadline refusals keep their exact codes.
+    async fn reconnect_refusal(&self, command: &str, error: ProtocolError) -> ProtocolError {
+        let scope_closed = self
+            .broker
+            .health()
+            .is_ok_and(|(_, state)| state == super::client_protocol::ScopeState::Closed);
+        let owner_remote_closed = !scope_closed
+            && self
+                .owner
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|owner| *owner.manager.client.remote_connection_closed().borrow());
+        reconnect_admission_refusal(command, error, owner_remote_closed)
     }
 }
 
@@ -3496,9 +3520,19 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             != 0
                     })
                 {
+                    // A peer retirement in progress refuses every non-end
+                    // command. For an exact reconnect that refusal is still a
+                    // clean pre-dispatch answer; it must not borrow the
+                    // unavailable-scope protocol failure.
+                    let error = if command == "scope.reconnect" {
+                        self.reconnect_refusal(&command, ProtocolError::ScopeUnavailable)
+                            .await
+                    } else {
+                        ProtocolError::ScopeUnavailable
+                    };
                     return NativeOutcome {
                         retention: None,
-                        result: Err(ProtocolError::ScopeUnavailable),
+                        result: Err(error),
                         effects: Effects::NotDispatched,
                     };
                 }
@@ -3670,11 +3704,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             match self.broker.disconnected_recovery(&lease) {
                 Ok(proof) => proof,
                 Err(error) => {
+                    // The quarantined transition settled after this reconnect
+                    // was admitted, or the offered receipt is no longer usable
+                    // for it. Nothing was dispatched, so the clean contract
+                    // refusal applies instead of a protocol failure.
+                    let error = self.reconnect_refusal(&command, error).await;
                     return NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    };
                 }
             }
         } else {
@@ -3697,15 +3736,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 // receipt-less reconnect receives. Reporting scope-unavailable
                 // instead would surface a refused reconnect as a protocol or
                 // publication failure.
-                let scope_closed = self
-                    .broker
-                    .health()
-                    .is_ok_and(|(_, state)| state == super::client_protocol::ScopeState::Closed);
-                let owner_remote_closed = !scope_closed
-                    && self.owner.lock().await.as_ref().is_some_and(|owner| {
-                        *owner.manager.client.remote_connection_closed().borrow()
-                    });
-                let error = reconnect_admission_refusal(&command, error, owner_remote_closed);
+                let error = self.reconnect_refusal(&command, error).await;
                 return NativeOutcome {
                     retention: None,
                     result: Err(error),
@@ -3731,11 +3762,19 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
             }
             Err(error) => {
+                // The quarantine can settle between the recovery lookup and
+                // this start boundary. The exact reconnect owns no replacement
+                // and dispatched nothing, so it keeps the clean stale refusal.
+                let error = if command == "scope.reconnect" {
+                    self.reconnect_refusal(&command, error).await
+                } else {
+                    error
+                };
                 return NativeOutcome {
                     retention: None,
                     result: Err(error),
                     effects: Effects::NotDispatched,
-                }
+                };
             }
         }
         if matches!(command.as_str(), "scope.reset" | "state.restore") {
@@ -3760,9 +3799,18 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         }
                     }
                 };
-            return self
+            let mut outcome = self
                 .reconnect_scope(captured_scope.unwrap_or_default(), request, lease, recovery)
                 .await;
+            // A pre-dispatch replacement refusal is the same clean stale
+            // answer, whatever exact precondition ended it. An accepted
+            // transition keeps its Unknown outcome untouched.
+            if outcome.effects == Effects::NotDispatched {
+                if let Err(error) = outcome.result {
+                    outcome.result = Err(self.reconnect_refusal(&command, error).await);
+                }
+            }
+            return outcome;
         }
         if command == "scope.restart" {
             return self
