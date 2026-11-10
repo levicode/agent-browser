@@ -735,3 +735,24 @@ async fn a_producer_quarantine_still_publishes_the_remote_loss_notice() {
         "a quarantined owner must still publish its remote-loss notice"
     );
 }
+
+#[tokio::test]
+async fn loss_noticed_after_publications_close_is_not_a_teardown_failure() {
+    // A real remote loss can be observed by the connection watcher after the
+    // close exchange has already sealed publications for retirement. There is
+    // no client left to notify, and the loss is not a new failure: the watcher
+    // must report "not queued" so the close can still prove its teardown.
+    let mut owner = DisconnectedOwner::new().await;
+    owner.broker.quarantine().unwrap();
+    let sink = owner
+        .browser
+        .event_sink
+        .get()
+        .cloned()
+        .expect("the owner event sink is installed");
+    sink.close_publications_for_test();
+    assert_eq!(
+        sink.emit_disconnected(&owner.client, &owner.targets),
+        Ok(false)
+    );
+}
