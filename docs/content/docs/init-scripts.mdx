@@ -56,6 +56,10 @@ agent-browser batch \
 
 `open` with no URL launches the browser on `about:blank`, leaving room to stage state before the target page loads.
 
+## Shared CDP connections
+
+Init scripts are registered per target. When the browser is shared with another CDP client — another agent, a test runner, or a Playwright client attached to the same tabs — that client can release a new popup's start pause before the scripts are registered. The popup's first document is then best effort: it may miss the init scripts or run one more than once. Documents created after registration (a reload, an explicit navigation, or a tab that starts after the setup is applied) keep the guarantee. Do not rely on init scripts in the first document of a popup the agent did not start in a shared browser. The same limitation applies to native ownership of JavaScript dialogs opened by such a popup.
+
 ## Extensions
 
 ```bash

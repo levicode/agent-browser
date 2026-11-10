@@ -69,6 +69,8 @@ This is useful when:
 
 ## Tab pinning
 
+New tabs and popups opened by the page are attached as they appear. If another CDP client also attached to the same browser can release a popup's start pause first, that popup's first document may start before this session registers its init scripts or dialog routing; later documents keep the guarantee. See [Init Scripts](/init-scripts#shared-cdp-connections).
+
 When several sessions share one browser over CDP, each session remembers which tab it is bound to (by CDP target id, persisted across daemon restarts). A restarted daemon reattaches to the session's own tab instead of adopting whatever tab is currently active, which in a shared browser is usually another session's.
 
 Pass `--pin-tab` (or set `AGENT_BROWSER_PIN_TAB=1`) to make the binding strict:

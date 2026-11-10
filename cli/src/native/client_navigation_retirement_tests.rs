@@ -379,6 +379,7 @@ async fn run_scheduled(
                 let mut receipt = None;
                 let mut acknowledged = None;
                 let mut committed = false;
+                let mut submitted = false;
                 let pending = trigger(
                     &page,
                     &operation,
@@ -390,6 +391,7 @@ async fn run_scheduled(
                     Some((&owner, &mut receipt)),
                     &mut acknowledged,
                     &mut committed,
+                    &mut submitted,
                 );
                 let mut result = if ack_cancel_race {
                     ORIGINAL_RESPONSE_GATE.scope(producer_gate, pending).await
@@ -895,4 +897,99 @@ async fn ack_cancel_race_still_rejects_wrong_loader_error_and_missing_terminal_e
         assert!(!confirmed, "accepted {reply:?}");
         assert!(stops <= 1);
     }
+}
+
+#[tokio::test]
+async fn reserved_navigation_cancel_before_submit_records_the_command_as_unsubmitted() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut commands = 0usize;
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(_) = message {
+                commands += 1;
+            }
+        }
+        commands
+    });
+    let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+    let ledger = OwnerDebtLedger::new(1, "scope".into());
+    client.install_debt_ledger(ledger.clone()).unwrap();
+    let targets = ClientTargets::new("context".into(), "scope".into());
+    targets
+        .attached("context", "target".into(), "session".into(), "page".into())
+        .unwrap();
+    targets.configured("target").unwrap();
+    targets
+        .resume_permit("target")
+        .await
+        .unwrap()
+        .complete()
+        .unwrap();
+    targets.acknowledge_enrollment().unwrap();
+    let gate = Arc::new(ExecutionGate::default());
+    let page = BrowserExecutionLease {
+        client: client.clone(),
+        page_session_id: "session".into(),
+        target_id: "target".into(),
+        identity_scope: "scope".into(),
+        permit: gate.enter(false).unwrap(),
+        targets: targets.clone(),
+    };
+    let broker = Arc::new(ClientSession::new());
+    let operation = broker.admit(1, 1, 10_000).unwrap();
+    assert!(broker.start(1, 1).unwrap());
+    let journal = ledger
+        .operation(
+            OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            "target".into(),
+            "session".into(),
+        )
+        .unwrap();
+    journal.bind_operation(&operation).unwrap();
+    let tasks = Arc::new(RetainedTasks::default());
+    let mut events = client
+        .subscribe_bounded_methods(METHODS, 256, 65536)
+        .unwrap();
+    // The caller's abort lands before the operation can reserve or submit the
+    // navigation. Nothing on this journal ever reaches the transport.
+    broker.cancel(1, 1).unwrap();
+    let mut receipt = None;
+    let mut acknowledged = None;
+    let mut committed = false;
+    let mut submitted = false;
+    let result = trigger(
+        &page,
+        &operation,
+        "Page.navigate",
+        json!({"url":"https://example.test/never"}),
+        "frame",
+        Some("old"),
+        &mut events,
+        Some((&tasks, &mut receipt)),
+        &mut acknowledged,
+        &mut committed,
+        &mut submitted,
+    )
+    .await;
+    assert_eq!(result, Err(ProtocolError::Cancelled));
+    assert!(
+        !submitted,
+        "an unsubmitted navigation was recorded as submitted"
+    );
+    assert!(!committed);
+    assert!(receipt.is_none());
+    assert!(acknowledged.is_none());
+    drop(events);
+    client.close().await;
+    let commands = tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(commands, 0, "the cancelled operation still sent a command");
 }
