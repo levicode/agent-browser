@@ -552,7 +552,8 @@ impl ClientEventSink {
             .map_err(|_| ProtocolError::CapacityExceeded)
     }
     /// Exact native reader EOF notice. False means not queued because the old
-    /// scope is already closed; it never means peer delivery or recovery.
+    /// scope is already closed or already sealed for retirement; it never means
+    /// peer delivery or recovery.
     /// Unlike ordinary publication this path cannot re-quarantine a replacement
     /// while an old watcher is finishing. Lifecycle still joins that watcher.
     ///
@@ -581,11 +582,14 @@ impl ClientEventSink {
             if !debt.matches_owner(generation, &targets.identity_scope) {
                 return Err(ProtocolError::StaleScope);
             }
-            if health == ScopeState::Closed {
+            // A closed scope and a scope whose close already sealed
+            // publications for retirement have no client left to notify. The
+            // loss is not a new failure there: report "not queued" so a loss
+            // that races the close cannot turn the connection watcher's
+            // event-only task into a teardown failure.
+            if health == ScopeState::Closed || !self.open.load(std::sync::atomic::Ordering::Acquire)
+            {
                 return Ok(false);
-            }
-            if !self.open.load(std::sync::atomic::Ordering::Acquire) {
-                return Err(ProtocolError::ScopeUnavailable);
             }
             self.enqueue_event(
                 &mut order,
