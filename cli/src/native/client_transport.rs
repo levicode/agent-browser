@@ -552,9 +552,15 @@ impl ClientEventSink {
             .map_err(|_| ProtocolError::CapacityExceeded)
     }
     /// Exact native reader EOF notice. False means not queued because the old
-    /// scope is already quarantined; it never means peer delivery or recovery.
+    /// scope is already closed; it never means peer delivery or recovery.
     /// Unlike ordinary publication this path cannot re-quarantine a replacement
     /// while an old watcher is finishing. Lifecycle still joins that watcher.
+    ///
+    /// The notice is loss evidence, not admission authority: a producer that
+    /// quarantined the scope first (a failed network task or a dirty task
+    /// settlement) must not swallow it. Suppressing it would leave the client
+    /// believing the scope is still usable, and its explicit cleanup would then
+    /// meet a quarantined broker it was never told about.
     pub(crate) fn emit_disconnected(
         &self,
         client: &std::sync::Arc<super::cdp::client::CdpClient>,
@@ -575,11 +581,10 @@ impl ClientEventSink {
             if !debt.matches_owner(generation, &targets.identity_scope) {
                 return Err(ProtocolError::StaleScope);
             }
-            if health == ScopeState::Quarantined {
+            if health == ScopeState::Closed {
                 return Ok(false);
             }
-            if health != ScopeState::Usable || !self.open.load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !self.open.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(ProtocolError::ScopeUnavailable);
             }
             self.enqueue_event(
@@ -1756,6 +1761,20 @@ where
                                 .health()
                                 .map(|(_, state)| state)
                                 .unwrap_or(ScopeState::Quarantined);
+                            // A reconnect admitted as ordinary work can meet the
+                            // scope's quarantine inside this same admission.
+                            // It never owned the quarantined transition and
+                            // dispatched nothing, so the disconnected-recovery
+                            // contract's clean refusal is stale-scope rather
+                            // than an unavailable-scope protocol failure.
+                            let code = if command == "scope.reconnect"
+                                && code == ProtocolError::ScopeUnavailable
+                                && state == ScopeState::Quarantined
+                            {
+                                ProtocolError::StaleScope
+                            } else {
+                                code
+                            };
                             if !enqueue(
                                 &sender,
                                 result_message(
@@ -3413,6 +3432,62 @@ mod tests {
         assert_eq!(closed["scopeState"], "closed");
         assert!(closed.get("cleanup").is_none());
         assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn reconnect_refused_inside_admission_on_a_quarantined_scope_settles_as_stale_scope() {
+        struct NeverDispatch;
+        impl ClientExecutor for NeverDispatch {
+            fn capabilities(&self) -> Vec<String> {
+                vec![]
+            }
+            async fn execute(
+                &self,
+                _: String,
+                _: serde_json::Map<String, serde_json::Value>,
+                _: OperationLease,
+            ) -> NativeOutcome {
+                panic!("a refused reconnect never dispatches work");
+            }
+            async fn shutdown(&self) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+        }
+        // A reconnect admitted as ordinary work can meet the scope's quarantine
+        // inside that same admission. Nothing was dispatched, so the
+        // disconnected-recovery contract's clean stale-scope refusal applies
+        // instead of an unavailable-scope protocol failure.
+        let broker = std::sync::Arc::new(ClientSession::new());
+        broker.quarantine().unwrap();
+        let executor = std::sync::Arc::new(NeverDispatch);
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        let ready = settlement_frame(&mut peer).await;
+        assert_eq!(ready["type"], "ready");
+        peer.get_mut()
+            .write_all(
+                b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":5000,\"command\":\"scope.reconnect\",\"args\":{\"identityScope\":\"scope\"}}\n",
+            )
+            .await
+            .unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "stale-scope");
+        assert_eq!(result["effects"], "not-dispatched");
+        assert_eq!(result["scopeState"], "quarantined");
+        drop(serving);
     }
     #[tokio::test]
     async fn quarantined_settlement_keeps_the_previously_offered_closing_receipt() {
