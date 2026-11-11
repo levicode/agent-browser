@@ -4143,8 +4143,10 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let semantic_trace = matches!(&request, DispatchRequest::TraceSemantic(_));
             let evidence = if semantic_trace {
                 super::client_tasks::SettlementEvidence::OptionalTrace
-            } else {
+            } else if modifies_page {
                 super::client_tasks::SettlementEvidence::Ordinary
+            } else {
+                super::client_tasks::SettlementEvidence::ReadOnly
             };
             let receive = self
                 .tasks

@@ -27,6 +27,12 @@ pub struct RetainedCompletion {
 pub(crate) enum SettlementEvidence {
     Ordinary,
     OptionalTrace,
+    /// A dispatch that cannot mutate page content (a query or field read).
+    /// A caller/deadline cancellation of one is a non-dispatch with nothing
+    /// to publish: its lost producer settlement is the scope's to retire, so
+    /// it must not seal the page, retain the producer, or quarantine the
+    /// scope (levicode/e2e#194).
+    ReadOnly,
 }
 /// Everything a retained operation needs from the scope that starts it. The
 /// evidence-aware entry points take this context so adding a settlement mode
@@ -281,6 +287,7 @@ impl RetainedTasks {
             cancellation,
         } = context;
         let optional_trace = evidence == SettlementEvidence::OptionalTrace;
+        let read_only = evidence == SettlementEvidence::ReadOnly;
         let operations = self.operations.clone();
         let task_targets = targets.clone();
         let key = journal.key();
@@ -298,6 +305,7 @@ impl RetainedTasks {
                 operations.running(key);
                 let monitor_registry = operations.clone();
                 let monitor_targets = task_targets.clone();
+                let caller_cancellation = cancellation.clone();
                 let mut cancellation = cancellation;
                 let monitor_broker = broker.clone();
                 let monitor = tokio::spawn(async move {
@@ -356,7 +364,29 @@ impl RetainedTasks {
                         inventory,
                     );
                 }
-                let dirty = already_dirty || settlement.is_err();
+                // A read-only dispatch that the caller cancelled or that ran
+                // out its deadline never had page effects to lose. Its lost
+                // producer settlement is retired with the scope, so it must
+                // not become settlement uncertainty: quarantining here turned
+                // one cancelled query into an unprovable attempt cleanup and
+                // every later attempt on the worker into APP_NOT_OPEN
+                // (levicode/e2e#194). A panic or a scope loss still counts.
+                let caller_stopped_read = read_only
+                    && outcome.effects == Effects::NotDispatched
+                    && matches!(
+                        outcome.result,
+                        Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+                    )
+                    && matches!(
+                        (*caller_cancellation.borrow()).error(),
+                        Some(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+                    )
+                    && !monitor_failed;
+                let dirty = if caller_stopped_read {
+                    false
+                } else {
+                    already_dirty || settlement.is_err()
+                };
                 if optional_trace {
                     // #48: an optional trace owns only disposable evidence. A
                     // cleanup loss or an unsettled target inventory is
@@ -398,7 +428,7 @@ impl RetainedTasks {
                 // that now settles as a non-dispatch would leave those claims
                 // in the ledger and the later close exchange could not prove
                 // cleanup.
-                if outcome.effects == Effects::Unknown || dirty || remote_only {
+                if outcome.effects == Effects::Unknown || dirty || remote_only || caller_stopped_read {
                     operations.retire(key);
                 }
                 let dirty = (if remote_only {
@@ -1340,6 +1370,148 @@ mod fixed_read_eof_tests {
                 assert_eq!(broker.health().unwrap().1, ScopeState::Usable);
                 assert!(targets.inventory().is_ok());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_cancelled_settlement_keeps_scope_usable_and_drains_clean() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_protocol::ScopeState;
+        use super::super::client_session::ClientSession;
+        use super::super::client_targets::ClientTargets;
+
+        // A read-only dispatch the caller cancelled (or that ran out its
+        // deadline) has nothing to publish. Its lost producer settlement is
+        // retired with the scope, so it must not seal the page, quarantine the
+        // scope, or fail the drain (levicode/e2e#194). Mutating dispatches, a
+        // real read failure, a dirty success, and a scope loss all keep the
+        // fail-closed settlement.
+        let cases = [
+            (
+                "cancelled read-only",
+                SettlementEvidence::ReadOnly,
+                ProtocolError::Cancelled,
+                true,
+                Ok(()),
+            ),
+            (
+                "deadline read-only",
+                SettlementEvidence::ReadOnly,
+                ProtocolError::DeadlineExceeded,
+                true,
+                Ok(()),
+            ),
+            (
+                "cancelled ordinary",
+                SettlementEvidence::Ordinary,
+                ProtocolError::Cancelled,
+                true,
+                Err(ProtocolError::CleanupFailed),
+            ),
+            (
+                "failed read-only",
+                SettlementEvidence::ReadOnly,
+                ProtocolError::BrowserFailure,
+                true,
+                Err(ProtocolError::CleanupFailed),
+            ),
+            (
+                "unstopped read-only",
+                SettlementEvidence::ReadOnly,
+                ProtocolError::Cancelled,
+                false,
+                Err(ProtocolError::CleanupFailed),
+            ),
+        ];
+        for (label, evidence, error, cancel, expected_drain) in cases {
+            let tasks = RetainedTasks::default();
+            let broker = Arc::new(ClientSession::new());
+            let lease = broker.admit(1, 1, 60_000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            targets
+                .attached("ctx", "selected".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("selected").unwrap();
+            targets
+                .resume_permit("selected")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap();
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            ledger.bind_context("ctx").unwrap();
+            ledger.bind_session("ctx", "selected", "session").unwrap();
+            let key = OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            };
+            let journal = ledger
+                .operation(key, "selected".into(), "session".into())
+                .unwrap();
+            journal.bind_operation(&lease).unwrap();
+            let mut stopped = lease.cancellation.clone();
+            let receive = tasks
+                .start_operation_evidence(
+                    OperationStartContext {
+                        identity_scope: "scope".into(),
+                        targets: targets.clone(),
+                        broker: broker.clone(),
+                        journal,
+                        cancellation: lease.cancellation.clone(),
+                    },
+                    evidence,
+                    async move {
+                        if cancel {
+                            while *stopped.borrow()
+                                == super::super::client_session::CancelSignal::None
+                            {
+                                if stopped.changed().await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        (
+                            NativeOutcome {
+                                retention: None,
+                                result: Err(error),
+                                effects: Effects::NotDispatched,
+                            },
+                            true,
+                        )
+                    },
+                )
+                .await
+                .unwrap();
+            if cancel {
+                broker.cancel(1, 1).unwrap();
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(2), receive)
+                .await
+                .unwrap()
+                .unwrap();
+            let clean = expected_drain.is_ok();
+            assert_eq!(
+                outcome.effects,
+                if clean {
+                    Effects::NotDispatched
+                } else {
+                    Effects::Unknown
+                },
+                "{label}"
+            );
+            assert_eq!(
+                broker.health().unwrap().1,
+                if clean {
+                    ScopeState::Usable
+                } else {
+                    ScopeState::Quarantined
+                },
+                "{label}"
+            );
+            assert_eq!(targets.inventory().is_ok(), clean, "{label}: page seal");
+            assert_eq!(tasks.drain().await, expected_drain, "{label}: drain");
         }
     }
 }
