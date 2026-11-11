@@ -1871,6 +1871,27 @@ impl ClientNetwork {
                 Ok(()) => Ok(()),
                 Err(NetworkTaskFailure::Operation(error)) => Err(error),
                 Err(NetworkTaskFailure::Command(failure)) => {
+                    if failure.request_gone() {
+                        // The browser itself proved the exact paused request or
+                        // interception is gone (a page-created frame detached
+                        // before the decision reached it). No application
+                        // request is left paused, so retire only this callback
+                        // occurrence; the scope keeps its cleanup proof.
+                        match this.finish_callback_occurrence(
+                            &session.session_id,
+                            &session_tenure,
+                            pending_key.as_ref(),
+                            pending_occurrence.as_ref(),
+                        ) {
+                            Ok(_) => return Ok(()),
+                            Err(error) => {
+                                if !this.sealed.load(Ordering::Acquire) {
+                                    let _ = this.broker.quarantine();
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
                     if let Some(receipt) = failure.into_retirement() {
                         if this.client.consume_network_retirement(
                             receipt,

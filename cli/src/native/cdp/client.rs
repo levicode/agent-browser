@@ -93,6 +93,10 @@ enum CommandWaitFailure {
 /// attach exact reader destruction; error ACKs and later lifecycle changes cannot.
 pub(crate) struct NetworkCommandFailure {
     retirement: Option<NetworkCommandRetirement>,
+    /// The browser already dropped the exact Fetch interception this command
+    /// targeted (a page-created frame can detach while a network decision is
+    /// in flight). The command is moot, not a lost scope-cleanup proof.
+    request_gone: bool,
 }
 impl std::fmt::Debug for NetworkCommandFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -105,10 +109,16 @@ impl NetworkCommandFailure {
     pub(crate) fn into_retirement(self) -> Option<NetworkCommandRetirement> {
         self.retirement
     }
+    pub(crate) fn request_gone(&self) -> bool {
+        self.request_gone
+    }
 }
 impl From<String> for NetworkCommandFailure {
     fn from(_: String) -> Self {
-        Self { retirement: None }
+        Self {
+            retirement: None,
+            request_gone: false,
+        }
     }
 }
 /// Non-cloneable, internal local-retirement evidence; never an ACK or authority.
@@ -1840,7 +1850,10 @@ impl CdpClient {
                 | "Fetch.continueWithAuth"
                 | "Page.handleJavaScriptDialog"
         ) {
-            return Err(NetworkCommandFailure { retirement: None });
+            return Err(NetworkCommandFailure {
+                retirement: None,
+                request_gone: false,
+            });
         }
         let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
         self.send_reserved_network_task_command(method, params, session, reservation)
@@ -1895,7 +1908,10 @@ impl CdpClient {
             reservation.is_owner_cleanup()
                 || !reservation.matches_envelope(method, Some(&params), Some(session))
         }) {
-            return Err(NetworkCommandFailure { retirement: None });
+            return Err(NetworkCommandFailure {
+                retirement: None,
+                request_gone: false,
+            });
         }
         let mut capture = match (self.owner.as_ref(), reservation.as_ref()) {
             (Some(owner), Some(reservation)) if reservation.belongs_to(owner) => {
@@ -1911,6 +1927,7 @@ impl CdpClient {
         let budget = reservation
             .as_ref()
             .and_then(CommandReservation::initialization_budget);
+        let mut request_gone = false;
         let result = within_initialization(budget, async {
             let response = self
                 .submit_reserved_command_bound(
@@ -1927,6 +1944,14 @@ impl CdpClient {
             match reply {
                 Ok(CommandReply::Success(value)) => Ok(value),
                 Ok(CommandReply::ErrorAck(error)) => {
+                    // The paused request or its interception was retired by
+                    // the browser (for example the frame that owned it
+                    // detached). Nothing application-visible is left paused;
+                    // the callback owner settles instead of quarantining the
+                    // whole scope for a moot terminal command.
+                    if error.is_interception_not_found() {
+                        request_gone = true;
+                    }
                     Err(format!("CDP error ({}): {}", method, error))
                 }
                 // These fixed terminal methods carry no remote-object courier.
@@ -1943,6 +1968,7 @@ impl CdpClient {
         .await;
         result.map_err(|_| NetworkCommandFailure {
             retirement: capture.and_then(|capture| capture.retirement),
+            request_gone,
         })
     }
     fn capture_network_retirement(&self, capture: &mut NetworkFailureCapture) {

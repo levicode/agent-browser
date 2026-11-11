@@ -93,6 +93,14 @@ impl CdpError {
     pub(crate) fn is_session_not_found(&self) -> bool {
         is_session_not_found_message(&self.message)
     }
+
+    /// The paused request or its interception was already retired by the
+    /// browser (for example a page-created frame detached before a network
+    /// decision reached it). Continuing or failing it is moot, not a lost
+    /// cleanup proof for the whole scope.
+    pub(crate) fn is_interception_not_found(&self) -> bool {
+        is_interception_not_found_message(&self.message)
+    }
 }
 
 /// The same closed browser answer as it survives the client's legacy string
@@ -117,6 +125,13 @@ fn is_closed_browser_answer(message: &str, answers: &[&str]) -> bool {
 }
 pub(crate) fn is_session_not_found_message(message: &str) -> bool {
     is_closed_browser_answer(message, &["session with given id not found"])
+}
+/// Fetch interception the browser already dropped. A page can remove a frame
+/// target while its paused request's decision is in flight; the browser then
+/// answers the terminal Fetch command with this closed shape. The request (and
+/// its interception) is gone, so no application request is left paused.
+pub(crate) fn is_interception_not_found_message(message: &str) -> bool {
+    is_closed_browser_answer(message, &["invalid interceptionid"])
 }
 /// A resolved object id the browser no longer knows. Only the exact document or
 /// realm could have destroyed the handle owned by a native capture group, so
@@ -656,6 +671,13 @@ mod tests {
         // Every other error keeps its strict classification.
         assert!(!is_session_not_found_message(
             "CDP error (Page.getFrameTree): Cannot find context with specified id"
+        ));
+        assert!(is_interception_not_found_message("Invalid InterceptionId."));
+        assert!(is_interception_not_found_message(
+            "CDP error (Fetch.continueRequest): Invalid InterceptionId."
+        ));
+        assert!(!is_interception_not_found_message(
+            "CDP error (Fetch.continueRequest): Session with given id not found."
         ));
         assert!(CdpError {
             code: Some(-32001),
