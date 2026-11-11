@@ -12,7 +12,7 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
 #[cfg(test)]
@@ -2484,6 +2484,18 @@ fn proven_hidden_iframe(node: &SemanticNode) -> bool {
             .is_some_and(|facts| facts.node_type == 1 && facts.tag == "iframe")
 }
 
+/// Iframe owners suppressed by the display-none pre-filter. Those subtrees are
+/// never read, so their owners carry no projected hidden state; the probe
+/// proves the same non-rendering that the metadata reader would, and the frame
+/// proof re-reads each exact owner before trusting it.
+fn display_none_iframe_owners(probed: &HashMap<i64, (i64, String)>) -> HashSet<i64> {
+    probed
+        .iter()
+        .filter(|(_, (kind, tag))| *kind == 1 && tag == "iframe")
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 #[cfg(test)]
 fn frame_has_hidden_owner(
     frame: &ObservationFrame,
@@ -2717,6 +2729,12 @@ pub async fn observe(
             display_none_subtrees(client, frame, &dom, lease).await
         )
         .unwrap_or_default();
+        // A display-none subtree is never read, so an iframe owner inside one
+        // never acquires the public hidden state that proves its frame
+        // omission. The probe's suppression is the same proof compact uses to
+        // drop the owner, and native re-reads the exact owner before honoring
+        // the omission, so carry those owners into the frame proof.
+        let display_none_owners = display_none_iframe_owners(&probed);
         for (id, fact) in probed {
             suppressed.entry(id).or_insert(fact);
         }
@@ -2824,6 +2842,7 @@ pub async fn observe(
             .iter()
             .filter(|(_, node)| proven_hidden_iframe(node))
             .map(|(id, _)| *id)
+            .chain(display_none_owners)
             .collect();
         let (roots, frame_truncated) = semantic_capture_stage!(
             witness,
@@ -9028,6 +9047,17 @@ mod tests {
         data["attributes"]["role"] = json!("unknown\tstrong");
         let node = project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
         assert_eq!(node.role.as_deref(), Some("strong"));
+    }
+
+    #[test]
+    fn display_none_prefilter_proves_only_element_iframe_owners() {
+        let probed = HashMap::from([
+            (1, (1, "iframe".to_owned())),
+            (2, (1, "div".to_owned())),
+            (3, (3, "iframe".to_owned())),
+        ]);
+        assert_eq!(display_none_iframe_owners(&probed), HashSet::from([1]));
+        assert!(display_none_iframe_owners(&HashMap::new()).is_empty());
     }
 
     #[test]
