@@ -5056,18 +5056,32 @@ impl SubmittedCommand {
             return Vec::new();
         }
         let result = response.result.as_ref().unwrap_or(&Value::Null);
-        let mut seen = HashSet::new();
-        let handles: Vec<&str> = [
+        // Result/object handles are the bounded creations the reserved slots
+        // cover. A failed evaluation can additionally serialize the exact
+        // exception object beside the returned Error object (for example a
+        // page script losing its frame owner); that bounded error artifact is
+        // not an unaccounted page creation. It is still a remote object, so it
+        // is retained and released like every other handle below instead of
+        // contaminating the whole owner.
+        let mut creation_seen = HashSet::new();
+        let creation_handles: Vec<&str> = [
             result["result"]["objectId"].as_str(),
             result["object"]["objectId"].as_str(),
-            result["exceptionDetails"]["exception"]["objectId"].as_str(),
         ]
         .into_iter()
         .flatten()
-        .filter(|object| seen.insert(*object))
+        .filter(|object| creation_seen.insert(*object))
         .collect();
-        if handles.len() > command.creation_slots
-            || handles.iter().any(|object| object.len() > 4096)
+        let exception_handles: Vec<&str> =
+            [result["exceptionDetails"]["exception"]["objectId"].as_str()]
+                .into_iter()
+                .flatten()
+                .collect();
+        if creation_handles.len() > command.creation_slots
+            || creation_handles
+                .iter()
+                .chain(exception_handles.iter())
+                .any(|object| object.len() > 4096)
         {
             state.contaminate_integrity();
             // Preserve pre-reserved anonymous creation debt if an invalid
@@ -5084,6 +5098,12 @@ impl SubmittedCommand {
             }
             return Vec::new();
         }
+        let mut seen = HashSet::new();
+        let handles: Vec<&str> = creation_handles
+            .into_iter()
+            .chain(exception_handles)
+            .filter(|object| seen.insert(*object))
+            .collect();
         let mut disposals = Vec::new();
         for object in handles {
             if !state.objects.iter().any(|old| {
@@ -8795,6 +8815,63 @@ pub(crate) mod tests {
         // A full/stopped queue drops only its unsent reservation, never debt.
         drop(disposal.reserve().unwrap());
         assert_eq!(ledger.snapshot().object_debt, 1);
+    }
+    #[test]
+    fn failed_evaluation_retains_result_and_exception_objects_without_losing_the_owner() {
+        let (ledger, journal) = owner();
+        let command = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.callFunctionOn",
+                Some(&json!({
+                    "functionDeclaration": "function(){return new Error('frame owner moved')}",
+                    "returnByValue": true
+                })),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap();
+        // A page script that throws while its frame is being removed returns
+        // the Error object as the expression result and serializes the exact
+        // exception object beside it. Both are bounded remote objects the
+        // ledger can retain and release; neither proves a corrupted reply.
+        let reply = response(json!({
+            "result": {"objectId": "error-result"},
+            "exceptionDetails": {"exception": {"objectId": "error-exception"}}
+        }));
+        let disposals = command.settle_for_delivery(&reply);
+        let snapshot = ledger.snapshot();
+        assert!(!snapshot.integrity_lost);
+        assert_eq!(disposals.len(), 2);
+        assert_eq!(snapshot.object_debt, 2);
+    }
+    #[test]
+    fn unaccounted_creation_handles_still_contaminate_beside_an_exception_object() {
+        let (ledger, journal) = owner();
+        let command = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.callFunctionOn",
+                Some(&json!({
+                    "functionDeclaration": "function(){return this}",
+                    "returnByValue": true
+                })),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap();
+        // One reserved creation slot but two distinct result/object creations:
+        // the exception artifact allowance must not excuse a second result.
+        let reply = response(json!({
+            "result": {"objectId": "created-a"},
+            "object": {"objectId": "created-b"},
+            "exceptionDetails": {"exception": {"objectId": "error-exception"}}
+        }));
+        let _ = command.settle_for_delivery(&reply);
+        let snapshot = ledger.snapshot();
+        assert!(snapshot.integrity_lost);
     }
     #[tokio::test]
     async fn revoked_journal_rejects_old_application_step_but_admits_mandatory_cleanup() {

@@ -2066,6 +2066,7 @@ where
                     id,
                     generation: requested,
                     operation_seq,
+                    command,
                     ..
                 } => result_message(
                     id,
@@ -2073,10 +2074,20 @@ where
                     operation_seq,
                     NativeOutcome {
                         retention: None,
-                        result: Err(if requested == generation {
-                            ProtocolError::ScopeUnavailable
-                        } else {
+                        result: Err(if requested != generation {
                             ProtocolError::StaleGeneration
+                        } else if command == "scope.reconnect" && recovery_negotiated {
+                            // This request arrived after the ordinary lane had
+                            // already entered terminal control. Its exact scope
+                            // is gone and nothing was dispatched, so the
+                            // disconnected-recovery contract gets the same
+                            // clean stale-scope refusal as every other
+                            // pre-dispatch reconnect refusal. A client that did
+                            // not negotiate that contract keeps the legacy
+                            // unavailable-scope refusal.
+                            ProtocolError::StaleScope
+                        } else {
+                            ProtocolError::ScopeUnavailable
                         }),
                         effects: Effects::NotDispatched,
                     },
@@ -3123,10 +3134,15 @@ mod tests {
         shutdown_release: tokio::sync::Notify,
         shutdown_done: tokio::sync::Notify,
         fail: bool,
+        recovery: bool,
     }
     impl ClientExecutor for TerminalCloseExecutor {
         fn capabilities(&self) -> Vec<String> {
-            vec![]
+            if self.recovery {
+                vec![super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned()]
+            } else {
+                vec![]
+            }
         }
         fn prepare_decision(&self, _: u64, _: &str, _: &Decision) -> Result<(), ProtocolError> {
             panic!("terminal callback authority must never reach the executor");
@@ -3158,6 +3174,7 @@ mod tests {
     }
     async fn terminal_close_peer(
         fail: bool,
+        recovery: bool,
     ) -> (
         tokio::io::BufReader<tokio::io::DuplexStream>,
         std::sync::Arc<TerminalCloseExecutor>,
@@ -3171,6 +3188,7 @@ mod tests {
             shutdown_release: tokio::sync::Notify::new(),
             shutdown_done: tokio::sync::Notify::new(),
             fail,
+            recovery,
         });
         let (peer, server) = tokio::io::duplex(8192);
         let (reader, writer) = tokio::io::split(server);
@@ -3180,7 +3198,14 @@ mod tests {
             ClientMessage::Hello {
                 id: "h".into(),
                 protocol: PROTOCOL.into(),
-                required_capabilities: vec!["terminal.close/1".into()],
+                required_capabilities: if recovery {
+                    vec![
+                        "terminal.close/1".into(),
+                        super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned(),
+                    ]
+                } else {
+                    vec!["terminal.close/1".into()]
+                },
             },
             broker,
             executor.clone(),
@@ -3203,7 +3228,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_after_shutdown_uses_cached_proof_without_request_revival() {
-        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let (mut peer, executor, serving) = terminal_close_peer(false, true).await;
         executor.shutdown_release.notify_one();
         executor.shutdown_done.notified().await;
         peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"late\",\"generation\":1,\"operationSeq\":2,\"timeoutMs\":1000,\"command\":\"scope.reconnect\",\"args\":{}}\n{\"type\":\"close\",\"id\":\"stale\",\"generation\":2}\n").await.unwrap();
@@ -3211,6 +3236,7 @@ mod tests {
         assert_eq!(refusal["id"], "late");
         assert_eq!(refusal["effects"], "not-dispatched");
         assert_eq!(refusal["scopeState"], "quarantined");
+        assert_eq!(refusal["error"]["code"], "stale-scope");
         let stale = settlement_frame(&mut peer).await;
         assert_eq!(stale["error"]["code"], "stale-generation");
         peer.get_mut().write_all(b"{\"type\":\"decision\",\"id\":\"d\",\"generation\":1,\"token\":\"retired\",\"decision\":{\"kind\":\"abort\"}}\n").await.unwrap();
@@ -3231,7 +3257,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_before_shutdown_preserves_partial_cancel_and_single_receipt() {
-        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let (mut peer, executor, serving) = terminal_close_peer(false, false).await;
         peer.get_mut()
             .write_all(b"{\"type\":\"cancel\",\"id\":\"c\",")
             .await
@@ -3615,7 +3641,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_cleanup_failure_is_correlated_after_unknown() {
-        let (mut peer, executor, serving) = terminal_close_peer(true).await;
+        let (mut peer, executor, serving) = terminal_close_peer(true, false).await;
         peer.get_mut()
             .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
             .await
@@ -3633,7 +3659,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_malformed_input_cannot_authorize_success_receipt() {
-        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let (mut peer, executor, serving) = terminal_close_peer(false, false).await;
         peer.get_mut().write_all(b"invalid\n").await.unwrap();
         peer.get_mut().shutdown().await.unwrap();
         executor.shutdown_release.notify_one();
@@ -3642,7 +3668,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_eof_in_partial_frame_still_shuts_down_without_receipt() {
-        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let (mut peer, executor, serving) = terminal_close_peer(false, false).await;
         peer.get_mut()
             .write_all(b"{\"type\":\"close\",")
             .await
@@ -3708,7 +3734,7 @@ mod tests {
     }
     #[tokio::test]
     async fn terminal_close_no_close_fixed_cutoff_never_implies_receipt() {
-        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let (mut peer, executor, serving) = terminal_close_peer(false, false).await;
         let began = tokio::time::Instant::now();
         executor.shutdown_release.notify_one();
         executor.shutdown_done.notified().await;
@@ -3785,6 +3811,7 @@ mod tests {
             shutdown_release: tokio::sync::Notify::new(),
             shutdown_done: tokio::sync::Notify::new(),
             fail: false,
+            recovery: false,
         });
         let (peer, server) = tokio::io::duplex(8192);
         let (reader, writer) = tokio::io::split(server);
