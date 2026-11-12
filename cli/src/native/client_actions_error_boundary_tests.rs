@@ -80,35 +80,30 @@ pub(super) async fn observe(mode: &str, request: &Value, observed: &mut Value) {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
-    let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::try_join!(
-            async move {
-                stdin.write_all(&input).await?;
-                drop(stdin);
-                Ok::<_, std::io::Error>(())
-            },
-            async move {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-            async move {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-            child.wait(),
-        )
-    })
-    .await;
-    let (stdout, stderr, status) = match completed {
-        Ok(Ok(((), stdout, stderr, status))) => (stdout, stderr, status),
-        failure => {
-            let killed = child.start_kill();
-            let reaped = child.wait().await.expect("reap owned Node child");
-            panic!("Node fixture failed: {failure:?}; kill={killed:?}; reap={reaped:?}");
-        }
-    };
+    // No test-local wall-clock budget: a per-evaluation Node spawn can outlast
+    // a fixed helper budget on a loaded windows-latest runner while the fixture
+    // result is still correct. The fixture's operation lease remains the only
+    // bound, and kill_on_drop reaps this exact child when the task is dropped.
+    let completed = tokio::try_join!(
+        async move {
+            stdin.write_all(&input).await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        },
+        async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        },
+        async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        },
+        async move { child.wait().await },
+    );
+    let (_, stdout, stderr, status) =
+        completed.unwrap_or_else(|error| panic!("Node fixture failed: {error:?}"));
     assert!(status.success(), "{}", String::from_utf8_lossy(&stderr));
     observed["actionErrorScriptResult"] = serde_json::from_slice(&stdout).unwrap();
     observed["fillPreflight"] = json!(preflight);

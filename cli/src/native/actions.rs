@@ -16334,12 +16334,25 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
         let dir = tempfile::tempdir().unwrap();
         let request_path = dir.path().join("browser-close-request.json");
         let plugin_path = dir.path().join("mock-provider-plugin");
+        // Read an exact byte count instead of waiting for stdin EOF. On macOS
+        // std cannot set FD_CLOEXEC atomically, so a concurrent spawn in this
+        // multi-threaded test process can inherit this pipe's write end; the
+        // EOF then arrives only when that unrelated child exits, after the
+        // product's 15 s plugin budget. The product still supplies every byte
+        // of the request; only the fixture stops depending on the descriptor
+        // count of an unrelated process.
+        let payload = json!({
+            "protocol": crate::plugins::PROTOCOL_VERSION,
+            "type": "browser.close",
+            "capability": crate::plugins::CAPABILITY_BROWSER_PROVIDER,
+            "request": {"sessionId": "s1"},
+        });
+        let payload_len = serde_json::to_vec(&payload).unwrap().len();
         fs::write(
             &plugin_path,
-            r#"#!/bin/sh
-cat > "$1"
-printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
-"#,
+            format!(
+                "#!/bin/sh\nhead -c {payload_len} > \"$1\"\nprintf '%s' '{{\"protocol\":\"agent-browser.plugin.v1\",\"success\":true,\"data\":{{}}}}'\n"
+            ),
         )
         .unwrap();
         let mut perms = fs::metadata(&plugin_path).unwrap().permissions();

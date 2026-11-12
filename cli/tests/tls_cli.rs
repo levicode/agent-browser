@@ -130,13 +130,20 @@ impl Drop for TlsServer {
 struct Session {
     tmp: TempDir,
     system_bundle: Option<PathBuf>,
+    // The daemon's Windows TCP port is derived from the session name, and the
+    // tests in this binary run in parallel. One shared name made concurrent
+    // sessions race for the same preferred port and misreport each other as a
+    // concurrently started daemon with a different configuration.
+    name: String,
 }
 
 impl Session {
     fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         Self {
             tmp: TempDir::new().unwrap(),
             system_bundle: None,
+            name: format!("tls{}", NEXT.fetch_add(1, Ordering::Relaxed)),
         }
     }
     fn command(&self) -> Command {
@@ -162,7 +169,7 @@ impl Session {
             .env("USERPROFILE", self.tmp.path())
             .env("AGENT_BROWSER_SOCKET_DIR", self.tmp.path().join("sockets"))
             .env("NO_COLOR", "1")
-            .args(["--session", "tls", "--json"]);
+            .args(["--session", &self.name, "--json"]);
         if let Some(path) = &self.system_bundle {
             cmd.env("SSL_CERT_FILE", path);
         }
@@ -181,8 +188,11 @@ impl Session {
             )
         })
     }
+    fn pid_path(&self) -> PathBuf {
+        self.tmp.path().join(format!("sockets/{}.pid", self.name))
+    }
     fn pid(&self) -> String {
-        std::fs::read_to_string(self.tmp.path().join("sockets/tls.pid")).unwrap()
+        std::fs::read_to_string(self.pid_path()).unwrap()
     }
     fn ca(&self, name: &str, contents: &str) -> PathBuf {
         let path = self.tmp.path().join(name);
@@ -338,7 +348,7 @@ fn install_rejects_an_invalid_explicit_ca_before_network_or_daemon() {
     let out = session.output(&["--ca-cert", ca.to_str().unwrap(), "install"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid.pem"));
-    assert!(!session.tmp.path().join("sockets/tls.pid").exists());
+    assert!(!session.pid_path().exists());
 }
 
 #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
@@ -374,7 +384,7 @@ fn install_fetches_manifest_with_explicit_and_native_trust() {
         );
     }
     assert_eq!(proxy.requests.load(Ordering::SeqCst), 2);
-    assert!(!session.tmp.path().join("sockets/tls.pid").exists());
+    assert!(!session.pid_path().exists());
 }
 
 #[cfg(unix)]

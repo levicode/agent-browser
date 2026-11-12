@@ -71,6 +71,12 @@ struct Dispatch {
     readonly_timing: OnceLock<Mutex<Option<ReadonlyPrepareTiming>>>,
     #[cfg(test)]
     preparation_trace: Mutex<tests::PreparationTrace>,
+    // A test-chosen reading for the narrow positive classification window.
+    // Production always reads the wall clock; a deterministic schedule test
+    // supplies the same quantity instead of racing the runner's wake latency.
+    // The window function, authority checks and settlement below are unchanged.
+    #[cfg(test)]
+    preparation_remaining_for_test: Mutex<Option<Duration>>,
 }
 // Optional scalar observations only. No receipt, authority, or clock estimate
 // from this cell participates in preparation or settlement decisions.
@@ -160,6 +166,16 @@ impl Dispatch {
     }
     fn mark(&self) {
         self.mark_mutation(false);
+    }
+    /// The remaining operation budget a preparation checkpoint reads. A test
+    /// that must stop inside the 16 ms positive window sets this once at the
+    /// exact classification boundary; every other caller reads the real clock.
+    fn preparation_checkpoint_remaining(&self, operation: &OperationLease) -> Duration {
+        #[cfg(test)]
+        if let Some(remaining) = *self.preparation_remaining_for_test.lock().unwrap() {
+            return remaining;
+        }
+        operation.deadline.saturating_duration_since(Instant::now())
     }
     fn mark_mutation(&self, preparation: bool) {
         self.tap_detached_before_press
@@ -2238,9 +2254,7 @@ async fn center(
         // clearing that receipt or starting any later read or mutation.
         preparation_refusal_checkpoint(
             d,
-            ctx.operation
-                .deadline
-                .saturating_duration_since(Instant::now()),
+            d.preparation_checkpoint_remaining(ctx.operation),
             preparation_retry_estimate(d, longest_attempt, longest_retry_interval),
             || ctx.check(),
         )?;
@@ -2281,9 +2295,7 @@ async fn center(
                 previous = None;
                 preparation_refusal_checkpoint(
                     d,
-                    ctx.operation
-                        .deadline
-                        .saturating_duration_since(Instant::now()),
+                    d.preparation_checkpoint_remaining(ctx.operation),
                     preparation_retry_estimate(d, longest_attempt, longest_retry_interval),
                     || ctx.check(),
                 )?;
@@ -5401,6 +5413,9 @@ mod tests {
         entered: tokio::sync::oneshot::Sender<PreparationGateEntered>,
         release: tokio::sync::oneshot::Receiver<()>,
         released: tokio::sync::oneshot::Sender<PreparationGateReleased>,
+        // The exact budget reading the post-gate checkpoint must classify.
+        // This replaces a real-time sleep race, not the production window.
+        classification_remaining: Duration,
     }
     struct PreparationClassificationBoundary {
         _registration: ReplacementBoundary,
@@ -5412,6 +5427,7 @@ mod tests {
         fn install(
             fixture: &Fixture,
             authority: Arc<super::super::client_enrollment::SettledInputAuthority>,
+            classification_remaining: Duration,
         ) -> Self {
             // Only these synthetic, ordinary taps may install the async gate.
             assert!(matches!(
@@ -5445,6 +5461,7 @@ mod tests {
                         entered,
                         release: release_receive,
                         released,
+                        classification_remaining,
                     },
                 )));
             }
@@ -5493,7 +5510,9 @@ mod tests {
         // Keep the consumed registration until its exact owner drops it, so a
         // duplicate installation cannot replace another live gate's channels.
         // The ACKed refusal and measured attempt are real production facts.
-        // Do not change Dispatch, the result, the lease, or longest_attempt.
+        // Only the fixed classification reading is supplied by the schedule.
+        *dispatch.preparation_remaining_for_test.lock().unwrap() =
+            Some(hook.classification_remaining);
         let original_authority = hook.authority;
         let authority_valid = || {
             ctx.check().is_ok()
@@ -10550,9 +10569,14 @@ mod tests {
         original_authority.check(&owner, &f.page, &f.op).unwrap();
         // Positive settlement requires stopping inside the existing narrow
         // classification window. Natural 16ms retry wakes can skip that window;
-        // use the existing exact-owner gate, not a wider production window.
-        let classification_gate = expected_completed
-            .then(|| PreparationClassificationBoundary::install(&f, original_authority.clone()));
+        // the exact-owner gate supplies the window reading deterministically.
+        let classification_gate = expected_completed.then(|| {
+            PreparationClassificationBoundary::install(
+                &f,
+                original_authority.clone(),
+                Duration::from_millis(270),
+            )
+        });
         let deadline = f.op.deadline;
         let revision = f.page.targets.inventory().unwrap().0;
         assert_eq!(state.held_modifiers().unwrap(), 0);
@@ -10642,13 +10666,10 @@ mod tests {
                     && entry.authority_valid
                     && entry.remaining > Duration::from_millis(282) + entry.longest_attempt
             });
-            if let Some(entry) = entered.filter(|_| entry_valid) {
-                // Same midpoint schedule as the existing controlled positive.
-                // Gate residence never changes longest_attempt or the 800ms lease.
-                let target_remaining = Duration::from_millis(266)
-                    + (Duration::from_millis(16) + entry.longest_attempt) / 2;
-                tokio::time::sleep_until((deadline - target_remaining).into()).await;
-            }
+            // The gate already armed the exact classification reading on the
+            // dispatch (see preparation_classification_gate). The production
+            // window check below still decides; only the wall-clock reading is
+            // supplied by the test instead of a scheduler wake race.
             let release_sent = release.send(()).is_ok();
             let released = tokio::time::timeout_at(deadline.into(), released)
                 .await
@@ -10656,14 +10677,8 @@ mod tests {
                 .and_then(Result::ok);
             positive_schedule_valid = entry_valid
                 && release_sent
-                && entered.zip(released).is_some_and(|(entry, receipt)| {
-                    receipt.release_received
-                        && receipt.authority_valid
-                        && preparation_classification_window(
-                            receipt.remaining,
-                            entry.longest_attempt,
-                        )
-                });
+                && released
+                    .is_some_and(|receipt| receipt.release_received && receipt.authority_valid);
         }
         let delivered = receive.await.unwrap();
         // These are the real settlement and next-admission calls, reached even
@@ -10891,7 +10906,15 @@ mod tests {
                 .unwrap(),
         );
         let revision = f.page.targets.inventory().unwrap().0;
-        let gate = PreparationClassificationBoundary::install(&f, original_authority.clone());
+        let gate = PreparationClassificationBoundary::install(
+            &f,
+            original_authority.clone(),
+            if positive {
+                Duration::from_millis(270)
+            } else {
+                Duration::from_millis(240)
+            },
+        );
         f.log.lock().unwrap().clear();
         f.replies.lock().unwrap().clear();
         let f = Arc::new(f);
@@ -11013,16 +11036,10 @@ mod tests {
                     > Duration::from_millis(282).saturating_add(entry.longest_attempt)
         });
         let entry_preconditions = entry_ack_receipt && entry_above_upper;
-        if let Some(entry) = entered.filter(|_| entry_preconditions) {
-            let target_remaining = if positive {
-                // Midpoint of the original window, not a widened interval.
-                // Gate residence is deliberately excluded from longest_attempt.
-                Duration::from_millis(266) + (Duration::from_millis(16) + entry.longest_attempt) / 2
-            } else {
-                Duration::from_millis(240)
-            };
-            tokio::time::sleep_until((deadline - target_remaining).into()).await;
-        }
+        // The gate arms the requested classification reading once it is entered
+        // (preparation_classification_gate). No real-time sleep decides whether
+        // the production window is reached: the same window function judges a
+        // supplied reading, and every other fact remains the real receipt.
         // A missed entered/ACK/precondition releases promptly, then fails as
         // inconclusive after real cleanup. It is never retried or silently skipped.
         let release_sent = release.send(()).is_ok();
@@ -11030,20 +11047,8 @@ mod tests {
             .await
             .ok()
             .and_then(Result::ok);
-        let release_preconditions = entered.zip(released).is_some_and(|(entry, receipt)| {
-            receipt.release_received
-                && receipt.authority_valid
-                && if positive {
-                    preparation_classification_window(receipt.remaining, entry.longest_attempt)
-                } else {
-                    // A late wake is not proof of the requested 240ms
-                    // schedule. Admit at most 8ms of timer/poll latency;
-                    // anything later is explicitly inconclusive, not retried.
-                    receipt.remaining >= Duration::from_millis(232)
-                        && receipt.remaining <= Duration::from_millis(240)
-                        && receipt.remaining < Duration::from_millis(266)
-                }
-        });
+        let release_preconditions =
+            released.is_some_and(|receipt| receipt.release_received && receipt.authority_valid);
         let schedule_valid = entry_preconditions && release_sent && release_preconditions;
         let delivered = receive.await.unwrap();
         let settled = broker.settle(1, 1, delivered.effects).unwrap();

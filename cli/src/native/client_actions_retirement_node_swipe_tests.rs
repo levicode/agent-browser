@@ -72,35 +72,30 @@ pub(super) async fn observed_request(
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let bytes = input.to_string().into_bytes();
-    let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::try_join!(
-            async move {
-                stdin.write_all(&bytes).await?;
-                drop(stdin);
-                Ok::<_, std::io::Error>(())
-            },
-            async move {
-                let mut b = Vec::new();
-                stdout.read_to_end(&mut b).await?;
-                Ok::<_, std::io::Error>(b)
-            },
-            async move {
-                let mut b = Vec::new();
-                stderr.read_to_end(&mut b).await?;
-                Ok::<_, std::io::Error>(b)
-            },
-            child.wait(),
-        )
-    })
-    .await;
-    let (stdout, stderr, status) = match completed {
-        Ok(Ok(((), stdout, stderr, status))) => (stdout, stderr, status),
-        failure => {
-            let killed = child.start_kill();
-            let reaped = child.wait().await.unwrap();
-            panic!("owned scripted DOM failed: {failure:?}; kill={killed:?}; reap={reaped:?}");
-        }
-    };
+    // No test-local wall-clock budget: a per-evaluation Node spawn can outlast
+    // a fixed helper budget on a loaded windows-latest runner while the fixture
+    // result is still correct. The fixture's operation lease remains the only
+    // bound, and kill_on_drop reaps this exact child when the task is dropped.
+    let completed = tokio::try_join!(
+        async move {
+            stdin.write_all(&bytes).await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        },
+        async move {
+            let mut b = Vec::new();
+            stdout.read_to_end(&mut b).await?;
+            Ok::<_, std::io::Error>(b)
+        },
+        async move {
+            let mut b = Vec::new();
+            stderr.read_to_end(&mut b).await?;
+            Ok::<_, std::io::Error>(b)
+        },
+        async move { child.wait().await },
+    );
+    let (_, stdout, stderr, status) =
+        completed.unwrap_or_else(|error| panic!("owned scripted DOM failed: {error:?}"));
     assert!(
         status.success(),
         "native-emitted geometry failed: {}",

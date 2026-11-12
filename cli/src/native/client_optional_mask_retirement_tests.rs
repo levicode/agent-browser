@@ -289,6 +289,29 @@ async fn optional_mask_retirement(case: Case) {
     let mut early_result = None;
     #[allow(unused_mut)]
     let mut published_at = None;
+    // These cases depend on the optional acceptance cut actually firing before
+    // the parent deadline. The cut is requested causally below, once the held
+    // optional reply proves the pixel read started; waiting for a wall-clock
+    // timer would measure the runner's timer granularity instead (Windows wakes
+    // a 12 ms cutoff about 16 ms late, past the parent deadline).
+    let cut_case = matches!(
+        case,
+        Case::OptionalDeadline
+            | Case::OptionalShortDeadline
+            | Case::OptionalResourceShortDeadline
+            | Case::SupersededBeforeCutoff
+            | Case::DetachedBeforeCutoff
+    );
+    // Only these cases publish the sealed tree; the two supersession cases
+    // request the same cut but must be refused by their retirement.
+    let sealed_cut = matches!(
+        case,
+        Case::OptionalDeadline | Case::OptionalShortDeadline | Case::OptionalResourceShortDeadline
+    );
+    let (cut_request, cut) = oneshot::channel();
+    if cut_case {
+        dispatch.set_optional_cut_for_test(cut);
+    }
     let delayed = !matches!(case, Case::PrivacyFailure | Case::GeometryFailure);
     if delayed {
         tokio::time::timeout(Duration::from_secs(2), reached)
@@ -323,10 +346,19 @@ async fn optional_mask_retirement(case: Case) {
         {
             cancel.send_replace(CancelSignal::Requested);
         }
+        if cut_case {
+            // The held optional reply proves the pixel read started, and any
+            // supersession/detachment has already been applied to the old
+            // publication ticket. The cut arm this selects is the production
+            // arm; only its wake source changed.
+            cut_request
+                .send(())
+                .expect("the optional cut receiver must still be armed");
+        }
         if case == Case::OptionalResourceShortDeadline {
-            let result = tokio::time::timeout_at(deadline.into(), &mut task.result)
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut task.result)
                 .await
-                .expect("resource custody must not consume the original 80ms result budget")
+                .expect("the requested cut must publish the sealed tree independent of custody")
                 .expect("result sender retained");
             published_at = Some(Instant::now());
             assert!(task.receipt.is_sealed_observation());
@@ -421,12 +453,20 @@ async fn optional_mask_retirement(case: Case) {
         relative_us(result_time),
         relative_us(terminal),
     );
+    if cut_case {
+        // The requested cut arm really ran (it records the production cutoff),
+        // and publication did not wait for the held optional pixel reply.
+        assert!(
+            timing.cutoff_selected.is_some(),
+            "the requested acceptance cut must select the production cut arm"
+        );
+    }
+    if sealed_cut {
+        assert!(task.receipt.is_sealed_observation());
+    }
     if matches!(
         case,
-        Case::OptionalDeadline
-            | Case::OptionalShortDeadline
-            | Case::OptionalScreenshotShortDeadline
-            | Case::CancelInventory
+        Case::OptionalScreenshotShortDeadline | Case::CancelInventory
     ) {
         assert!(
             result_time < deadline,
@@ -443,16 +483,18 @@ async fn optional_mask_retirement(case: Case) {
             | Case::PrivacyFailure
             | Case::GeometryFailure
     ) {
-        if !matches!(case, Case::PrivacyFailure | Case::GeometryFailure) {
+        if !cut_case && !matches!(case, Case::PrivacyFailure | Case::GeometryFailure) {
             assert!(
                 result_time >= deadline - (budget / 5).min(Duration::from_millis(500)),
                 "optional capture must not finish before its earliest possible subdeadline"
             );
         }
-        assert!(
-            result_time < deadline,
-            "cleanup grace is not the result budget"
-        );
+        if !cut_case {
+            assert!(
+                result_time < deadline,
+                "cleanup grace is not the result budget"
+            );
+        }
         let value = result.unwrap();
         assert!(value.get("treeUnavailable").is_none());
         assert!(value.get("pixels").is_none());
@@ -525,15 +567,17 @@ async fn optional_mask_retirement(case: Case) {
     assert_eq!(owner.client.pending_len().await, 0);
     if matches!(
         case,
-        Case::CancelShortUnacknowledgedObject
-            | Case::MissingScreenshotAck
-            | Case::OptionalResourceShortDeadline
+        Case::CancelShortUnacknowledgedObject | Case::MissingScreenshotAck
     ) {
         assert!(
             terminal >= deadline,
             "unknown resource settlement must not inherit the value-only fast exit"
         );
     }
+    // OptionalResourceShortDeadline proves the same property causally: the
+    // sealed result was sent while the unacknowledged resource still needed
+    // settlement (asserted above), so no deadline-relative elapsed time is
+    // required.
     let terminal_refs = refs.lock().unwrap().ref_ids();
     let terminal_commands = commands.lock().unwrap().len();
     if delayed {
