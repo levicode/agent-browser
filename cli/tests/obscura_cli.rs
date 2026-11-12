@@ -17,10 +17,26 @@ impl Session {
 
     fn command(&self) -> Command {
         let mut command = Command::new(BIN);
+        // Keep the platform environment and remove only what could carry
+        // another agent-browser session or proxy into this one. A fully cleared
+        // environment leaves the spawned daemon without the Windows system
+        // variables its loopback bind needs: on windows-latest the daemon then
+        // dies with "The requested service provider could not be loaded or
+        // initialized. (os error 10106)" before any scenario runs.
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("AGENT_BROWSER_")
+                || matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY"
+                )
+            {
+                command.env_remove(key);
+            }
+        }
         command
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self.dir.path())
+            .env("USERPROFILE", self.dir.path())
             .env("AGENT_BROWSER_SOCKET_DIR", self.dir.path())
             .env("NO_COLOR", "1")
             .current_dir(self.dir.path())
