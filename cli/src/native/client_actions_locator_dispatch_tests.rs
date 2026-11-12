@@ -78,6 +78,37 @@ process.stdout.write(JSON.stringify({
 }));
 "#;
 
+// The first Node exec in a fresh test process pays the interpreter loader and
+// cold page-cache cost before any emitted script runs. On a shared runner that
+// startup can outlast this fixture's 2s evaluation budget: the ebdcab22 Linux
+// job killed a child that was still loading at that bound. Warm the runtime
+// once per process, before the fixture and its operation lease start, so the
+// evaluation budget below still measures only the emitted function.
+const SCRIPTED_DOM_STARTUP: Duration = Duration::from_secs(60);
+static SCRIPTED_DOM_RUNTIME_WARM: std::sync::Once = std::sync::Once::new();
+
+async fn warm_scripted_dom_runtime() {
+    if SCRIPTED_DOM_RUNTIME_WARM.is_completed() {
+        return;
+    }
+    // Process startup is environment cost, not a protocol deadline. A missing
+    // or broken runtime still fails here, with the child's own error, instead
+    // of hiding inside the fixture's evaluation budget.
+    let started = tokio::time::timeout(
+        SCRIPTED_DOM_STARTUP,
+        Command::new("node").arg("--version").output(),
+    )
+    .await
+    .expect("the scripted DOM runtime must start for these fixtures")
+    .expect("these tests require an already-installed Node runtime; never download one");
+    assert!(
+        started.status.success(),
+        "the scripted DOM runtime failed to start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    SCRIPTED_DOM_RUNTIME_WARM.call_once(|| {});
+}
+
 async fn evaluate_emitted_function(request: &Value, kind: &str) -> Value {
     let input = json!({
         "kind": kind,
@@ -96,7 +127,8 @@ async fn evaluate_emitted_function(request: &Value, kind: &str) -> Value {
     let mut stdout = child.stdout.take().expect("script output");
     let mut stderr = child.stderr.take().expect("script errors");
     let input = input.to_string().into_bytes();
-    // Bound this helper below the fixture's unchanged 5s operation lease.
+    // Bound only the evaluation, below the fixture's unchanged 5s operation
+    // lease; the runtime startup warmed before the fixture is not this budget.
     // Read both pipes while writing so backpressure cannot stall the peer.
     let completed = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::try_join!(
@@ -187,6 +219,7 @@ async fn locator_long_press_witnesses_original_900_ms_hold() {
 
 #[tokio::test]
 async fn locator_clear_uses_exact_empty_value_then_fallback_delete() {
+    warm_scripted_dom_runtime().await;
     let f = fixture(CLEAR_MODE).await;
     ClientActions::default()
         .execute(
@@ -249,6 +282,7 @@ async fn locator_clear_uses_exact_empty_value_then_fallback_delete() {
 
 #[tokio::test]
 async fn locator_select_option_positive_index_two_executes_native_selection() {
+    warm_scripted_dom_runtime().await;
     let f = fixture(SELECT_MODE).await;
     ClientActions::default()
         .execute(
