@@ -370,17 +370,24 @@ impl RetainedTasks {
                 // not become settlement uncertainty: quarantining here turned
                 // one cancelled query into an unprovable attempt cleanup and
                 // every later attempt on the worker into APP_NOT_OPEN
-                // (levicode/e2e#194). A panic or a scope loss still counts.
+                // (levicode/e2e#194). The caller's stop can still be in flight
+                // when the operation's own deadline fires first, so its
+                // DeadlineExceeded settlement is stop evidence by itself. An
+                // unstopped producer loss (no deadline, no cancel) still
+                // counts, as do a panic and a scope loss.
+                let caller_stopped = matches!(
+                    (*caller_cancellation.borrow()).error(),
+                    Some(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+                );
+                let read_deadline_exhausted =
+                    matches!(outcome.result, Err(ProtocolError::DeadlineExceeded));
                 let caller_stopped_read = read_only
                     && outcome.effects == Effects::NotDispatched
                     && matches!(
                         outcome.result,
                         Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
                     )
-                    && matches!(
-                        (*caller_cancellation.borrow()).error(),
-                        Some(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
-                    )
+                    && (caller_stopped || read_deadline_exhausted)
                     && !monitor_failed;
                 let dirty = if caller_stopped_read {
                     false
@@ -1383,9 +1390,11 @@ mod fixed_read_eof_tests {
         // A read-only dispatch the caller cancelled (or that ran out its
         // deadline) has nothing to publish. Its lost producer settlement is
         // retired with the scope, so it must not seal the page, quarantine the
-        // scope, or fail the drain (levicode/e2e#194). Mutating dispatches, a
-        // real read failure, a dirty success, and a scope loss all keep the
-        // fail-closed settlement.
+        // scope, or fail the drain (levicode/e2e#194). The caller's stop can
+        // still be in flight when the operation's own deadline fires first, so
+        // an exhausted read deadline settles clean without an observed caller
+        // cancel too. Mutating dispatches, a real read failure, a dirty
+        // success, and a scope loss all keep the fail-closed settlement.
         let cases = [
             (
                 "cancelled read-only",
@@ -1402,10 +1411,24 @@ mod fixed_read_eof_tests {
                 Ok(()),
             ),
             (
+                "deadline read-only without observed caller cancel",
+                SettlementEvidence::ReadOnly,
+                ProtocolError::DeadlineExceeded,
+                false,
+                Ok(()),
+            ),
+            (
                 "cancelled ordinary",
                 SettlementEvidence::Ordinary,
                 ProtocolError::Cancelled,
                 true,
+                Err(ProtocolError::CleanupFailed),
+            ),
+            (
+                "deadline ordinary without observed caller cancel",
+                SettlementEvidence::Ordinary,
+                ProtocolError::DeadlineExceeded,
+                false,
                 Err(ProtocolError::CleanupFailed),
             ),
             (
