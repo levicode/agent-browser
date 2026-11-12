@@ -289,12 +289,22 @@ async fn optional_mask_retirement(case: Case) {
     let mut early_result = None;
     #[allow(unused_mut)]
     let mut published_at = None;
-    // These cases prove the optional acceptance cut publishes the sealed tree
-    // while the optional pixel read is still outstanding. The cut is requested
-    // causally below, once that reply is provably held; waiting for a wall-clock
+    // These cases depend on the optional acceptance cut actually firing before
+    // the parent deadline. The cut is requested causally below, once the held
+    // optional reply proves the pixel read started; waiting for a wall-clock
     // timer would measure the runner's timer granularity instead (Windows wakes
     // a 12 ms cutoff about 16 ms late, past the parent deadline).
     let cut_case = matches!(
+        case,
+        Case::OptionalDeadline
+            | Case::OptionalShortDeadline
+            | Case::OptionalResourceShortDeadline
+            | Case::SupersededBeforeCutoff
+            | Case::DetachedBeforeCutoff
+    );
+    // Only these cases publish the sealed tree; the two supersession cases
+    // request the same cut but must be refused by their retirement.
+    let sealed_cut = matches!(
         case,
         Case::OptionalDeadline | Case::OptionalShortDeadline | Case::OptionalResourceShortDeadline
     );
@@ -320,13 +330,6 @@ async fn optional_mask_retirement(case: Case) {
                 "staging is not publication"
             );
         }
-        if cut_case {
-            // The held optional reply proves the pixel read started. The cut arm
-            // this selects is the production arm; only its wake source changed.
-            cut_request
-                .send(())
-                .expect("the optional cut receiver must still be armed");
-        }
         if case == Case::SupersededBeforeCutoff {
             let (newer, _cancel_newer) = operation(2);
             let admitted = dispatch.prepare(owner.context(), observe(), newer).unwrap();
@@ -342,6 +345,15 @@ async fn optional_mask_retirement(case: Case) {
             )
         {
             cancel.send_replace(CancelSignal::Requested);
+        }
+        if cut_case {
+            // The held optional reply proves the pixel read started, and any
+            // supersession/detachment has already been applied to the old
+            // publication ticket. The cut arm this selects is the production
+            // arm; only its wake source changed.
+            cut_request
+                .send(())
+                .expect("the optional cut receiver must still be armed");
         }
         if case == Case::OptionalResourceShortDeadline {
             let result = tokio::time::timeout(Duration::from_secs(2), &mut task.result)
@@ -448,6 +460,8 @@ async fn optional_mask_retirement(case: Case) {
             timing.cutoff_selected.is_some(),
             "the requested acceptance cut must select the production cut arm"
         );
+    }
+    if sealed_cut {
         assert!(task.receipt.is_sealed_observation());
     }
     if matches!(
