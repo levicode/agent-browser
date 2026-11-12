@@ -127,43 +127,32 @@ async fn evaluate_emitted_function(request: &Value, kind: &str) -> Value {
     let mut stdout = child.stdout.take().expect("script output");
     let mut stderr = child.stderr.take().expect("script errors");
     let input = input.to_string().into_bytes();
-    // Bound only the evaluation, below the fixture's unchanged 5s operation
-    // lease; the runtime startup warmed before the fixture is not this budget.
     // Read both pipes while writing so backpressure cannot stall the peer.
-    let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        tokio::try_join!(
-            async move {
-                stdin.write_all(&input).await?;
-                drop(stdin);
-                Ok::<_, std::io::Error>(())
-            },
-            async move {
-                let mut bytes = Vec::new();
-                stdout.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-            async move {
-                let mut bytes = Vec::new();
-                stderr.read_to_end(&mut bytes).await?;
-                Ok::<_, std::io::Error>(bytes)
-            },
-            child.wait(),
-        )
-    })
-    .await;
-    let (stdout, stderr, status) = match completed {
-        Ok(Ok(((), stdout, stderr, status))) => (stdout, stderr, status),
-        failure => {
-            // Only this owned Node child is terminated. Reap it before failing;
-            // kill_on_drop also guards cancellation of the fixture task.
-            let killed = child.start_kill();
-            let reaped = child
-                .wait()
-                .await
-                .expect("owned Node fixture child must be reaped after failure");
-            panic!("Node fixture failed: {failure:?}; kill={killed:?}; reap={reaped:?}");
-        }
-    };
+    // No test-local wall-clock budget: the warm-up above pays process startup,
+    // but each evaluation still spawns Node, and on windows-latest that spawn
+    // can outlast a fixed 2 s helper budget while the fixture is still correct
+    // (run 43174808312). The fixture's operation lease remains the only bound,
+    // and kill_on_drop reaps this exact child when the fixture task is dropped.
+    let completed = tokio::try_join!(
+        async move {
+            stdin.write_all(&input).await?;
+            drop(stdin);
+            Ok::<_, std::io::Error>(())
+        },
+        async move {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        },
+        async move {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).await?;
+            Ok::<_, std::io::Error>(bytes)
+        },
+        async move { child.wait().await },
+    );
+    let (_, stdout, stderr, status) =
+        completed.unwrap_or_else(|error| panic!("Node fixture failed: {error:?}"));
     assert!(
         status.success(),
         "native-emitted script failed: {}",
