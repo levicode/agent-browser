@@ -5200,6 +5200,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     Effects::Completed
                 } else if unsubmitted_navigation {
                     Effects::NotDispatched
+                } else if command == "page.activate" {
+                    // A cancelled activation is resolved by its own active
+                    // state: a page that never became current has no
+                    // application effect to be uncertain about, and a page
+                    // that did is complete.
+                    if page_active.load(std::sync::atomic::Ordering::SeqCst) {
+                        Effects::Completed
+                    } else {
+                        Effects::NotDispatched
+                    }
                 } else if expired || (result.is_err() && mutating) {
                     // An interrupted read has no mutation to be uncertain
                     // about: a command that cannot commit input or browser
