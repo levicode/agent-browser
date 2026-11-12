@@ -558,6 +558,10 @@ pub(crate) struct ObservationResultReceipt {
     cleanup_failed_before_publication: Arc<AtomicBool>,
     #[cfg(test)]
     optional_timing: Arc<Mutex<OptionalPublicationTiming>>,
+    // The parent lease the fresh fallback was admitted under. A deterministic
+    // test compares it with the original deadline instead of timing the run.
+    #[cfg(test)]
+    fallback_lease_deadline: Arc<Mutex<Option<Instant>>>,
 }
 // Test-only causal timestamps, not scheduling hooks or publication authority.
 // Only the producer writes these fields; the fixture reads after the joined run.
@@ -585,6 +589,14 @@ impl ObservationResultReceipt {
     #[cfg(test)]
     fn mark_result_sent(&self) {
         self.optional_timing.lock().unwrap().result_sent = Some(Instant::now());
+    }
+    #[cfg(test)]
+    fn mark_fallback_lease(&self, deadline: Instant) {
+        *self.fallback_lease_deadline.lock().unwrap() = Some(deadline);
+    }
+    #[cfg(test)]
+    pub(crate) fn fallback_lease_deadline(&self) -> Option<Instant> {
+        *self.fallback_lease_deadline.lock().unwrap()
     }
     pub(crate) fn is_sealed_observation(&self) -> bool {
         self.sealed.load(Ordering::Acquire)
@@ -793,6 +805,19 @@ pub struct ObservationDispatch {
     // The production lease stays the default for every dispatch that opts out.
     #[cfg(test)]
     optional_observe_headroom_for_test: Mutex<Option<Duration>>,
+    // Test-only deterministic request for the optional acceptance cut. A loaded
+    // runner can wake the cutoff timer after the parent deadline (Windows timer
+    // granularity alone is ~15.6 ms), so a timing test asks for the cut once the
+    // optional pixel read has provably started instead of predicting a wake.
+    // The cut arm it selects is the production arm; only the wake source changes.
+    #[cfg(test)]
+    optional_cut_for_test: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    // Test-only split between the semantic read and the fresh fallback. The
+    // production split reserves a quarter of the remaining parent budget; a
+    // deterministic fallback test fixes that split so neither phase races a
+    // shared-runner timer. The parent deadline itself is never changed.
+    #[cfg(test)]
+    semantic_lease_headroom_for_test: Mutex<Option<Duration>>,
 }
 /// Only the real-browser joint test can pause an initial sample after its actual
 /// revision snapshot. The receiver creates real browser events; this seam does
@@ -818,6 +843,10 @@ impl ObservationDispatch {
             initial_inventory_probe_for_test: Mutex::new(None),
             #[cfg(test)]
             optional_observe_headroom_for_test: Mutex::new(None),
+            #[cfg(test)]
+            optional_cut_for_test: Mutex::new(None),
+            #[cfg(test)]
+            semantic_lease_headroom_for_test: Mutex::new(None),
             refs,
             captures: Mutex::new(CaptureAuthority::default()),
             publication: tokio::sync::Mutex::new(Publication {
@@ -842,6 +871,51 @@ impl ObservationDispatch {
     #[cfg(test)]
     pub(crate) fn set_optional_observe_headroom_for_test(&self, headroom: Duration) {
         *self.optional_observe_headroom_for_test.lock().unwrap() = Some(headroom);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_optional_cut_for_test(&self, cut: tokio::sync::oneshot::Receiver<()>) {
+        *self.optional_cut_for_test.lock().unwrap() = Some(cut);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_semantic_lease_headroom_for_test(&self, headroom: Duration) {
+        *self.semantic_lease_headroom_for_test.lock().unwrap() = Some(headroom);
+    }
+    /// The semantic read lease for this dispatch. Production reserves a quarter
+    /// of the remaining parent budget for the fresh fallback; a deterministic
+    /// schedule test fixes that split and keeps every check on the real clock.
+    fn prepared_semantic_lease(
+        &self,
+        request: &DispatchRequest,
+        operation: &OperationLease,
+        now: Instant,
+    ) -> OperationLease {
+        #[cfg(test)]
+        if let Some(headroom) = *self.semantic_lease_headroom_for_test.lock().unwrap() {
+            return OperationLease {
+                is_callback: operation.is_callback,
+                generation: operation.generation,
+                sequence: operation.sequence,
+                deadline: operation
+                    .deadline
+                    .checked_sub(headroom)
+                    .unwrap_or(operation.deadline),
+                cancellation: operation.cancellation.clone(),
+            };
+        }
+        prepared_semantic_lease_at(request, operation, now)
+    }
+    /// Wake the optional acceptance cut. Production waits for the pixel lease's
+    /// cutoff timer; a timing test can request the same cut once its held pixel
+    /// reply proves the optional work really started.
+    async fn optional_acceptance_cut(&self, operation: &OperationLease) {
+        #[cfg(test)]
+        let trigger = { self.optional_cut_for_test.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some(trigger) = trigger {
+            let _ = trigger.await;
+            return;
+        }
+        tokio::time::sleep_until(operation.deadline.into()).await;
     }
     /// The existing publication authority owns one retirement counter; this
     /// never replaces scope generation, target tenure or the shared ref map.
@@ -1143,7 +1217,7 @@ impl ObservationDispatch {
         self.check_publication_fence(retirement_fence)?;
         // Fix the reader cutoff once before queued/frame work can reduce its
         // fallback reserve. That work keeps the original parent lease.
-        let semantic_operation = prepared_semantic_lease_at(&request, &operation, Instant::now());
+        let semantic_operation = self.prepared_semantic_lease(&request, &operation, Instant::now());
         Ok(PreparedDispatch {
             retirement_fence,
             context,
@@ -2103,7 +2177,7 @@ impl ObservationDispatch {
         let completed = tokio::select! {
             biased;
             result = &mut optional => result,
-            _ = tokio::time::sleep_until(pixel_operation.deadline.into()) => {
+            _ = self.optional_acceptance_cut(&pixel_operation) => {
                 #[cfg(test)]
                 receipt.mark_optional_cutoff();
                 // Do not cancel/drop the optional future: a raw ACK or a mask
@@ -3001,6 +3075,8 @@ impl ObservationDispatch {
             }
         }
         if let Some(cause) = fallback_cause {
+            #[cfg(test)]
+            receipt.mark_fallback_lease(operation.deadline);
             if let Some(journal) = &journal {
                 journal.check_async().await.map_err(|e| failure(protected_error(e)))?;
             }
