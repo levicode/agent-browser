@@ -626,6 +626,85 @@ async fn captured_retirement_cannot_remove_marker_only_aba() {
     terminal_boundary(TerminalCase::DestroyedThenMarkerReplaced).await;
 }
 
+#[tokio::test]
+async fn invalid_interception_ack_retires_the_callback_without_quarantining() {
+    let mut peer = peer().await;
+    let broker = Arc::new(ClientSession::new());
+    let (sink, mut emitted) = ClientEventSink::test_channel(broker.clone());
+    let scope = BlobScope {
+        generation: 1,
+        identity_scope: SCOPE.into(),
+    };
+    let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+    blobs.activate_scope(scope.clone()).unwrap();
+    let network = Arc::new(ClientNetwork::new(
+        peer.client.clone(),
+        broker.clone(),
+        sink,
+        scope,
+        blobs,
+        Arc::new(super::super::client_ui::UiGate::default()),
+        NetworkPolicy::default(),
+    ));
+    enroll(&network, CHILD_SESSION, CHILD_SESSION, false);
+    let operation = broker.admit(1, 1, 5_000).unwrap();
+    assert!(broker.start(1, 1).unwrap());
+    let _ = operation;
+    let (entered, release) = take_result_gate(&network);
+    peer.emit
+        .send(json!({"method":"Fetch.requestPaused","sessionId":CHILD_SESSION,
+            "params":{"requestId":"gone-interception","request":{"url":"https://fixture.invalid/beacon",
+            "method":"POST","headers":{},"postData":"fixed"}}}))
+        .unwrap();
+    let event = tokio::time::timeout(WAIT, peer.reader.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.method, "Fetch.requestPaused");
+    network.event(&event).unwrap();
+    let event = tokio::time::timeout(WAIT, emitted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ServerMessage::Event {
+        event,
+        decision: Some(token),
+        ..
+    } = event
+    else {
+        panic!("expected actual request callback decision");
+    };
+    assert_eq!(event, "network.request");
+    broker
+        .resolve(
+            1,
+            &token.token,
+            Decision::Continue {
+                overrides: Default::default(),
+            },
+        )
+        .unwrap();
+    let command = next_command(&mut peer, "Fetch.continueRequest", CHILD_SESSION).await;
+    // The browser itself dropped the interception: its frame detached before
+    // the decision reached it. No request is left paused and the scope proof
+    // is intact, so the callback retires instead of quarantining everything.
+    peer.emit
+        .send(json!({"id":command["id"],"sessionId":CHILD_SESSION,
+            "error":{"code":-32000,"message":"Invalid InterceptionId."}}))
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    release.send(()).unwrap();
+    let outcome = join_network_task(&network).await;
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+    assert!(
+        network.pending_interceptions.lock().unwrap().is_empty(),
+        "the gone interception's occurrence must be retired"
+    );
+    assert_eq!(peer.ledger.snapshot().outstanding_commands, 0);
+    close_peer(peer).await;
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LocalFailureCase {
     ForeignSessionThenDetach,
