@@ -297,12 +297,7 @@ mod tests {
         store.release(&scope, &handle).unwrap();
         // A released handle cannot be read after the descriptor was published.
         assert!(store
-            .read_chunk(
-                &scope,
-                &transferred["resultHandle"].as_str().unwrap(),
-                0,
-                16
-            )
+            .read_chunk(&scope, transferred["resultHandle"].as_str().unwrap(), 0, 16)
             .is_err());
 
         // The evaluator's own refusal is preserved verbatim.

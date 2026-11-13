@@ -944,7 +944,7 @@ async fn chromium_object_hash_route_geometry_accepts_proven_opaque_subtrees() {
         .await
         .unwrap();
     let gate = Arc::new(ExecutionGate::default());
-    let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
+    let page = owner.lease(gate.enter(false).unwrap()).unwrap();
     let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
     let operation = OperationLease {
         is_callback: false,

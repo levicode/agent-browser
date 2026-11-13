@@ -6232,13 +6232,10 @@ mod owned_inventory_diagnostic_opt_in_tests {
         let registry = retired_read_registry().await;
         let (_cancel, operation) =
             read_operation(std::time::Instant::now() + std::time::Duration::from_millis(40));
-        assert_eq!(
-            registry
-                .wait_read_session_retired(&operation, "frame-session")
-                .await
-                .unwrap(),
-            false
-        );
+        assert!(!registry
+            .wait_read_session_retired(&operation, "frame-session")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

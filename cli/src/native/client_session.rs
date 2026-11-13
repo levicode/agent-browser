@@ -3987,7 +3987,7 @@ mod tests {
         let window = broker.callback_decision_timeout_ms(1, "scope").unwrap();
         // A short operation must not shrink the decision below the fixed policy.
         assert!(
-            window >= DEFAULT_DECISION_TIMEOUT_MS && window < DEFAULT_DECISION_TIMEOUT_MS + 1_000,
+            (DEFAULT_DECISION_TIMEOUT_MS..DEFAULT_DECISION_TIMEOUT_MS + 1_000).contains(&window),
             "{window}"
         );
         let lease = broker
