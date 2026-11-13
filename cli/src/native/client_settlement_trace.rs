@@ -5471,7 +5471,7 @@ mod observe_initial_diagnostic_tests {
             };
             let bytes = serde_json::to_vec(&record).unwrap();
             assert!(
-                bytes.len() + 1 <= MAX_RECORD_BYTES,
+                bytes.len() < MAX_RECORD_BYTES,
                 "record plus LF: {}",
                 bytes.len() + 1
             );

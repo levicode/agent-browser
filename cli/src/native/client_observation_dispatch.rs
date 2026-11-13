@@ -1831,13 +1831,15 @@ impl ObservationDispatch {
         let first = frame_inventory_attempt_impl(
             &context.page,
             operation,
-            Some(cleanup),
-            screenshot,
-            true,
-            None,
-            UnpartitionedInventory::WaitForEnrollment,
-            #[cfg(test)]
-            initial_probe.as_ref(),
+            FrameInventoryRequest {
+                cleanup: Some(cleanup),
+                screenshot,
+                readonly_disposal: true,
+                partition: None,
+                unpartitioned: UnpartitionedInventory::WaitForEnrollment,
+                #[cfg(test)]
+                initial_probe: initial_probe.as_ref(),
+            },
         )
         .await;
         let rejected = match first {
@@ -1879,13 +1881,15 @@ impl ObservationDispatch {
         let inventory = frame_inventory_attempt_impl(
             &context.page,
             operation,
-            Some(cleanup),
-            screenshot,
-            true,
-            None,
-            UnpartitionedInventory::WaitForEnrollment,
-            #[cfg(test)]
-            initial_probe.as_ref(),
+            FrameInventoryRequest {
+                cleanup: Some(cleanup),
+                screenshot,
+                readonly_disposal: true,
+                partition: None,
+                unpartitioned: UnpartitionedInventory::WaitForEnrollment,
+                #[cfg(test)]
+                initial_probe: initial_probe.as_ref(),
+            },
         )
         .await
         .map_err(|failure| {
@@ -3734,13 +3738,15 @@ async fn verified_semantic_frames_with_cleanup(
     frame_inventory_attempt_impl(
         page,
         operation,
-        cleanup,
-        screenshot,
-        true,
-        None,
-        UnpartitionedInventory::WaitForEnrollment,
-        #[cfg(test)]
-        None,
+        FrameInventoryRequest {
+            cleanup,
+            screenshot,
+            readonly_disposal: true,
+            partition: None,
+            unpartitioned: UnpartitionedInventory::WaitForEnrollment,
+            #[cfg(test)]
+            initial_probe: None,
+        },
     )
     .await
     .map(|inventory| inventory.frames)
@@ -3916,13 +3922,15 @@ async fn frame_inventory_attempt(
     frame_inventory_attempt_impl(
         page,
         operation,
-        cleanup,
-        screenshot,
-        false,
-        None,
-        UnpartitionedInventory::WaitForEnrollment,
-        #[cfg(test)]
-        None,
+        FrameInventoryRequest {
+            cleanup,
+            screenshot,
+            readonly_disposal: false,
+            partition: None,
+            unpartitioned: UnpartitionedInventory::WaitForEnrollment,
+            #[cfg(test)]
+            initial_probe: None,
+        },
     )
     .await
 }
@@ -4145,13 +4153,15 @@ async fn query_frames(
     frame_inventory_attempt_impl(
         page,
         operation,
-        cleanup,
-        screenshot,
-        false,
-        partition,
-        UnpartitionedInventory::Immediate,
-        #[cfg(test)]
-        None,
+        FrameInventoryRequest {
+            cleanup,
+            screenshot,
+            readonly_disposal: false,
+            partition,
+            unpartitioned: UnpartitionedInventory::Immediate,
+            #[cfg(test)]
+            initial_probe: None,
+        },
     )
     .await
     .map_err(|error| error.record(screenshot))
@@ -4317,31 +4327,23 @@ enum UnpartitionedInventory {
     /// list: an incomplete registry is an unavailable scope, not readiness.
     Immediate,
 }
+/// The non-page inputs of one frame inventory attempt. The page and its
+/// operation stay separate because every attempt must be fenced by both.
+struct FrameInventoryRequest<'a> {
+    cleanup: Option<&'a AtomicBool>,
+    screenshot: Option<&'a ScreenshotFailureWitness>,
+    readonly_disposal: bool,
+    partition: Option<&'a super::client_enrollment::PageAcquisitionProof>,
+    unpartitioned: UnpartitionedInventory,
+    #[cfg(test)]
+    initial_probe: Option<&'a tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>>,
+}
 async fn frame_inventory_attempt_impl(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
-    cleanup: Option<&AtomicBool>,
-    screenshot: Option<&ScreenshotFailureWitness>,
-    readonly_disposal: bool,
-    partition: Option<&super::client_enrollment::PageAcquisitionProof>,
-    unpartitioned: UnpartitionedInventory,
-    #[cfg(test)] initial_probe: Option<
-        &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
-    >,
+    request: FrameInventoryRequest<'_>,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
-    match frame_inventory_attempt_once(
-        page,
-        operation,
-        cleanup,
-        screenshot,
-        readonly_disposal,
-        partition,
-        unpartitioned,
-        #[cfg(test)]
-        initial_probe,
-    )
-    .await?
-    {
+    match frame_inventory_attempt_once(page, operation, request).await? {
         FrameInventoryAttempt::Ready(inventory) => Ok(inventory),
         FrameInventoryAttempt::Retired { session, error } => {
             if page
@@ -4366,15 +4368,17 @@ async fn frame_inventory_attempt_impl(
 async fn frame_inventory_attempt_once(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
-    cleanup: Option<&AtomicBool>,
-    screenshot: Option<&ScreenshotFailureWitness>,
-    readonly_disposal: bool,
-    partition: Option<&super::client_enrollment::PageAcquisitionProof>,
-    unpartitioned: UnpartitionedInventory,
-    #[cfg(test)] initial_probe: Option<
-        &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
-    >,
+    request: FrameInventoryRequest<'_>,
 ) -> Result<FrameInventoryAttempt, FrameInventoryFailure> {
+    let FrameInventoryRequest {
+        cleanup,
+        screenshot,
+        readonly_disposal,
+        partition,
+        unpartitioned,
+        #[cfg(test)]
+        initial_probe,
+    } = request;
     check(page, operation)?;
     let (revision, targets, inventory_before) = if let Some(partition) = partition {
         partition
