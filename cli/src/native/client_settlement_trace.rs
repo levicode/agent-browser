@@ -264,6 +264,8 @@ pub(crate) struct Facts {
     pub inventory_integrity_lost: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_first_loss: Option<InventoryFirstLoss>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "inventorySealCause")]
+    pub inventory_seal_cause: Option<InventorySealCause>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -859,6 +861,7 @@ pub(crate) struct InventorySnapshot {
     pub sealed: bool,
     pub integrity_lost: bool,
     pub first_loss: Option<InventoryFirstLoss>,
+    pub seal_cause: Option<InventorySealCause>,
     pub reservations: usize,
     pub unconfigured: usize,
     pub attachments: Option<DiagnosticTargetInventory>,
@@ -1688,6 +1691,34 @@ pub(crate) enum InventoryFirstLoss {
     RetainedDeadlineSeal,
     RetainedSettlementSeal,
     RetainedCompletionSeal,
+}
+/// Which first seal the inventory lost its integrity to. Diagnostic only; the
+/// first loss keeps its immutable reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventorySealCause {
+    Explicit,
+    DispatchCleanup,
+    PublishHandles,
+    Shutdown,
+    Close,
+    Restart,
+    Network,
+    Capture,
+    OperationState,
+    RetainedDeadline,
+    RetainedSettlement,
+    RetainedCompletion,
+}
+impl InventorySealCause {
+    pub(crate) fn from_reason(reason: InventoryFirstLoss) -> Self {
+        match reason {
+            InventoryFirstLoss::RetainedDeadlineSeal => Self::RetainedDeadline,
+            InventoryFirstLoss::RetainedSettlementSeal => Self::RetainedSettlement,
+            InventoryFirstLoss::RetainedCompletionSeal => Self::RetainedCompletion,
+            _ => Self::Explicit,
+        }
+    }
 }
 pub(crate) fn terminal_proof_refusal(
     stage: TerminalCleanupStage,
@@ -2683,6 +2714,7 @@ fn inventory_snapshot_into(
             inventory_sealed: Some(snapshot.sealed),
             inventory_integrity_lost: Some(snapshot.integrity_lost),
             inventory_first_loss: snapshot.first_loss,
+            inventory_seal_cause: snapshot.seal_cause,
             inventory_reservations: Some(snapshot.reservations.min(8192) as u64),
             inventory_unconfigured: Some(snapshot.unconfigured.min(8192) as u64),
             ..Facts::default()

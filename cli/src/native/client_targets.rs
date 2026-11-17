@@ -781,6 +781,7 @@ struct Registry {
     sealed: bool,
     integrity_lost: bool,
     first_loss: Option<diagnostic::InventoryFirstLoss>,
+    seal_cause: Option<diagnostic::InventorySealCause>,
     owner_retirement_inventory: Option<bool>,
     reservations: usize,
     creation_sequence: u64,
@@ -1035,6 +1036,7 @@ impl Registry {
             sealed: self.sealed,
             integrity_lost: self.integrity_lost,
             first_loss: self.first_loss,
+            seal_cause: self.seal_cause,
             reservations: self.reservations,
             unconfigured: self
                 .targets
@@ -1069,6 +1071,8 @@ impl Registry {
     }
     fn lose_integrity(&mut self, reason: diagnostic::InventoryFirstLoss) {
         self.first_loss.get_or_insert(reason);
+        self.seal_cause
+            .get_or_insert(diagnostic::InventorySealCause::from_reason(reason));
         self.sealed = true;
         self.integrity_lost = true;
     }
@@ -3156,12 +3160,26 @@ impl ClientTargets {
         }
     }
     pub fn seal(&self) {
-        self.seal_diagnostic(diagnostic::InventoryFirstLoss::ExplicitSeal);
+        self.seal_with_cause(
+            diagnostic::InventoryFirstLoss::ExplicitSeal,
+            diagnostic::InventorySealCause::Explicit,
+        );
     }
     pub(crate) fn seal_diagnostic(&self, reason: diagnostic::InventoryFirstLoss) {
+        let cause = diagnostic::InventorySealCause::from_reason(reason);
+        self.seal_with_cause(reason, cause);
+    }
+    pub(crate) fn seal_with_cause(
+        &self,
+        reason: diagnostic::InventoryFirstLoss,
+        cause: diagnostic::InventorySealCause,
+    ) {
         self.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.state.lock() {
+                if state.seal_cause.is_none() {
+                    state.seal_cause = Some(cause);
+                }
                 state.lose_integrity(reason);
             }
             self.changed.notify_waiters();
@@ -5984,6 +6002,10 @@ mod first_loss_diagnostic_tests {
         assert!(registry.first_loss.is_none());
         registry.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
         assert!(registry.sealed && registry.integrity_lost);
+        assert_eq!(
+            registry.diagnostic_inventory().seal_cause,
+            Some(diagnostic::InventorySealCause::Explicit)
+        );
         registry.lose_integrity(diagnostic::InventoryFirstLoss::ExplicitSeal);
         assert_eq!(
             registry.first_loss,

@@ -511,8 +511,10 @@ fn inventory_failure_snapshot_does_not_require_active_cleanup() {
         InventoryPoint::SettlementRefused,
         InventorySnapshot {
             observed: true,
-            sealed: false,
-            integrity_lost: false,
+            sealed: true,
+            integrity_lost: true,
+            first_loss: Some(InventoryFirstLoss::ExplicitSeal),
+            seal_cause: Some(InventorySealCause::DispatchCleanup),
             reservations: 1,
             unconfigured: 2,
             ..Default::default()
@@ -521,6 +523,8 @@ fn inventory_failure_snapshot_does_not_require_active_cleanup() {
     let rows = records(&file);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1]["phase"], "InventorySnapshot");
+    assert_eq!(rows[1]["inventoryFirstLoss"], "explicit-seal");
+    assert_eq!(rows[1]["inventorySealCause"], "dispatch-cleanup");
     assert_eq!(rows[1]["inventoryPoint"], "settlement-refused");
     assert_eq!(rows[1]["operationSeq"], 19);
     assert_eq!(rows[1]["inventoryObserved"], true);
@@ -533,10 +537,12 @@ fn inventory_failure_snapshot_does_not_require_active_cleanup() {
             "droppedBefore",
             "emittedBefore",
             "generation",
+            "inventoryFirstLoss",
             "inventoryIntegrityLost",
             "inventoryObserved",
             "inventoryPoint",
             "inventoryReservations",
+            "inventorySealCause",
             "inventorySealed",
             "inventoryUnconfigured",
             "operationSeq",

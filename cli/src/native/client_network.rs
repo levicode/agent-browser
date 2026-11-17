@@ -4238,7 +4238,10 @@ mod bridge_tests {
                 .unwrap();
         }
         if matches!(case, RetirementWatchCase::PoisonBefore) {
-            targets.seal();
+            targets.seal_with_cause(
+                crate::native::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+                crate::native::client_settlement_trace::InventorySealCause::Network,
+            );
         }
         if matches!(case, RetirementWatchCase::UnownedSeal) {
             targets.seal_admission();

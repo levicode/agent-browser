@@ -1372,7 +1372,10 @@ impl ObservationDispatch {
                     }) && !release_handles(&blobs, &scope, &output.handles)
                     {
                         if !evidence_only {
-                            targets.seal();
+                            targets.seal_with_cause(
+                                diagnostic::InventoryFirstLoss::ExplicitSeal,
+                                diagnostic::InventorySealCause::DispatchCleanup,
+                            );
                         }
                         return Err(DispatchFailure {
                             error: ProtocolError::CleanupFailed,
@@ -1383,7 +1386,10 @@ impl ObservationDispatch {
                 }
                 Err(error) => {
                     if error.cleanup_integrity_lost && !evidence_only {
-                        targets.seal();
+                        targets.seal_with_cause(
+                            diagnostic::InventoryFirstLoss::ExplicitSeal,
+                            diagnostic::InventorySealCause::DispatchCleanup,
+                        );
                     }
                     match send.take() {
                         Some(send) => {
@@ -3214,7 +3220,10 @@ impl ObservationDispatch {
             if let Some(witness) = screenshot { witness.failure(&error); }
             let clean = release_handles(&context.blobs, &context.scope, &handles);
             if !clean {
-                capture_context.page.targets.seal();
+                capture_context.page.targets.seal_with_cause(
+                    diagnostic::InventoryFirstLoss::ExplicitSeal,
+                    diagnostic::InventorySealCause::PublishHandles,
+                );
             }
             return Err(DispatchFailure {
                 error,
