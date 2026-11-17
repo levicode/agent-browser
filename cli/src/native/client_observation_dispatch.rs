@@ -4468,6 +4468,11 @@ async fn frame_inventory_attempt_once(
             // establish application frame ancestry.
             continue;
         }
+        if super::client_enrollment::capture_auxiliary_kind(&target.kind) {
+            // Auxiliary browser targets render no page document; their own
+            // configuration must not gate the page's frame inventory.
+            continue;
+        }
         if !target.configured || !target.resumed {
             return Err(ProtocolError::ScopeUnavailable.into());
         }

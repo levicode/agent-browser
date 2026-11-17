@@ -1041,17 +1041,23 @@ impl Registry {
             unconfigured: self
                 .targets
                 .values()
-                .filter(|t| t.purpose.is_none() || !t.configured)
+                .filter(|t| {
+                    !super::client_enrollment::capture_auxiliary_kind(&t.kind)
+                        && (t.purpose.is_none() || !t.configured)
+                })
                 .count(),
             attachments: diagnostic::inventory_enabled().then_some(inventory),
         }
     }
     fn inventory_complete(&self) -> bool {
         self.reservations == 0
-            && self
-                .targets
-                .values()
-                .all(|target| target.purpose.is_some() && target.configured)
+            && self.targets.values().all(|target| {
+                // Auxiliary browser targets (browser/tab/browser_ui) render no
+                // page document and own no origin storage. Their independent
+                // configuration must not gate a document read.
+                super::client_enrollment::capture_auxiliary_kind(&target.kind)
+                    || (target.purpose.is_some() && target.configured)
+            })
     }
     /// Read admission waits for the scope's own enrollment instead of treating
     /// a page's background target work as an unavailable scope. A target that
@@ -4461,6 +4467,29 @@ mod tests {
             assert!(state.targets["worker"].capture_ready());
         }
         targets.check_settlement_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_auxiliary_browser_target_does_not_gate_a_document_read() {
+        let targets = ClientTargets::new("ctx".into(), "scope".into());
+        targets
+            .attached("ctx", "page".into(), "session".into(), "page".into())
+            .unwrap();
+        targets
+            .attached("ctx", "ui".into(), "ui-session".into(), "browser_ui".into())
+            .unwrap();
+        let mut state = targets.state.lock().unwrap();
+        state.targets.get_mut("page").unwrap().configured = true;
+        state.targets.get_mut("page").unwrap().resumed = true;
+        assert!(!state.targets["ui"].configured);
+        assert!(state.inventory_complete());
+        assert!(state.read_enrollment_settled());
+        assert_eq!(
+            state.targets["ui"].purpose,
+            Some(TargetPurpose::Application)
+        );
+        drop(state);
+        assert_eq!(targets.inventory_diagnostic().unconfigured, 0);
     }
 
     #[tokio::test]
