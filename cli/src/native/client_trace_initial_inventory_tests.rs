@@ -21,6 +21,7 @@ enum Race {
     AttachOtherTwice,
     AttachOtherHeldRelease,
     Cancel,
+    CancelDuringOwner,
     Sealed,
     Reservation,
     Replacement,
@@ -115,6 +116,7 @@ impl Fixture {
                             | Race::AttachOtherContinuous
                             | Race::AttachOtherTwice
                             | Race::AttachOtherHeldRelease
+                            | Race::CancelDuringOwner
                     )
             );
         }
@@ -133,6 +135,8 @@ impl Fixture {
         let peer_attached_others = attached_others.clone();
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
         let peer_cancel = cancel.clone();
+        // A broker-admitted lease owns the broker's own cancellation receiver.
+        let peer_broker = broker.clone();
         let peer_targets = targets.clone();
         let samples = Arc::new(AtomicUsize::new(0));
         let peer_samples = samples.clone();
@@ -165,6 +169,7 @@ impl Fixture {
                     | Race::HeldReleaseWithoutMutation
                     | Race::ReleaseError
                     | Race::ReleaseWrongSession
+                    | Race::CancelDuringOwner
             );
             loop {
                 let text = tokio::select! {
@@ -312,6 +317,19 @@ impl Fixture {
                     "DOM.getFrameOwner" if child => {
                         assert_eq!(request["params"]["frameId"], "child");
                         json!({"backendNodeId":101})
+                    }
+                    "DOM.resolveNode" if child && race == Race::CancelDuringOwner => {
+                        // The caller stops while its own frame-owner read is in
+                        // flight, and that read then settles with a validated CDP
+                        // error. This is a stop, not a lost object obligation.
+                        if let Some(broker) = &peer_broker {
+                            broker.cancel(1, 1).unwrap();
+                        } else {
+                            peer_cancel.send_replace(CancelSignal::Requested);
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        failed = true;
+                        json!({})
                     }
                     "DOM.resolveNode" if child => {
                         json!({"object":{"subtype":"node","objectId":format!("owner-{releases}")}})
