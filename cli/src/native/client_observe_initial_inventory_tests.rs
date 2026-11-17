@@ -578,9 +578,24 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         assert!(targets.owned_target("target").is_err());
     } else {
         assert!(joined_clean && !dispatch_dirty);
-        assert_eq!(original_error, ProtocolError::StaleScope);
+        // A caller stop that settles while the frame-owner read is in flight is
+        // that stop, not a lost cleanup proof; the read dispatched nothing.
+        assert_eq!(
+            original_error,
+            if race == Race::CancelDuringOwner {
+                ProtocolError::Cancelled
+            } else {
+                ProtocolError::StaleScope
+            }
+        );
         assert_eq!(same_owner, Some(race != Race::Replacement));
         assert!(!snapshot.integrity_lost);
+        if race == Race::CancelDuringOwner {
+            assert!(
+                targets.inventory().is_ok(),
+                "a caller-stopped initial owner read must not seal the page inventory"
+            );
+        }
     }
     if matches!(
         race,
@@ -597,6 +612,10 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
     }
     let expected_samples = if matches!(race, Race::Continuous | Race::AttachOtherContinuous) {
         2
+    } else if race == Race::CancelDuringOwner {
+        // The stop lands during the first frame-owner read, before the sample's
+        // final frame fence.
+        0
     } else {
         1
     };
@@ -802,6 +821,11 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn observe_receipt_caller_stop_during_owner_read_keeps_the_scope_usable() {
+    retained_observe_receipt_control(Race::CancelDuringOwner, false).await;
 }
 
 #[tokio::test]

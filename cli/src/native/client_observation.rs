@@ -424,6 +424,16 @@ pub(crate) async fn retained_read_command(
         // Do not lose a late object before its owning caller can record it.
         Ok(Ok(value)) if owns_resources => Ok(value),
         Ok(Ok(_)) => Err(primary),
+        // A validated CDP error reply carries no result object. The read the
+        // browser refused settles as the caller's stop, exactly like the same
+        // reply when it arrives before the stop wins the select. Only an
+        // unacknowledged reply or a retained object obligation can leave
+        // cleanup unproven; a mutation keeps its own fail-closed settlement.
+        Ok(Err(_))
+            if owns_resources && status.as_ref().is_some_and(|status| status.is_error_ack()) =>
+        {
+            Err(primary)
+        }
         Ok(Err(_)) | Err(_)
             if status
                 .as_ref()
