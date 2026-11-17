@@ -6151,6 +6151,28 @@ mod owned_inventory_diagnostic_opt_in_tests {
     }
 
     #[tokio::test]
+    async fn read_inventory_does_not_wait_for_an_unconfigured_auxiliary_browser_target() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "ui".into(), "ui-session".into(), "browser_ui".into())
+            .unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(!state.targets["ui"].configured);
+        }
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.wait_read_inventory(&operation, false),
+        )
+        .await
+        .expect("an auxiliary browser target renders no page document and must not gate a read");
+        let (_, targets, _) = read.unwrap();
+        assert_eq!(targets.len(), 2);
+    }
+
+    #[tokio::test]
     async fn read_inventory_refuses_immediately_when_the_registry_sealed() {
         let registry = ready_read_registry();
         registry.seal();
