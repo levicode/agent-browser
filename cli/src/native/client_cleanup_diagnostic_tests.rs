@@ -704,6 +704,7 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
             prefix: None,
             read_error: None,
             read_cleanup_lost: None,
+            cleanup_cause: Some(ReadCleanupCause::GroupRelease),
             stage: ScreenshotStage::Capture,
             capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
             inventory_after_failure: InventoryAfterFailure::Changed,
@@ -718,6 +719,7 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
     assert_eq!(rows[1]["capturePhase"], "post-capture-validation");
     assert_eq!(rows[1]["inventoryAfterFailure"], "changed");
     assert_eq!(rows[1]["error"], "stale-scope");
+    assert_eq!(rows[1]["readCleanupCause"], "group-release");
     assert_eq!(
         keys(&rows[1]),
         [
@@ -731,6 +733,7 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
             "overflow",
             "phase",
             "pid",
+            "readCleanupCause",
             "record",
             "schemaVersion",
             "screenshotStage",
@@ -738,6 +741,20 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
             "suppressedBefore"
         ]
     );
+}
+
+#[tokio::test]
+async fn read_cleanup_cause_is_scoped_and_first_wins() {
+    assert_eq!(current_read_cleanup_cause(), None);
+    let seen = READ_CLEANUP_CAUSE
+        .scope(Cell::new(None), async {
+            record_read_cleanup_cause(ReadCleanupCause::ReadSettlement);
+            record_read_cleanup_cause(ReadCleanupCause::GroupRelease);
+            current_read_cleanup_cause()
+        })
+        .await;
+    assert_eq!(seen, Some(ReadCleanupCause::ReadSettlement));
+    assert_eq!(current_read_cleanup_cause(), None);
 }
 
 #[test]
@@ -1000,6 +1017,7 @@ fn semantic_read_failure_uses_existing_sink_with_closed_typed_detail_only() {
             error: ProtocolError::StaleScope,
             read_error: Some(ReadError::Geometry(GeometryReadError::StaleIdentity)),
             read_cleanup_lost: Some(false),
+            cleanup_cause: None,
         },
     );
     let rows = records(&file);

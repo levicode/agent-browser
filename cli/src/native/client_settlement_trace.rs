@@ -288,6 +288,8 @@ pub(crate) struct Facts {
     pub read_error: Option<ReadError>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "readDirty")]
     pub read_cleanup_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readCleanupCause")]
+    pub read_cleanup_cause: Option<ReadCleanupCause>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
     pub frame_pass: Option<FrameInventoryPass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1448,6 +1450,7 @@ pub(crate) struct ScreenshotFailure {
     pub stage: ScreenshotStage,
     pub read_error: Option<ReadError>,
     pub read_cleanup_lost: Option<bool>,
+    pub cleanup_cause: Option<ReadCleanupCause>,
     pub capture_phase: ScreenshotCapturePhase,
     pub inventory_after_failure: InventoryAfterFailure,
     pub error: ProtocolError,
@@ -1472,6 +1475,7 @@ fn screenshot_failure_into(
             screenshot_stage: Some(failure.stage),
             read_error: failure.read_error,
             read_cleanup_lost: failure.read_cleanup_lost,
+            read_cleanup_cause: failure.cleanup_cause,
             capture_phase: Some(failure.capture_phase),
             inventory_after_failure: Some(failure.inventory_after_failure),
             error: Some(failure.error),
@@ -1641,6 +1645,31 @@ pub(crate) enum TerminalEnrollmentRefusal {
 /// guard produced any. Observation is diagnostic only, never cleanup authority.
 pub(crate) type TerminalRefusalObservation = Option<(TerminalEnrollmentRefusal, Option<[u64; 2]>)>;
 
+/// Which read-side settlement refused the stop's cleanup proof. Diagnostic
+/// only: it carries no error text, identifier, or payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadCleanupCause {
+    ReadSettlement,
+    GroupRelease,
+    ObjectGroupRelease,
+    OwnerRelease,
+}
+tokio::task_local! {
+    pub(crate) static READ_CLEANUP_CAUSE: Cell<Option<ReadCleanupCause>>;
+}
+/// Record the first cleanup cause seen by the current read. Outside a read's
+/// scoped task this is a no-op; a later cause never replaces the first.
+pub(crate) fn record_read_cleanup_cause(cause: ReadCleanupCause) {
+    let _ = READ_CLEANUP_CAUSE.try_with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(cause));
+        }
+    });
+}
+pub(crate) fn current_read_cleanup_cause() -> Option<ReadCleanupCause> {
+    READ_CLEANUP_CAUSE.try_with(Cell::get).ok().flatten()
+}
 /// Set once under the original target registry lock. No payload or runtime
 /// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

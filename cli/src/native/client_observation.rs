@@ -444,9 +444,14 @@ pub(crate) async fn retained_read_command(
         {
             Err(primary)
         }
-        Ok(Err(_)) | Err(_) if requires_settlement => Err(ObservationError::CleanupFailed {
-            primary: Some(Box::new(primary)),
-        }),
+        Ok(Err(_)) | Err(_) if requires_settlement => {
+            super::client_settlement_trace::record_read_cleanup_cause(
+                super::client_settlement_trace::ReadCleanupCause::ReadSettlement,
+            );
+            Err(ObservationError::CleanupFailed {
+                primary: Some(Box::new(primary)),
+            })
+        }
         Ok(Err(_)) | Err(_) => Err(primary),
     }
 }
@@ -679,6 +684,9 @@ async fn settle_object_group<T>(
         equivalence_tests::after_group_release(lease, group);
         result.map_err(|error| settled_stop(error, lease))
     } else {
+        super::client_settlement_trace::record_read_cleanup_cause(
+            super::client_settlement_trace::ReadCleanupCause::ObjectGroupRelease,
+        );
         Err(ObservationError::CleanupFailed {
             primary: result.err().map(Box::new),
         })
@@ -705,6 +713,9 @@ async fn settle_captured_object_group<T>(
         equivalence_tests::after_group_release(lease, group);
         result.map_err(|error| settled_stop(error, lease))
     } else {
+        super::client_settlement_trace::record_read_cleanup_cause(
+            super::client_settlement_trace::ReadCleanupCause::GroupRelease,
+        );
         Err(ObservationError::CleanupFailed {
             primary: result.err().map(Box::new),
         })
@@ -722,6 +733,9 @@ async fn settle_owner_object<T>(
     if super::client_actions::release_object_accounted(client, session, object).await {
         result
     } else {
+        super::client_settlement_trace::record_read_cleanup_cause(
+            super::client_settlement_trace::ReadCleanupCause::OwnerRelease,
+        );
         Err(ObservationError::CleanupFailed {
             primary: result.err().map(Box::new),
         })
