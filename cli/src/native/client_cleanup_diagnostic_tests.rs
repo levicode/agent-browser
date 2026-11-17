@@ -764,6 +764,39 @@ async fn read_cleanup_cause_is_scoped_and_first_wins() {
 }
 
 #[test]
+fn read_proof_tags_are_unconditional_closed_and_consistent() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    read_proof_into(
+        &capture,
+        1,
+        10,
+        ReadCommand::PageUrl,
+        true,
+        ReadProofMissing::None,
+    );
+    read_proof_into(
+        &capture,
+        1,
+        11,
+        ReadCommand::BrowserObserve,
+        false,
+        ReadProofMissing::Inventory,
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["phase"], "ReadProof");
+    assert_eq!(rows[0]["operationSeq"], 10);
+    assert_eq!(rows[0]["readCommand"], "page-url");
+    assert_eq!(rows[0]["readProofSigned"], true);
+    assert_eq!(rows[0]["readProofMissing"], "none");
+    assert_eq!(rows[1]["readCommand"], "browser-observe");
+    assert_eq!(rows[1]["readProofSigned"], false);
+    assert_eq!(rows[1]["readProofMissing"], "inventory");
+    let _ = capture;
+}
+
+#[test]
 fn screenshot_failure_maximal_closed_record_fits_existing_bound() {
     let record = Record {
         schema_version: 2,

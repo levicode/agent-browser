@@ -3845,11 +3845,42 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         } else {
             false
         };
+        let read_command = super::client_settlement_trace::ReadCommand::from_native(&command);
+        let read_generation = lease.generation;
+        let read_sequence = lease.sequence;
         let finish = |mut outcome: NativeOutcome| {
             // A proven, completed page creation is a completed prefix, not a
             // clean no-effect refusal of the whole public operation.
             if reopened && outcome.effects == Effects::NotDispatched {
                 outcome.effects = Effects::Completed;
+            }
+            if let Some(read) = read_command {
+                let signed = self
+                    .broker
+                    .health()
+                    .map(|(_, state)| state == super::client_protocol::ScopeState::Usable)
+                    .unwrap_or(false);
+                let missing = if signed {
+                    super::client_settlement_trace::ReadProofMissing::None
+                } else if outcome.retention.is_some() {
+                    super::client_settlement_trace::ReadProofMissing::Retention
+                } else if matches!(
+                    &outcome.result,
+                    Err(super::client_protocol::ProtocolError::BrowserFailure
+                        | super::client_protocol::ProtocolError::StaleScope
+                        | super::client_protocol::ProtocolError::StaleReference)
+                ) {
+                    super::client_settlement_trace::ReadProofMissing::Inventory
+                } else {
+                    super::client_settlement_trace::ReadProofMissing::Cleanup
+                };
+                super::client_settlement_trace::read_proof(
+                    read_generation,
+                    read_sequence,
+                    read,
+                    signed,
+                    missing,
+                );
             }
             outcome
         };

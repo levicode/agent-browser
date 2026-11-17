@@ -73,6 +73,7 @@ pub(crate) enum SettlementPhase {
     PendingResultQueued,
     CaptureLimitReached,
     CaptureStarted,
+    ReadProof,
     ProxyDaemonSpawned,
     PrefaceReturned,
     CopyStarted,
@@ -266,6 +267,12 @@ pub(crate) struct Facts {
     pub inventory_first_loss: Option<InventoryFirstLoss>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "inventorySealCause")]
     pub inventory_seal_cause: Option<InventorySealCause>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readCommand")]
+    pub read_command: Option<ReadCommand>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readProofSigned")]
+    pub read_proof_signed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readProofMissing")]
+    pub read_proof_missing: Option<ReadProofMissing>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1672,6 +1679,73 @@ pub(crate) fn record_read_cleanup_cause(cause: ReadCleanupCause) {
 }
 pub(crate) fn current_read_cleanup_cause() -> Option<ReadCleanupCause> {
     READ_CLEANUP_CAUSE.try_with(Cell::get).ok().flatten()
+}
+/// Closed names for the business-scope reads whose settlement proof is tagged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadCommand {
+    PageActivate,
+    PageNavigate,
+    PageUrl,
+    CookiesGet,
+    SessionEnvironment,
+    BrowserObserve,
+    StateRestore,
+}
+impl ReadCommand {
+    pub(crate) fn from_native(command: &str) -> Option<Self> {
+        match command {
+            "page.activate" => Some(Self::PageActivate),
+            "page.navigate" => Some(Self::PageNavigate),
+            "page.url" => Some(Self::PageUrl),
+            "context.cookies.get" => Some(Self::CookiesGet),
+            "session.environment" => Some(Self::SessionEnvironment),
+            "browser.observe" => Some(Self::BrowserObserve),
+            "state.restore" => Some(Self::StateRestore),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadProofMissing {
+    None,
+    Retention,
+    Inventory,
+    Cleanup,
+}
+/// Unconditional per-read proof tag. Diagnostic only, no payload or text.
+pub(crate) fn read_proof(
+    generation: u64,
+    sequence: u64,
+    command: ReadCommand,
+    signed: bool,
+    missing: ReadProofMissing,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        read_proof_into(capture, generation, sequence, command, signed, missing);
+    }
+}
+fn read_proof_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    command: ReadCommand,
+    signed: bool,
+    missing: ReadProofMissing,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ReadProof,
+        Facts {
+            generation: Some(generation),
+            read_command: Some(command),
+            read_proof_signed: Some(signed),
+            read_proof_missing: Some(missing),
+            ..Facts::default()
+        },
+    );
 }
 /// Set once under the original target registry lock. No payload or runtime
 /// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
