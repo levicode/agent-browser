@@ -328,7 +328,10 @@ pub(crate) async fn replace_pages(
             if journal.effects_started {
                 // The enclosing owner retains containment responsibility. Do
                 // not allow a late create ACK to become ordinary application use.
-                context.page.targets.seal();
+                context.page.targets.seal_with_cause(
+                    super::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+                    super::client_settlement_trace::InventorySealCause::Restart,
+                );
             }
             Err(Box::new(journal))
         }

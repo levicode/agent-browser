@@ -781,6 +781,7 @@ struct Registry {
     sealed: bool,
     integrity_lost: bool,
     first_loss: Option<diagnostic::InventoryFirstLoss>,
+    seal_cause: Option<diagnostic::InventorySealCause>,
     owner_retirement_inventory: Option<bool>,
     reservations: usize,
     creation_sequence: u64,
@@ -1035,21 +1036,28 @@ impl Registry {
             sealed: self.sealed,
             integrity_lost: self.integrity_lost,
             first_loss: self.first_loss,
+            seal_cause: self.seal_cause,
             reservations: self.reservations,
             unconfigured: self
                 .targets
                 .values()
-                .filter(|t| t.purpose.is_none() || !t.configured)
+                .filter(|t| {
+                    !super::client_enrollment::capture_auxiliary_kind(&t.kind)
+                        && (t.purpose.is_none() || !t.configured)
+                })
                 .count(),
             attachments: diagnostic::inventory_enabled().then_some(inventory),
         }
     }
     fn inventory_complete(&self) -> bool {
         self.reservations == 0
-            && self
-                .targets
-                .values()
-                .all(|target| target.purpose.is_some() && target.configured)
+            && self.targets.values().all(|target| {
+                // Auxiliary browser targets (browser/tab/browser_ui) render no
+                // page document and own no origin storage. Their independent
+                // configuration must not gate a document read.
+                super::client_enrollment::capture_auxiliary_kind(&target.kind)
+                    || (target.purpose.is_some() && target.configured)
+            })
     }
     /// Read admission waits for the scope's own enrollment instead of treating
     /// a page's background target work as an unavailable scope. A target that
@@ -1069,6 +1077,8 @@ impl Registry {
     }
     fn lose_integrity(&mut self, reason: diagnostic::InventoryFirstLoss) {
         self.first_loss.get_or_insert(reason);
+        self.seal_cause
+            .get_or_insert(diagnostic::InventorySealCause::from_reason(reason));
         self.sealed = true;
         self.integrity_lost = true;
     }
@@ -3156,12 +3166,26 @@ impl ClientTargets {
         }
     }
     pub fn seal(&self) {
-        self.seal_diagnostic(diagnostic::InventoryFirstLoss::ExplicitSeal);
+        self.seal_with_cause(
+            diagnostic::InventoryFirstLoss::ExplicitSeal,
+            diagnostic::InventorySealCause::Explicit,
+        );
     }
     pub(crate) fn seal_diagnostic(&self, reason: diagnostic::InventoryFirstLoss) {
+        let cause = diagnostic::InventorySealCause::from_reason(reason);
+        self.seal_with_cause(reason, cause);
+    }
+    pub(crate) fn seal_with_cause(
+        &self,
+        reason: diagnostic::InventoryFirstLoss,
+        cause: diagnostic::InventorySealCause,
+    ) {
         self.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.state.lock() {
+                if state.seal_cause.is_none() {
+                    state.seal_cause = Some(cause);
+                }
                 state.lose_integrity(reason);
             }
             self.changed.notify_waiters();
@@ -4443,6 +4467,29 @@ mod tests {
             assert!(state.targets["worker"].capture_ready());
         }
         targets.check_settlement_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unconfigured_auxiliary_browser_target_does_not_gate_a_document_read() {
+        let targets = ClientTargets::new("ctx".into(), "scope".into());
+        targets
+            .attached("ctx", "page".into(), "session".into(), "page".into())
+            .unwrap();
+        targets
+            .attached("ctx", "ui".into(), "ui-session".into(), "browser_ui".into())
+            .unwrap();
+        let mut state = targets.state.lock().unwrap();
+        state.targets.get_mut("page").unwrap().configured = true;
+        state.targets.get_mut("page").unwrap().resumed = true;
+        assert!(!state.targets["ui"].configured);
+        assert!(state.inventory_complete());
+        assert!(state.read_enrollment_settled());
+        assert_eq!(
+            state.targets["ui"].purpose,
+            Some(TargetPurpose::Application)
+        );
+        drop(state);
+        assert_eq!(targets.inventory_diagnostic().unconfigured, 0);
     }
 
     #[tokio::test]
@@ -5984,6 +6031,10 @@ mod first_loss_diagnostic_tests {
         assert!(registry.first_loss.is_none());
         registry.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
         assert!(registry.sealed && registry.integrity_lost);
+        assert_eq!(
+            registry.diagnostic_inventory().seal_cause,
+            Some(diagnostic::InventorySealCause::Explicit)
+        );
         registry.lose_integrity(diagnostic::InventoryFirstLoss::ExplicitSeal);
         assert_eq!(
             registry.first_loss,
@@ -6097,6 +6148,28 @@ mod owned_inventory_diagnostic_opt_in_tests {
         assert!(targets
             .iter()
             .all(|target| target.configured && target.resumed));
+    }
+
+    #[tokio::test]
+    async fn read_inventory_does_not_wait_for_an_unconfigured_auxiliary_browser_target() {
+        let registry = ready_read_registry();
+        registry
+            .attached("ctx", "ui".into(), "ui-session".into(), "browser_ui".into())
+            .unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(!state.targets["ui"].configured);
+        }
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.wait_read_inventory(&operation, false),
+        )
+        .await
+        .expect("an auxiliary browser target renders no page document and must not gate a read");
+        let (_, targets, _) = read.unwrap();
+        assert_eq!(targets.len(), 2);
     }
 
     #[tokio::test]

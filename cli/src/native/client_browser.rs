@@ -1314,7 +1314,10 @@ impl OwnedBrowser {
         }
         .await;
         if let Err(error) = initialized {
-            targets.seal();
+            targets.seal_with_cause(
+                super::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+                super::client_settlement_trace::InventorySealCause::OperationState,
+            );
             let disposed = manager
                 .client
                 .send_command(
@@ -1768,7 +1771,10 @@ impl OwnedBrowser {
             };
         }
         self.ui.seal();
-        self.targets.seal();
+        self.targets.seal_with_cause(
+            super::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+            super::client_settlement_trace::InventorySealCause::Close,
+        );
         let debt = self.manager.client.debt_ledger();
         self.manager
             .client
@@ -1915,7 +1921,10 @@ impl OwnedBrowser {
                 Err(ProtocolError::CleanupFailed)
             };
         }
-        self.targets.seal();
+        self.targets.seal_with_cause(
+            super::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+            super::client_settlement_trace::InventorySealCause::Shutdown,
+        );
         if !self.owns_context {
             let probe = self.persistent_probe.cleanup(&self.manager.client).await;
             let closed = self.manager.close().await;

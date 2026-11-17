@@ -121,6 +121,7 @@ struct ScreenshotFailureState {
     revision: Option<u64>,
     inventory_rejection: Option<diagnostic::FrameInventoryRejection>,
     read_failure: Option<(diagnostic::ReadError, bool)>,
+    cleanup_cause: Option<diagnostic::ReadCleanupCause>,
     initial_sample: Option<u8>,
     prefix: Option<diagnostic::ObserveInitialPrefix>,
 }
@@ -146,6 +147,7 @@ impl ScreenshotFailureWitness {
                 revision: None,
                 inventory_rejection: None,
                 read_failure: None,
+                cleanup_cause: None,
                 initial_sample: None,
                 prefix: None,
             }),
@@ -217,6 +219,7 @@ impl ScreenshotFailureWitness {
                     ScreenshotCapturePhase::NotEntered,
                     error.clone(),
                 ));
+                state.cleanup_cause = diagnostic::current_read_cleanup_cause();
             }
         }
     }
@@ -229,6 +232,7 @@ impl ScreenshotFailureWitness {
                     error.clone(),
                 ));
                 state.read_failure = Some(detail);
+                state.cleanup_cause = diagnostic::current_read_cleanup_cause();
             }
         }
     }
@@ -321,7 +325,16 @@ impl ScreenshotFailureWitness {
         }
     }
     fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
-        let (stage, capture_phase, error, before, read_failure, initial_sample, prefix) = {
+        let (
+            stage,
+            capture_phase,
+            error,
+            before,
+            read_failure,
+            cleanup_cause,
+            initial_sample,
+            prefix,
+        ) = {
             let mut state = self.state.lock().ok()?;
             let (stage, phase, error) = state.first.take()?;
             (
@@ -330,6 +343,7 @@ impl ScreenshotFailureWitness {
                 error,
                 state.revision,
                 state.read_failure.take(),
+                state.cleanup_cause.take(),
                 state.initial_sample,
                 state.prefix,
             )
@@ -348,6 +362,7 @@ impl ScreenshotFailureWitness {
             stage,
             read_error: read_failure.map(|detail| detail.0),
             read_cleanup_lost: read_failure.map(|detail| detail.1),
+            cleanup_cause,
             capture_phase,
             error,
             inventory_after_failure,
@@ -1315,6 +1330,7 @@ impl ObservationDispatch {
             #[cfg(test)]
             let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
             let run = observation::with_capture_retirement(retirement, run);
+            let run = diagnostic::READ_CLEANUP_CAUSE.scope(std::cell::Cell::new(None), run);
             let mut output = match operation_journal {
                 Some(journal) => journal.scope(run).await,
                 None => run.await,
@@ -1356,7 +1372,10 @@ impl ObservationDispatch {
                     }) && !release_handles(&blobs, &scope, &output.handles)
                     {
                         if !evidence_only {
-                            targets.seal();
+                            targets.seal_with_cause(
+                                diagnostic::InventoryFirstLoss::ExplicitSeal,
+                                diagnostic::InventorySealCause::DispatchCleanup,
+                            );
                         }
                         return Err(DispatchFailure {
                             error: ProtocolError::CleanupFailed,
@@ -1367,7 +1386,10 @@ impl ObservationDispatch {
                 }
                 Err(error) => {
                     if error.cleanup_integrity_lost && !evidence_only {
-                        targets.seal();
+                        targets.seal_with_cause(
+                            diagnostic::InventoryFirstLoss::ExplicitSeal,
+                            diagnostic::InventorySealCause::DispatchCleanup,
+                        );
                     }
                     match send.take() {
                         Some(send) => {
@@ -3198,7 +3220,10 @@ impl ObservationDispatch {
             if let Some(witness) = screenshot { witness.failure(&error); }
             let clean = release_handles(&context.blobs, &context.scope, &handles);
             if !clean {
-                capture_context.page.targets.seal();
+                capture_context.page.targets.seal_with_cause(
+                    diagnostic::InventoryFirstLoss::ExplicitSeal,
+                    diagnostic::InventorySealCause::PublishHandles,
+                );
             }
             return Err(DispatchFailure {
                 error,
@@ -4441,6 +4466,11 @@ async fn frame_inventory_attempt_once(
         if target.purpose != Some(TargetPurpose::Application) {
             // State-bootstrap targets have independent ownership and cannot
             // establish application frame ancestry.
+            continue;
+        }
+        if super::client_enrollment::capture_auxiliary_kind(&target.kind) {
+            // Auxiliary browser targets render no page document; their own
+            // configuration must not gate the page's frame inventory.
             continue;
         }
         if !target.configured || !target.resumed {

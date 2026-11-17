@@ -1057,7 +1057,10 @@ mod tests {
                         .unwrap()
                         .insert(extra.key(), extra_entry);
                 }
-                "target-poison" => targets.seal(),
+                "target-poison" => targets.seal_with_cause(
+                    crate::native::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+                    crate::native::client_settlement_trace::InventorySealCause::OperationState,
+                ),
                 _ => {}
             }
             // The expected physical-close contamination alone must not explain

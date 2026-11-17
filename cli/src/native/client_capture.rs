@@ -310,7 +310,10 @@ async fn capture_transaction(
     let cleanup_integrity_lost = result.as_ref().err() == Some(&CaptureReason::CleanupFailed)
         || geometry_integrity.as_ref().err() == Some(&CaptureReason::CleanupFailed);
     if cleanup_integrity_lost {
-        context.page.targets.seal();
+        context.page.targets.seal_with_cause(
+            super::client_settlement_trace::InventoryFirstLoss::ExplicitSeal,
+            super::client_settlement_trace::InventorySealCause::Capture,
+        );
     }
     result
         .and_then(|pixels| {

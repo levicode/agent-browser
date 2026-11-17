@@ -264,6 +264,8 @@ pub(crate) struct Facts {
     pub inventory_integrity_lost: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_first_loss: Option<InventoryFirstLoss>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "inventorySealCause")]
+    pub inventory_seal_cause: Option<InventorySealCause>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,6 +290,8 @@ pub(crate) struct Facts {
     pub read_error: Option<ReadError>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "readDirty")]
     pub read_cleanup_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readCleanupCause")]
+    pub read_cleanup_cause: Option<ReadCleanupCause>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
     pub frame_pass: Option<FrameInventoryPass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -857,6 +861,7 @@ pub(crate) struct InventorySnapshot {
     pub sealed: bool,
     pub integrity_lost: bool,
     pub first_loss: Option<InventoryFirstLoss>,
+    pub seal_cause: Option<InventorySealCause>,
     pub reservations: usize,
     pub unconfigured: usize,
     pub attachments: Option<DiagnosticTargetInventory>,
@@ -1448,6 +1453,7 @@ pub(crate) struct ScreenshotFailure {
     pub stage: ScreenshotStage,
     pub read_error: Option<ReadError>,
     pub read_cleanup_lost: Option<bool>,
+    pub cleanup_cause: Option<ReadCleanupCause>,
     pub capture_phase: ScreenshotCapturePhase,
     pub inventory_after_failure: InventoryAfterFailure,
     pub error: ProtocolError,
@@ -1472,6 +1478,7 @@ fn screenshot_failure_into(
             screenshot_stage: Some(failure.stage),
             read_error: failure.read_error,
             read_cleanup_lost: failure.read_cleanup_lost,
+            read_cleanup_cause: failure.cleanup_cause,
             capture_phase: Some(failure.capture_phase),
             inventory_after_failure: Some(failure.inventory_after_failure),
             error: Some(failure.error),
@@ -1641,6 +1648,31 @@ pub(crate) enum TerminalEnrollmentRefusal {
 /// guard produced any. Observation is diagnostic only, never cleanup authority.
 pub(crate) type TerminalRefusalObservation = Option<(TerminalEnrollmentRefusal, Option<[u64; 2]>)>;
 
+/// Which read-side settlement refused the stop's cleanup proof. Diagnostic
+/// only: it carries no error text, identifier, or payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadCleanupCause {
+    ReadSettlement,
+    GroupRelease,
+    ObjectGroupRelease,
+    OwnerRelease,
+}
+tokio::task_local! {
+    pub(crate) static READ_CLEANUP_CAUSE: Cell<Option<ReadCleanupCause>>;
+}
+/// Record the first cleanup cause seen by the current read. Outside a read's
+/// scoped task this is a no-op; a later cause never replaces the first.
+pub(crate) fn record_read_cleanup_cause(cause: ReadCleanupCause) {
+    let _ = READ_CLEANUP_CAUSE.try_with(|cell| {
+        if cell.get().is_none() {
+            cell.set(Some(cause));
+        }
+    });
+}
+pub(crate) fn current_read_cleanup_cause() -> Option<ReadCleanupCause> {
+    READ_CLEANUP_CAUSE.try_with(Cell::get).ok().flatten()
+}
 /// Set once under the original target registry lock. No payload or runtime
 /// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1659,6 +1691,34 @@ pub(crate) enum InventoryFirstLoss {
     RetainedDeadlineSeal,
     RetainedSettlementSeal,
     RetainedCompletionSeal,
+}
+/// Which first seal the inventory lost its integrity to. Diagnostic only; the
+/// first loss keeps its immutable reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventorySealCause {
+    Explicit,
+    DispatchCleanup,
+    PublishHandles,
+    Shutdown,
+    Close,
+    Restart,
+    Network,
+    Capture,
+    OperationState,
+    RetainedDeadline,
+    RetainedSettlement,
+    RetainedCompletion,
+}
+impl InventorySealCause {
+    pub(crate) fn from_reason(reason: InventoryFirstLoss) -> Self {
+        match reason {
+            InventoryFirstLoss::RetainedDeadlineSeal => Self::RetainedDeadline,
+            InventoryFirstLoss::RetainedSettlementSeal => Self::RetainedSettlement,
+            InventoryFirstLoss::RetainedCompletionSeal => Self::RetainedCompletion,
+            _ => Self::Explicit,
+        }
+    }
 }
 pub(crate) fn terminal_proof_refusal(
     stage: TerminalCleanupStage,
@@ -2654,6 +2714,7 @@ fn inventory_snapshot_into(
             inventory_sealed: Some(snapshot.sealed),
             inventory_integrity_lost: Some(snapshot.integrity_lost),
             inventory_first_loss: snapshot.first_loss,
+            inventory_seal_cause: snapshot.seal_cause,
             inventory_reservations: Some(snapshot.reservations.min(8192) as u64),
             inventory_unconfigured: Some(snapshot.unconfigured.min(8192) as u64),
             ..Facts::default()
