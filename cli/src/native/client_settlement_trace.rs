@@ -98,6 +98,8 @@ pub(crate) enum SettlementPhase {
     DetailLimit,
     /// One scope-isolation decision: which layer sealed, poisoned or quarantined a scope and why.
     ScopeIsolation,
+    /// Composition of the live network event tasks when their bound is reached.
+    NetworkBacklog,
 }
 
 pub(crate) use SettlementPhase as Phase;
@@ -368,6 +370,10 @@ pub(crate) struct Facts {
     pub isolation_reason: Option<IsolationReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_kinds: Option<[u16; 12]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_pending: Option<[u16; 6]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_pending_total: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1062,6 +1068,23 @@ pub(crate) struct IsolationObservation {
 pub(crate) fn scope_isolation(observation: IsolationObservation) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
         scope_isolation_into(capture, observation);
+    }
+}
+/// The live event-task composition when the network handler reaches its bound.
+/// Emitted regardless of the reason the bound was reached.
+pub(crate) fn network_backlog(generation: u64, pending: [u16; 6], total: u16) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            0,
+            Phase::NetworkBacklog,
+            Facts {
+                generation: Some(generation),
+                network_pending: Some(pending),
+                network_pending_total: Some(total),
+                ..Facts::default()
+            },
+        );
     }
 }
 fn scope_isolation_into(capture: &Capture, observation: IsolationObservation) {
@@ -4240,6 +4263,7 @@ mod isolation_tests {
         }
         ClientTargets::new("context".into(), "scope".into()).seal();
         ClientSession::new().quarantine().unwrap();
+        network_backlog(1, [2, 0, 0, 0, 0, 0], 2);
         let records = rows(&file);
         // The caller is this test, which is exactly what `#[track_caller]` must
         // report: the transition function must not claim its own line. The
@@ -4261,6 +4285,16 @@ mod isolation_tests {
             })
             .expect("broker quarantine wrote no isolation record");
         assert_eq!(quarantine["scopeState"], "quarantined");
+        let backlog = records
+            .iter()
+            .find(|record| record["phase"] == "NetworkBacklog")
+            .expect("network backlog wrote no record");
+        assert_eq!(
+            backlog["networkPending"],
+            serde_json::json!([2, 0, 0, 0, 0, 0])
+        );
+        assert_eq!(backlog["networkPendingTotal"], 2);
+        assert_eq!(backlog["generation"], 1);
     }
 }
 

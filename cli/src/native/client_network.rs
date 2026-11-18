@@ -35,9 +35,30 @@ use super::client_transport::ClientEventSink;
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// One live event task, counted by class until the task settles.
+struct PendingTaskGuard {
+    counters: Arc<[AtomicU16; 6]>,
+    class: usize,
+}
+impl Drop for PendingTaskGuard {
+    fn drop(&mut self) {
+        self.counters[self.class].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+/// Closed class order used by the forwarded `networkPending` diagnostic.
+fn pending_task_class(method: &str) -> usize {
+    match method {
+        "Fetch.requestPaused" => 0,
+        "Fetch.authRequired" => 1,
+        "Page.javascriptDialogOpening" => 2,
+        "Network.loadingFinished" => 3,
+        "Network.loadingFailed" => 4,
+        _ => 5,
+    }
+}
 pub struct ClientNetwork {
     pub client: Arc<CdpClient>,
     broker: Arc<ClientSession>,
@@ -60,6 +81,8 @@ pub struct ClientNetwork {
     cancellation: tokio::sync::watch::Sender<CancelSignal>,
     sessions: Mutex<HashMap<String, EnrolledSession>>,
     tasks: Mutex<tokio::task::JoinSet<Result<(), ProtocolError>>>,
+    // Live event-handler tasks by class; read only when the task bound is hit.
+    pending_tasks: Arc<[AtomicU16; 6]>,
     #[cfg(test)]
     task_result_gate: Mutex<
         Option<(
@@ -523,6 +546,7 @@ impl ClientNetwork {
             cancellation,
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
+            pending_tasks: Arc::new(std::array::from_fn(|_| AtomicU16::new(0))),
             #[cfg(test)]
             task_result_gate: Mutex::new(None),
             blocking_reads: Mutex::new(tokio::task::JoinSet::new()),
@@ -1723,6 +1747,15 @@ impl ClientNetwork {
             }
         }
         if tasks.len() >= 64 {
+            // Name the tasks that accumulated before isolating the scope: the
+            // composition is the evidence a later fix needs.
+            let pending: [u16; 6] =
+                std::array::from_fn(|index| self.pending_tasks[index].load(Ordering::Relaxed));
+            super::client_settlement_trace::network_backlog(
+                self.scope.generation,
+                pending,
+                tasks.len().min(u16::MAX as usize) as u16,
+            );
             self.broker.quarantine()?;
             return Err(ProtocolError::CapacityExceeded);
         }
@@ -1750,7 +1783,14 @@ impl ClientNetwork {
         };
         let this = self.clone();
         let event = event.clone();
+        let pending_class = pending_task_class(&event.method);
+        self.pending_tasks[pending_class].fetch_add(1, Ordering::Relaxed);
+        let pending_guard = PendingTaskGuard {
+            counters: self.pending_tasks.clone(),
+            class: pending_class,
+        };
         tasks.spawn(async move {
+            let _pending = pending_guard;
             let _budget = budget;
             let deadline = captured
                 .as_ref()
