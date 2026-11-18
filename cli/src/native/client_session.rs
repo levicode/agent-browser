@@ -1747,6 +1747,57 @@ impl ClientSession {
         resource_scope: Option<String>,
         eval_window: Option<super::client_debt::EvalWindowHandle>,
     ) -> Result<DecisionLease, ProtocolError> {
+        self.decision_scoped_with_eval_admission(
+            generation,
+            owner,
+            kind,
+            timeout_ms,
+            registry,
+            resource_scope,
+            eval_window,
+            true,
+        )
+    }
+    /// Admit one scoped decision without turning a full table into scope-health
+    /// evidence. A caller that can refuse its own request uses this variant so
+    /// capacity only fails that request; the default wrapper keeps the scope
+    /// quarantine for callers that cannot settle locally.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub(crate) fn try_decision_scoped_with_eval(
+        &self,
+        generation: u64,
+        owner: DecisionOwner,
+        kind: DecisionKind,
+        timeout_ms: u64,
+        registry: Option<u64>,
+        resource_scope: Option<String>,
+        eval_window: Option<super::client_debt::EvalWindowHandle>,
+    ) -> Result<DecisionLease, ProtocolError> {
+        self.decision_scoped_with_eval_admission(
+            generation,
+            owner,
+            kind,
+            timeout_ms,
+            registry,
+            resource_scope,
+            eval_window,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    fn decision_scoped_with_eval_admission(
+        &self,
+        generation: u64,
+        owner: DecisionOwner,
+        kind: DecisionKind,
+        timeout_ms: u64,
+        registry: Option<u64>,
+        resource_scope: Option<String>,
+        eval_window: Option<super::client_debt::EvalWindowHandle>,
+        quarantine_on_capacity: bool,
+    ) -> Result<DecisionLease, ProtocolError> {
         if resource_scope.as_ref().is_some_and(String::is_empty) {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -1759,18 +1810,20 @@ impl ClientSession {
             return Err(ProtocolError::InvalidTimeout);
         }
         if inner.decisions.len() >= MAX_DECISIONS {
-            Self::seal(&mut inner, ScopeState::Quarantined);
-            super::client_settlement_trace::scope_isolation(
-                super::client_settlement_trace::IsolationObservation {
-                    layer: super::client_settlement_trace::IsolationLayer::SessionQuarantine,
-                    caller: std::panic::Location::caller(),
-                    reason: super::client_settlement_trace::IsolationReason::Capacity,
-                    operation_seq: super::client_debt::current_operation_sequence(),
-                    target_kinds: None,
-                    error: Some(ProtocolError::CapacityExceeded),
-                    scope_state: Some(ScopeState::Quarantined),
-                },
-            );
+            if quarantine_on_capacity {
+                Self::seal(&mut inner, ScopeState::Quarantined);
+                super::client_settlement_trace::scope_isolation(
+                    super::client_settlement_trace::IsolationObservation {
+                        layer: super::client_settlement_trace::IsolationLayer::SessionQuarantine,
+                        caller: std::panic::Location::caller(),
+                        reason: super::client_settlement_trace::IsolationReason::Capacity,
+                        operation_seq: super::client_debt::current_operation_sequence(),
+                        target_kinds: None,
+                        error: Some(ProtocolError::CapacityExceeded),
+                        scope_state: Some(ScopeState::Quarantined),
+                    },
+                );
+            }
             return Err(ProtocolError::CapacityExceeded);
         }
         // Interop is internal operation coordination, never background callback

@@ -38,6 +38,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Live network event tasks admitted to run callback or response work at once.
+/// A burst beyond it waits for a slot inside the event's own budget: the bound
+/// is local backpressure, never a scope-health verdict. Retained waiting tasks
+/// stay bounded by the decision broker and interception tables, so this number
+/// only paces work and never refuses a request by itself.
+const NETWORK_TASK_CONCURRENCY: usize = 64;
 pub struct ClientNetwork {
     pub client: Arc<CdpClient>,
     broker: Arc<ClientSession>,
@@ -60,6 +66,9 @@ pub struct ClientNetwork {
     cancellation: tokio::sync::watch::Sender<CancelSignal>,
     sessions: Mutex<HashMap<String, EnrolledSession>>,
     tasks: Mutex<tokio::task::JoinSet<Result<(), ProtocolError>>>,
+    // Paces live event tasks. Acquired inside the task, so the event pump never
+    // blocks and a full gate never isolates the scope.
+    task_slots: tokio::sync::Semaphore,
     #[cfg(test)]
     task_result_gate: Mutex<
         Option<(
@@ -523,6 +532,7 @@ impl ClientNetwork {
             cancellation,
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
+            task_slots: tokio::sync::Semaphore::new(NETWORK_TASK_CONCURRENCY),
             #[cfg(test)]
             task_result_gate: Mutex::new(None),
             blocking_reads: Mutex::new(tokio::task::JoinSet::new()),
@@ -1529,10 +1539,8 @@ impl ClientNetwork {
                     return Err(ProtocolError::BrowserFailure);
                 }
             }
-            if tasks.len() >= 64 {
-                self.broker.quarantine()?;
-                return Err(ProtocolError::CapacityExceeded);
-            }
+            // Terminal download work is already bounded by the 128-entry
+            // download table; it needs no second task-count refusal.
             let this = self.clone();
             let params = event.params.clone();
             tasks.spawn(async move {
@@ -1603,33 +1611,75 @@ impl ClientNetwork {
         };
         let pending_occurrence = pending_key.as_ref().map(|_| Arc::new(()));
         if let Some(key) = &pending_key {
-            let mut pending = self
-                .pending_interceptions
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            if pending.len() >= 2048 {
-                return Err(ProtocolError::CapacityExceeded);
+            let full = {
+                let mut pending = self
+                    .pending_interceptions
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if pending.len() >= 2048 {
+                    true
+                } else {
+                    pending.insert(key.clone(), pending_occurrence.as_ref().unwrap().clone());
+                    false
+                }
+            };
+            if full {
+                // Interception accounting being full retires only this request;
+                // it is not evidence that the page scope is unusable.
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                self.refuse_callback(
+                    &mut tasks,
+                    &session.session_id,
+                    event,
+                    session_tenure.clone(),
+                    pending_key.clone(),
+                    pending_occurrence.clone(),
+                );
+                return Ok(());
             }
-            pending.insert(key.clone(), pending_occurrence.as_ref().unwrap().clone());
         }
         // Accounting happens in event order before tasks are launched.
         if event.method == "Fetch.requestPaused" {
             if let Some(network_id) = event.params.get("networkId").and_then(Value::as_str) {
                 let fetch_id = required_string(&event.params, "requestId")?;
-                let mut ids = self
-                    .request_ids
-                    .lock()
-                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                if ids.len() >= 2048 {
-                    return Err(ProtocolError::CapacityExceeded);
-                }
-                if let Some(previous) =
-                    ids.insert((session_id.into(), network_id.into()), fetch_id.into())
-                {
-                    self.auth_attempts
+                let full = {
+                    let mut ids = self
+                        .request_ids
                         .lock()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?
-                        .remove(&(session_id.into(), previous));
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if ids.len() >= 2048 {
+                        true
+                    } else {
+                        if let Some(previous) =
+                            ids.insert((session_id.into(), network_id.into()), fetch_id.into())
+                        {
+                            self.auth_attempts
+                                .lock()
+                                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                                .remove(&(session_id.into(), previous));
+                        }
+                        false
+                    }
+                };
+                if full {
+                    // Request-id accounting being full retires only this
+                    // request, keeping the scope's cleanup proof.
+                    let mut tasks = self
+                        .tasks
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    self.refuse_callback(
+                        &mut tasks,
+                        &session.session_id,
+                        event,
+                        session_tenure.clone(),
+                        pending_key.clone(),
+                        pending_occurrence.clone(),
+                    );
+                    return Ok(());
                 }
             }
         }
@@ -1722,34 +1772,65 @@ impl ClientNetwork {
                 return Err(ProtocolError::BrowserFailure);
             }
         }
-        if tasks.len() >= 64 {
-            self.broker.quarantine()?;
-            return Err(ProtocolError::CapacityExceeded);
-        }
         let callback_event = matches!(
             event.method.as_str(),
             "Fetch.requestPaused" | "Fetch.authRequired" | "Page.javascriptDialogOpening"
         );
         let unpublished_callback = callback_event && sink.is_publication_pending()?;
-        // A paused request from an unpublished page must not reserve UI ahead
-        // of the lifecycle owner's exclusive restore/import work. Live-session
+        // A paused request is control-plane work, not a native UI effect: it
+        // publishes one route decision and answers the browser, which the
+        // capture already treats as live page activity. Gating it on the
+        // protected-read UI gate made a capture and the page's own pending
+        // loads wait on each other, so a paused request holds no UI admission.
+        // Dialogs and auth challenges remain UI callbacks and keep the gate.
+        let ui_callback = callback_event && event.method != "Fetch.requestPaused";
+        // A paused request from an unpublished page must not publish ahead of
+        // the lifecycle owner's exclusive restore/import work; live-session UI
         // callbacks retain their original immediate reservation ordering.
-        let callback_reservation = if callback_event && !unpublished_callback {
-            // A paused request only needs a route decision, not UI custody.
-            // Let it overlap a protected read; dialogs and auth still wait.
-            Some(
-                self.ui_gate
-                    .reserve_callback(event.method == "Fetch.requestPaused")?,
-            )
+        let callback_reservation = if ui_callback && !unpublished_callback {
+            match self.ui_gate.reserve_callback(false) {
+                Ok(reservation) => Some(reservation),
+                // The callback table being momentarily full is local
+                // backpressure, not evidence that the scope is unusable: fail
+                // only the callback that cannot be admitted.
+                Err(ProtocolError::CapacityExceeded) => {
+                    self.refuse_callback(
+                        &mut tasks,
+                        &session.session_id,
+                        event,
+                        session_tenure.clone(),
+                        pending_key.clone(),
+                        pending_occurrence.clone(),
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
         let captured = if event.method == "Fetch.requestPaused" {
-            Some(self.capture_request(
+            match self.capture_request(
                 &session.session_id,
                 DecisionOwner::Scope,
                 self.callback_decision_timeout_ms(),
-            )?)
+            ) {
+                Ok(lease) => Some(lease),
+                // The scope decision table being momentarily full is local
+                // backpressure; this request alone is retired.
+                Err(ProtocolError::CapacityExceeded) => {
+                    self.refuse_callback(
+                        &mut tasks,
+                        &session.session_id,
+                        event,
+                        session_tenure.clone(),
+                        pending_key.clone(),
+                        pending_occurrence.clone(),
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -1765,6 +1846,26 @@ impl ClientNetwork {
                 network: &this,
                 token: lease.token.clone(),
             });
+            // Local backpressure: a burst waits for a decision slot inside this
+            // event's own budget instead of isolating the scope. Only the
+            // request that never gets a slot fails; a stopping scope leaves its
+            // pending interceptions to the close path.
+            let _slot = match this.acquire_network_task_slot(deadline).await {
+                Ok(slot) => slot,
+                Err(ProtocolError::DeadlineExceeded) => {
+                    let refused = this
+                        .refuse_paused_request(&session.session_id, &event)
+                        .await;
+                    return this.settle_event_result(
+                        refused,
+                        &session.session_id,
+                        &session_tenure,
+                        pending_key.as_ref(),
+                        pending_occurrence.as_ref(),
+                    );
+                }
+                Err(_) => return Ok(()),
+            };
             if callback_event {
                 if let Err(error) = this
                     .wait_for_configuration(configuration_ready, deadline)
@@ -1796,7 +1897,7 @@ impl ClientNetwork {
                     return Err(error);
                 }
             }
-            let callback_reservation = if unpublished_callback {
+            if unpublished_callback {
                 if let Err(error) = sink
                     .wait_publication(deadline, this.cancellation.subscribe())
                     .await
@@ -1809,7 +1910,24 @@ impl ClientNetwork {
                 if !this.session_tenure_live(&session.session_id, &session_tenure)? {
                     return Ok(());
                 }
-                Some(this.ui_gate.reserve_callback(false)?)
+            }
+            let callback_reservation = if unpublished_callback && ui_callback {
+                match this.ui_gate.reserve_callback(false) {
+                    Ok(reservation) => Some(reservation),
+                    Err(ProtocolError::CapacityExceeded) => {
+                        let refused = this
+                            .refuse_paused_request(&session.session_id, &event)
+                            .await;
+                        return this.settle_event_result(
+                            refused,
+                            &session.session_id,
+                            &session_tenure,
+                            pending_key.as_ref(),
+                            pending_occurrence.as_ref(),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 callback_reservation
             };
@@ -1869,86 +1987,196 @@ impl ClientNetwork {
             };
             #[cfg(test)]
             this.pause_network_task_result_for_test().await;
-            // Captured command errors outrank later asynchronous table removal.
-            // In particular an ErrorAck cannot become normal retirement merely
-            // because detach was applied while this task was awaiting its turn.
-            let result = match result {
-                Ok(()) => Ok(()),
-                Err(NetworkTaskFailure::Operation(error)) => Err(error),
-                Err(NetworkTaskFailure::Command(failure)) => {
-                    if failure.request_gone() {
-                        // The browser itself proved the exact paused request or
-                        // interception is gone (a page-created frame detached
-                        // before the decision reached it). No application
-                        // request is left paused, so retire only this callback
-                        // occurrence; the scope keeps its cleanup proof.
-                        match this.finish_callback_occurrence(
-                            &session.session_id,
-                            &session_tenure,
-                            pending_key.as_ref(),
-                            pending_occurrence.as_ref(),
-                        ) {
-                            Ok(_) => return Ok(()),
-                            Err(error) => {
-                                if !this.sealed.load(Ordering::Acquire) {
-                                    let _ = this.broker.quarantine();
-                                }
-                                return Err(error);
-                            }
-                        }
-                    }
-                    if let Some(receipt) = failure.into_retirement() {
-                        if this.client.consume_network_retirement(
-                            receipt,
-                            this.scope.generation,
-                            &this.scope.identity_scope,
-                            &session.session_id,
-                        ) && matches!(
-                            this.finish_callback_occurrence(
-                                &session.session_id,
-                                &session_tenure,
-                                pending_key.as_ref(),
-                                pending_occurrence.as_ref()
-                            ),
-                            Ok(true)
-                        ) {
-                            // Exact reader destruction, NOT a fabricated ACK.
-                            return Ok(());
-                        }
-                    }
-                    if !this.sealed.load(Ordering::Acquire) {
-                        let _ = this.broker.quarantine();
-                    }
-                    return Err(ProtocolError::BrowserFailure);
-                }
-            };
-            if result.is_ok() {
-                this.finish_callback_occurrence(
-                    &session.session_id,
-                    &session_tenure,
-                    pending_key.as_ref(),
-                    pending_occurrence.as_ref(),
-                )?;
-            }
-            if !this
-                .sessions
-                .lock()
-                .is_ok_and(|sessions| sessions.contains_key(&session.session_id))
-            {
-                return Ok(());
-            }
-            if result.is_err()
-                && !this.sealed.load(Ordering::Acquire)
-                && this
-                    .sessions
-                    .lock()
-                    .is_ok_and(|sessions| sessions.contains_key(&session.session_id))
-            {
-                let _ = this.broker.quarantine();
-            }
-            result
+            this.settle_event_result(
+                result,
+                &session.session_id,
+                &session_tenure,
+                pending_key.as_ref(),
+                pending_occurrence.as_ref(),
+            )
         });
         Ok(())
+    }
+
+    /// Normalize one event task's outcome. A clean settlement, or a command the
+    /// browser proved already gone, keeps the scope. Any other failure is a real
+    /// cleanup-integrity loss, so it quarantines before it is reported.
+    fn settle_event_result(
+        &self,
+        result: Result<(), NetworkTaskFailure>,
+        session: &str,
+        tenure: &tokio::sync::watch::Receiver<bool>,
+        pending_key: Option<&(String, String, String)>,
+        pending_occurrence: Option<&Arc<()>>,
+    ) -> Result<(), ProtocolError> {
+        // Captured command errors outrank later asynchronous table removal.
+        // In particular an ErrorAck cannot become normal retirement merely
+        // because detach was applied while this task was awaiting its turn.
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err(NetworkTaskFailure::Operation(error)) => Err(error),
+            Err(NetworkTaskFailure::Command(failure)) => {
+                if failure.request_gone() {
+                    // The browser itself proved the exact paused request or
+                    // interception is gone (a page-created frame detached
+                    // before the decision reached it). No application
+                    // request is left paused, so retire only this callback
+                    // occurrence; the scope keeps its cleanup proof.
+                    match self.finish_callback_occurrence(
+                        session,
+                        tenure,
+                        pending_key,
+                        pending_occurrence,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(error) => {
+                            if !self.sealed.load(Ordering::Acquire) {
+                                let _ = self.broker.quarantine();
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                if let Some(receipt) = failure.into_retirement() {
+                    if self.client.consume_network_retirement(
+                        receipt,
+                        self.scope.generation,
+                        &self.scope.identity_scope,
+                        session,
+                    ) && matches!(
+                        self.finish_callback_occurrence(
+                            session,
+                            tenure,
+                            pending_key,
+                            pending_occurrence
+                        ),
+                        Ok(true)
+                    ) {
+                        // Exact reader destruction, NOT a fabricated ACK.
+                        return Ok(());
+                    }
+                }
+                if !self.sealed.load(Ordering::Acquire) {
+                    let _ = self.broker.quarantine();
+                }
+                return Err(ProtocolError::BrowserFailure);
+            }
+        };
+        if result.is_ok() {
+            self.finish_callback_occurrence(session, tenure, pending_key, pending_occurrence)?;
+        }
+        if !self
+            .sessions
+            .lock()
+            .is_ok_and(|sessions| sessions.contains_key(session))
+        {
+            return Ok(());
+        }
+        if result.is_err()
+            && !self.sealed.load(Ordering::Acquire)
+            && self
+                .sessions
+                .lock()
+                .is_ok_and(|sessions| sessions.contains_key(session))
+        {
+            let _ = self.broker.quarantine();
+        }
+        result
+    }
+
+    /// Wait for one live event-task slot inside the event's own budget. The
+    /// gate only paces decisioning work; it never refuses by itself, so a full
+    /// gate is backpressure rather than a scope-health verdict.
+    async fn acquire_network_task_slot(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, ProtocolError> {
+        let mut cancellation = self.cancellation.subscribe();
+        if *cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        tokio::select! { biased;
+            permit = self.task_slots.acquire() => permit.map_err(|_| ProtocolError::ScopeUnavailable),
+            _ = cancellation.changed() => Err(ProtocolError::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(ProtocolError::DeadlineExceeded),
+        }
+    }
+
+    /// Retain one local refusal: fail exactly the paused callback this event
+    /// owns without publishing it or touching scope health. The refusal is a
+    /// normal retained task so its command settlement is still joined, and an
+    /// unacknowledged refusal stays a real cleanup-integrity failure.
+    fn refuse_callback(
+        self: &Arc<Self>,
+        tasks: &mut tokio::task::JoinSet<Result<(), ProtocolError>>,
+        session: &str,
+        event: &CdpEvent,
+        tenure: tokio::sync::watch::Receiver<bool>,
+        pending_key: Option<(String, String, String)>,
+        pending_occurrence: Option<Arc<()>>,
+    ) {
+        let this = self.clone();
+        let session = session.to_owned();
+        let event = event.clone();
+        tasks.spawn(async move {
+            let refused = this.refuse_paused_request(&session, &event).await;
+            this.settle_event_result(
+                refused,
+                &session,
+                &tenure,
+                pending_key.as_ref(),
+                pending_occurrence.as_ref(),
+            )
+        });
+    }
+
+    /// Send the terminal command for a paused callback that was never published
+    /// to the caller.
+    async fn refuse_paused_request(
+        &self,
+        session: &str,
+        event: &CdpEvent,
+    ) -> Result<(), NetworkTaskFailure> {
+        match event.method.as_str() {
+            "Fetch.requestPaused" => {
+                let request_id = required_string(&event.params, "requestId")?;
+                self.client
+                    .send_network_task_command(
+                        "Fetch.failRequest",
+                        json!({"requestId": request_id, "errorReason": "Aborted"}),
+                        session,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(NetworkTaskFailure::Command)
+            }
+            "Fetch.authRequired" => {
+                let request_id = required_string(&event.params, "requestId")?;
+                self.client
+                    .send_network_task_command(
+                        "Fetch.continueWithAuth",
+                        json!({"requestId": request_id, "authChallengeResponse": {"response": "CancelAuth"}}),
+                        session,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(NetworkTaskFailure::Command)
+            }
+            "Page.javascriptDialogOpening" => self
+                .client
+                .send_network_task_command(
+                    "Page.handleJavaScriptDialog",
+                    json!({"accept": false}),
+                    session,
+                )
+                .await
+                .map(|_| ())
+                .map_err(NetworkTaskFailure::Command),
+            _ => Ok(()),
+        }
     }
 
     pub(crate) async fn settle_borrowed_event(
@@ -3266,7 +3494,9 @@ impl ClientNetwork {
         if self.routes_frozen.load(Ordering::Acquire) {
             return Err(ProtocolError::StaleScope);
         }
-        let lease = self.broker.decision_scoped_with_eval(
+        // A full decision table refuses only this callback's request; the
+        // caller settles it locally and the scope keeps its cleanup proof.
+        let lease = self.broker.try_decision_scoped_with_eval(
             self.scope.generation,
             owner,
             DecisionKind::Request,
@@ -5697,8 +5927,9 @@ mod bridge_tests {
                 scope_state: super::super::client_protocol::ScopeState::Usable,
             })
             .unwrap();
-        assert!(events.try_recv().is_err());
-        drop(exclusive);
+        // Paused-request registration is control-plane work: once publication
+        // completes it publishes the decision even while an exclusive
+        // initialization still holds the UI gate.
         let ServerMessage::Event {
             event,
             decision: Some(decision),
@@ -5711,6 +5942,7 @@ mod bridge_tests {
             panic!("expected post-ACK request")
         };
         assert_eq!(event, "network.request");
+        drop(exclusive);
         network
             .broker
             .resolve(
@@ -6110,9 +6342,9 @@ mod bridge_tests {
                 )
                 .await
                 .unwrap();
-            // A paused request is admitted during a protected read by design
-            // (it carries no UI custody), so only the UI callbacks below still
-            // wait for the exclusive permit and must never rebind afterwards.
+            // A paused request holds no UI admission, so only the UI callbacks
+            // below still wait for the exclusive permit and must never rebind
+            // afterwards.
             for (method, params) in [
                 (
                     "Fetch.authRequired",
@@ -6178,25 +6410,14 @@ mod bridge_tests {
         network
             .replace_routes(1, vec!["attempt-route".into()])
             .unwrap();
-        let (_cancel, operation) = download_operation();
-        let exclusive = network
-            .ui_gate
-            .enter(
-                true,
-                false,
-                operation.deadline,
-                operation.cancellation.clone(),
-            )
-            .await
-            .unwrap();
         network.event(&CdpEvent {
             method: "Fetch.requestPaused".into(),
             session_id: Some("worker".into()),
             params: json!({"requestId":"worker-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
         }).unwrap();
-        tokio::task::yield_now().await;
+        // Retiring the page session does not revoke the worker's captured route
+        // version; the callback is not UI-admitted, so it is already published.
         network.detach_session("owned").unwrap();
-        drop(exclusive);
         let (name, payload, decision) = next_event(&mut events).await;
         assert_eq!(name, "network.request");
         assert_eq!(payload["version"], 1);
@@ -6226,11 +6447,203 @@ mod bridge_tests {
         for index in 0..64 {
             network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("held-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
         }
-        assert_eq!(network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"overflow","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}),Err(ProtocolError::CapacityExceeded));
+        // The next callback waits for a decision slot instead of isolating the
+        // scope; a page whose configuration never commits stays alive.
+        assert!(network
+            .event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"queued","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})})
+            .is_ok());
+        assert!(network.check().is_ok());
         network.close().await.unwrap();
         assert_eq!(network.pending_callbacks().unwrap(), 0);
         assert!(events.try_recv().is_err());
         assert!(commands.try_recv().is_err());
+        server.abort();
+    }
+
+    /// A page-load burst above the old 64-task bound must not isolate the scope:
+    /// the excess callbacks wait for a slot and every request still settles.
+    /// Regression for levicode/e2e#236.
+    #[tokio::test]
+    async fn callback_burst_above_the_task_bound_keeps_the_scope_usable() {
+        use super::super::client_protocol::ScopeState;
+        let (network, mut events, mut commands, server) = fixture().await;
+        let total = 160;
+        for index in 0..total {
+            assert!(
+                network
+                    .event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("burst-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})})
+                    .is_ok(),
+                "callback {index} was refused instead of back-pressured"
+            );
+        }
+        assert!(network.check().is_ok(), "scope must stay usable");
+        assert_eq!(network.broker.health().unwrap().1, ScopeState::Usable);
+        // Every admitted callback still publishes exactly one decision and
+        // continues when the caller answers, exactly once per request.
+        let mut continued = std::collections::BTreeSet::new();
+        for _ in 0..total {
+            let (name, _payload, notice) = next_event(&mut events).await;
+            assert_eq!(name, "network.request");
+            let token = notice.expect("decision notice").token;
+            network
+                .broker
+                .resolve(
+                    1,
+                    &token,
+                    Decision::Continue {
+                        overrides: RequestOverrides::default(),
+                    },
+                )
+                .unwrap();
+            let command = tokio::time::timeout(std::time::Duration::from_secs(2), commands.recv())
+                .await
+                .expect("continue command")
+                .expect("command channel");
+            assert_eq!(command["method"], "Fetch.continueRequest");
+            let request = command["params"]["requestId"]
+                .as_str()
+                .expect("request id")
+                .to_owned();
+            assert!(continued.insert(request), "request continued twice");
+        }
+        let expected: std::collections::BTreeSet<String> =
+            (0..total).map(|index| format!("burst-{index}")).collect();
+        assert_eq!(continued, expected);
+        let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert_eq!(network.pending_callbacks().unwrap(), 0);
+        assert_eq!(network.pending_interceptions.lock().unwrap().len(), 0);
+        assert!(network.check().is_ok(), "scope must remain usable");
+        assert_eq!(network.broker.health().unwrap().1, ScopeState::Usable);
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    /// A scope whose decision table is momentarily full refuses only that
+    /// request: the browser-side pause is failed, its accounting is retired,
+    /// and the scope keeps its cleanup proof.
+    #[tokio::test]
+    async fn exhausted_decision_table_refuses_only_the_request() {
+        use super::super::client_protocol::ScopeState;
+        let (network, mut events, mut commands, server) = fixture().await;
+        let mut held = Vec::new();
+        for _ in 0..256 {
+            held.push(
+                network
+                    .capture_request("owned", DecisionOwner::Scope, 30_000)
+                    .unwrap(),
+            );
+        }
+        assert!(
+            network
+                .capture_request("owned", DecisionOwner::Scope, 30_000)
+                .is_err(),
+            "precondition: the decision table is full"
+        );
+        network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"refused","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
+        let command = tokio::time::timeout(std::time::Duration::from_secs(2), commands.recv())
+            .await
+            .expect("refusal command")
+            .expect("command channel");
+        assert_eq!(command["method"], "Fetch.failRequest");
+        assert_eq!(command["params"]["requestId"], "refused");
+        let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert!(
+            network.check().is_ok(),
+            "refusal must not isolate the scope"
+        );
+        assert_eq!(network.broker.health().unwrap().1, ScopeState::Usable);
+        // Exactly the pre-filled leases remain: the refused callback leaked no
+        // token of its own.
+        assert_eq!(network.pending_callbacks().unwrap(), 256);
+        assert_eq!(network.pending_interceptions.lock().unwrap().len(), 0);
+        assert!(events.try_recv().is_err());
+        drop(held);
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    /// A protected read that holds the exclusive UI gate must not stall the
+    /// page's intercepted requests: registration and release are control-plane
+    /// work, so every callback still publishes and continues while the read
+    /// keeps exclusivity. Regression for levicode/e2e#236.
+    #[tokio::test]
+    async fn callbacks_register_and_continue_while_a_read_holds_ui_exclusivity() {
+        use super::super::client_protocol::ScopeState;
+        let (network, mut events, mut commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        let exclusive = network
+            .ui_gate
+            .enter(
+                true,
+                false,
+                operation.deadline,
+                operation.cancellation.clone(),
+            )
+            .await
+            .unwrap();
+        let total = 96;
+        let mut continued = std::collections::BTreeSet::new();
+        let mut max_tasks = 0;
+        for index in 0..total {
+            assert!(
+                network
+                    .event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("gated-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})})
+                    .is_ok(),
+                "callback {index} was refused while a read held the UI gate"
+            );
+            max_tasks = max_tasks.max(network.tasks.lock().unwrap().len());
+            // Drain in batches so the owner's bounded event channel (64) never
+            // overflows while the exclusive gate stays held.
+            if index % 16 == 15 {
+                for _ in 0..16 {
+                    let (name, _payload, notice) = next_event(&mut events).await;
+                    assert_eq!(name, "network.request");
+                    network
+                        .broker
+                        .resolve(
+                            1,
+                            &notice.expect("decision notice").token,
+                            Decision::Continue {
+                                overrides: RequestOverrides::default(),
+                            },
+                        )
+                        .unwrap();
+                    let command =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), commands.recv())
+                            .await
+                            .expect("continue command")
+                            .expect("command channel");
+                    assert_eq!(command["method"], "Fetch.continueRequest");
+                    let request = command["params"]["requestId"]
+                        .as_str()
+                        .expect("request id")
+                        .to_owned();
+                    assert!(continued.insert(request), "request continued twice");
+                }
+            }
+        }
+        // The retained task set stays at the old bound and never spills into an
+        // isolation: the page load and the read overlap instead of queueing.
+        assert!(max_tasks <= NETWORK_TASK_CONCURRENCY, "{max_tasks} tasks");
+        let expected: std::collections::BTreeSet<String> =
+            (0..total).map(|index| format!("gated-{index}")).collect();
+        assert_eq!(continued, expected);
+        assert_eq!(network.broker.health().unwrap().1, ScopeState::Usable);
+        assert!(network.check().is_ok());
+        drop(exclusive);
+        let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert_eq!(network.pending_callbacks().unwrap(), 0);
+        assert!(network.check().is_ok(), "scope must remain usable");
+        network.close().await.unwrap();
         server.abort();
     }
     async fn next_event(
