@@ -2815,7 +2815,7 @@ impl ClientEnrollment {
             .application_epoch
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
-        if !capture_auxiliary_kind(&entry.kind) {
+        if !page_capture_auxiliary_kind(&entry.kind) {
             index.document_epoch = index
                 .document_epoch
                 .checked_add(1)
@@ -5304,7 +5304,7 @@ impl ClientEnrollment {
                 .application_epoch
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
-            if !capture_auxiliary_kind(&promoted_kind) {
+            if !page_capture_auxiliary_kind(&promoted_kind) {
                 index.document_epoch = index
                     .document_epoch
                     .checked_add(1)
@@ -6621,7 +6621,12 @@ impl ClientEnrollment {
                             }
                             drop(event); result
                         });
-                    } else if let Err(error) = self.event_internal(&event, Some(event.budget_lease()), Some(sequence)) { break Err(error); }
+                    } else if let Err(error) = self.event_internal(&event, Some(event.budget_lease()), Some(sequence)) {
+                        // An auxiliary target session carries no page document and
+                        // no page cleanup proof obligation. Its own event failure is
+                        // local to that target and must not poison the page scope.
+                        if !self.is_auxiliary_event_session(&event) { break Err(error); }
+                    }
                     if let Err(error)=self.mark_event_applied(sequence) { break Err(error); }
                     self.changed.notify_waiters();
                 }
@@ -7870,7 +7875,7 @@ impl ClientEnrollment {
             .application_epoch
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
-        if !capture_auxiliary_kind(&entry.kind) {
+        if !page_capture_auxiliary_kind(&entry.kind) {
             index.document_epoch = index
                 .document_epoch
                 .checked_add(1)
@@ -8152,6 +8157,22 @@ impl ClientEnrollment {
     fn event(&self, event: &CdpEvent) -> Result<(), ProtocolError> {
         self.event_internal(event, None, None)
     }
+    fn is_auxiliary_event_session(&self, event: &CdpEvent) -> bool {
+        let Some(session) = event.session_id.as_deref() else {
+            return false;
+        };
+        self.index
+            .lock()
+            .ok()
+            .and_then(|index| {
+                index
+                    .sessions
+                    .get(session)
+                    .map(|entry| page_capture_auxiliary_kind(&entry.kind))
+            })
+            .unwrap_or(false)
+    }
+
     fn event_internal(
         &self,
         event: &CdpEvent,
@@ -8304,7 +8325,7 @@ impl ClientEnrollment {
                     self.revoke_eval_authority();
                     let document_moved = removed.iter().any(|entry| {
                         (entry.application || entry.observation_only)
-                            && !capture_auxiliary_kind(&entry.kind)
+                            && !page_capture_auxiliary_kind(&entry.kind)
                     });
                     index.application_epoch = index
                         .application_epoch
@@ -8700,6 +8721,11 @@ fn validate_capture_target_info(
 /// retirement must not invalidate an otherwise stable page capture.
 pub(crate) fn capture_auxiliary_kind(kind: &str) -> bool {
     matches!(kind, "browser" | "tab" | "browser_ui")
+}
+/// Auxiliary targets whose movement must not invalidate a page capture or
+/// poison the page scope. Their own startup/publication proofs stay their own.
+pub(crate) fn page_capture_auxiliary_kind(kind: &str) -> bool {
+    capture_auxiliary_kind(kind) || matches!(kind, "service_worker" | "worker" | "shared_worker")
 }
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()
@@ -9271,6 +9297,99 @@ async fn bounded<T>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auxiliary_page_level_kinds_are_central() {
+        for kind in ["browser", "tab", "browser_ui"] {
+            assert!(super::capture_auxiliary_kind(kind), "{kind}");
+        }
+        for kind in ["page", "iframe"] {
+            assert!(!super::capture_auxiliary_kind(kind), "{kind}");
+        }
+        for kind in ["service_worker", "worker", "shared_worker"] {
+            assert!(!super::capture_auxiliary_kind(kind), "{kind}");
+            assert!(super::page_capture_auxiliary_kind(kind), "{kind}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auxiliary_session_event_errors_are_local() {
+        let (owner, _notices, _log, _emit, server, _broker, connection) =
+            fixture_with_client("aux-event-local", true).await;
+        let entry = |kind: &str| super::Attribution {
+            target: format!("{kind}-target"),
+            session: format!("{kind}-session"),
+            parent: None,
+            root: format!("{kind}-session"),
+            kind: kind.to_owned(),
+            application: true,
+            observation_only: false,
+            observer_paused: Some(false),
+            init_paused_by_attachment: false,
+            resumed: true,
+        };
+        {
+            let mut index = owner.index.lock().unwrap();
+            index.sessions.insert("page-session".into(), entry("page"));
+            index
+                .sessions
+                .insert("sw-session".into(), entry("service_worker"));
+            index
+                .sessions
+                .insert("ui-session".into(), entry("browser_ui"));
+        }
+        let event = |session: Option<&str>| CdpEvent {
+            method: "Runtime.consoleAPICalled".into(),
+            params: serde_json::json!({}),
+            session_id: session.map(str::to_owned),
+        };
+        assert!(owner.is_auxiliary_event_session(&event(Some("sw-session"))));
+        assert!(owner.is_auxiliary_event_session(&event(Some("ui-session"))));
+        assert!(!owner.is_auxiliary_event_session(&event(Some("page-session"))));
+        assert!(!owner.is_auxiliary_event_session(&event(None)));
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn auxiliary_worker_and_ui_targets_never_move_the_document_epoch() {
+        let (owner, _notices, _log, _emit, server, _broker, connection) =
+            fixture_with_client("aux-document-epoch", true).await;
+        let entry = |kind: &str| super::Attribution {
+            target: format!("{kind}-target"),
+            session: format!("{kind}-session"),
+            parent: None,
+            root: format!("{kind}-session"),
+            kind: kind.to_owned(),
+            application: true,
+            observation_only: false,
+            observer_paused: Some(false),
+            init_paused_by_attachment: false,
+            resumed: true,
+        };
+        let before = owner.index.lock().unwrap().document_epoch;
+        owner.bump_application_epoch(&entry("page")).unwrap();
+        let page_epoch = owner.index.lock().unwrap().document_epoch;
+        assert_eq!(
+            page_epoch,
+            before + 1,
+            "an application page moves the epoch"
+        );
+        for kind in ["browser_ui", "service_worker", "worker", "shared_worker"] {
+            owner.bump_application_epoch(&entry(kind)).unwrap();
+            assert_eq!(
+                owner.index.lock().unwrap().document_epoch,
+                page_epoch,
+                "auxiliary {kind} must not move the page document epoch"
+            );
+        }
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn typed_admission_invalid_ownership_cannot_borrow_owner_stop() {
         let (mut owner, _notices, _log, _emit, server, _broker, connection) =
