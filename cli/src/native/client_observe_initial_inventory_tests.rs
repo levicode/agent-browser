@@ -582,7 +582,14 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         // that stop, not a lost cleanup proof; the read dispatched nothing.
         assert_eq!(
             original_error,
-            if race == Race::CancelDuringOwner {
+            if matches!(
+                race,
+                Race::CancelDuringOwner
+                    | Race::Cancel
+                    | Race::CancelFinal
+                    | Race::OopifCancel
+                    | Race::HiddenOopifCancel
+            ) {
                 ProtocolError::Cancelled
             } else {
                 ProtocolError::StaleScope
@@ -590,7 +597,14 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         );
         assert_eq!(same_owner, Some(race != Race::Replacement));
         assert!(!snapshot.integrity_lost);
-        if race == Race::CancelDuringOwner {
+        if matches!(
+            race,
+            Race::CancelDuringOwner
+                | Race::Cancel
+                | Race::CancelFinal
+                | Race::OopifCancel
+                | Race::HiddenOopifCancel
+        ) {
             assert!(
                 targets.inventory().is_ok(),
                 "a caller-stopped initial owner read must not seal the page inventory"
@@ -612,8 +626,11 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
     }
     let expected_samples = if matches!(race, Race::Continuous | Race::AttachOtherContinuous) {
         2
-    } else if race == Race::CancelDuringOwner {
-        // The stop lands during the first frame-owner read, before the sample's
+    } else if matches!(
+        race,
+        Race::CancelDuringOwner | Race::OopifCancel | Race::HiddenOopifCancel
+    ) {
+        // The stop lands during the first sample's frame inventory, before its
         // final frame fence.
         0
     } else {
@@ -826,6 +843,26 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
 #[tokio::test]
 async fn observe_receipt_caller_stop_during_owner_read_keeps_the_scope_usable() {
     retained_observe_receipt_control(Race::CancelDuringOwner, false).await;
+}
+
+#[tokio::test]
+async fn observe_receipt_hidden_oopif_owner_cancel_keeps_the_scope_usable() {
+    retained_observe_receipt_control(Race::HiddenOopifCancel, false).await;
+}
+
+#[tokio::test]
+async fn observe_receipt_oopif_child_session_cancel_keeps_the_scope_usable() {
+    retained_observe_receipt_control(Race::OopifCancel, false).await;
+}
+
+#[tokio::test]
+async fn observe_receipt_broker_cancel_at_final_frame_keeps_the_scope_usable() {
+    retained_observe_receipt_control(Race::CancelFinal, false).await;
+}
+
+#[tokio::test]
+async fn observe_receipt_broker_cancel_at_initial_frame_keeps_the_scope_usable() {
+    retained_observe_receipt_control(Race::Cancel, false).await;
 }
 
 #[tokio::test]
