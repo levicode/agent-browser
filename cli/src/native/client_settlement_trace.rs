@@ -96,6 +96,8 @@ pub(crate) enum SettlementPhase {
     FrameAdmissionRefused,
     FrameSummary,
     DetailLimit,
+    /// One scope-isolation decision: which layer sealed, poisoned or quarantined a scope and why.
+    ScopeIsolation,
 }
 
 pub(crate) use SettlementPhase as Phase;
@@ -357,6 +359,16 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_state: Option<ScopeState>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_layer: Option<IsolationLayer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_file: Option<IsolationFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_reason: Option<IsolationReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kinds: Option<[u16; 12]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted: Option<bool>,
@@ -405,6 +417,7 @@ impl Facts {
             &mut self.root_attachment_ordinal,
             &mut self.cleanup_owner,
             &mut self.cleanup_attempt,
+            &mut self.isolation_line,
             &mut self.length,
             &mut self.total,
             &mut self.calls,
@@ -926,6 +939,148 @@ diagnostic_enum!(DiagnosticTargetStage {
     RestartRetiring,
     PurposeAssigned
 });
+// Which native layer isolated the scope. Every layer is emitted from the one
+// function that performs the transition, so no call site can stay silent.
+diagnostic_enum!(IsolationLayer {
+    TargetSeal,
+    EnrollmentPoison,
+    RetentionProducer,
+    SessionQuarantine,
+    SessionCancel
+});
+// Closed caller vocabulary. The line comes from `Location::caller()`, so a
+// trace can be resolved against the exact native commit it was produced on.
+diagnostic_enum!(IsolationFile {
+    Other,
+    ClientActions,
+    ClientBrowser,
+    ClientCapture,
+    ClientDebt,
+    ClientEnrollment,
+    ClientEnrollmentPageQuery,
+    ClientInteropWire,
+    ClientNetwork,
+    ClientObservationDispatch,
+    ClientOperationState,
+    ClientProtectedRead,
+    ClientRestart,
+    ClientSession,
+    ClientSettlementTrace,
+    ClientState,
+    ClientStateDispatch,
+    ClientTasks,
+    ClientTargets,
+    ClientTransport,
+    CdpClient
+});
+// Why the isolation happened. Target seals keep their immutable first-loss
+// reason; the session and enrollment layers have their own causes.
+diagnostic_enum!(IsolationReason {
+    Explicit,
+    Failure,
+    CleanupFailure,
+    UncertainOutcome,
+    Capacity,
+    Terminal,
+    OwnerRetirement,
+    AdmissionClosed,
+    Abandoned,
+    ResumeIdentityMismatch,
+    ResumePermitDropped,
+    AuxiliaryCapacity,
+    QueryRevisionExhausted,
+    UnknownQueryRevisionExhausted,
+    InvalidRetirementAuthority,
+    AuxiliaryAckMismatch,
+    AuxiliaryAbandoned,
+    CreationAbandoned,
+    RetainedDeadlineSeal,
+    RetainedSettlementSeal,
+    RetainedCompletionSeal
+});
+
+impl IsolationFile {
+    pub(crate) fn from_path(path: &str) -> Self {
+        match path.rsplit('/').next().unwrap_or(path) {
+            "client_actions.rs" => Self::ClientActions,
+            "client_browser.rs" => Self::ClientBrowser,
+            "client_capture.rs" => Self::ClientCapture,
+            "client_debt.rs" => Self::ClientDebt,
+            "client_enrollment.rs" => Self::ClientEnrollment,
+            "client_enrollment_page_query.rs" => Self::ClientEnrollmentPageQuery,
+            "client_interop_wire.rs" => Self::ClientInteropWire,
+            "client_network.rs" => Self::ClientNetwork,
+            "client_observation_dispatch.rs" => Self::ClientObservationDispatch,
+            "client_operation_state.rs" => Self::ClientOperationState,
+            "client_protected_read.rs" => Self::ClientProtectedRead,
+            "client_restart.rs" => Self::ClientRestart,
+            "client_session.rs" => Self::ClientSession,
+            "client_settlement_trace.rs" => Self::ClientSettlementTrace,
+            "client_state.rs" => Self::ClientState,
+            "client_state_dispatch.rs" => Self::ClientStateDispatch,
+            "client_tasks.rs" => Self::ClientTasks,
+            "client_targets.rs" => Self::ClientTargets,
+            "client_transport.rs" => Self::ClientTransport,
+            "client.rs" => Self::CdpClient,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl IsolationReason {
+    pub(crate) fn from_loss(reason: InventoryFirstLoss) -> Self {
+        match reason {
+            InventoryFirstLoss::ResumeIdentityMismatch => Self::ResumeIdentityMismatch,
+            InventoryFirstLoss::ResumePermitDropped => Self::ResumePermitDropped,
+            InventoryFirstLoss::AuxiliaryCapacity => Self::AuxiliaryCapacity,
+            InventoryFirstLoss::QueryRevisionExhausted => Self::QueryRevisionExhausted,
+            InventoryFirstLoss::UnknownQueryRevisionExhausted => {
+                Self::UnknownQueryRevisionExhausted
+            }
+            InventoryFirstLoss::ExplicitSeal => Self::Explicit,
+            InventoryFirstLoss::InvalidRetirementAuthority => Self::InvalidRetirementAuthority,
+            InventoryFirstLoss::AuxiliaryAckMismatch => Self::AuxiliaryAckMismatch,
+            InventoryFirstLoss::AuxiliaryAbandoned => Self::AuxiliaryAbandoned,
+            InventoryFirstLoss::CreationAbandoned => Self::CreationAbandoned,
+            InventoryFirstLoss::RetainedDeadlineSeal => Self::RetainedDeadlineSeal,
+            InventoryFirstLoss::RetainedSettlementSeal => Self::RetainedSettlementSeal,
+            InventoryFirstLoss::RetainedCompletionSeal => Self::RetainedCompletionSeal,
+        }
+    }
+}
+/// One isolation observation. `target_kinds` is the bounded kind census of the
+/// sealed registry, so a scope-wide seal still records what it covered.
+pub(crate) struct IsolationObservation {
+    pub layer: IsolationLayer,
+    pub caller: &'static std::panic::Location<'static>,
+    pub reason: IsolationReason,
+    pub operation_seq: u64,
+    pub target_kinds: Option<[u16; 12]>,
+    pub error: Option<ProtocolError>,
+    pub scope_state: Option<ScopeState>,
+}
+pub(crate) fn scope_isolation(observation: IsolationObservation) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        scope_isolation_into(capture, observation);
+    }
+}
+fn scope_isolation_into(capture: &Capture, observation: IsolationObservation) {
+    record_capture(
+        capture,
+        observation.operation_seq,
+        Phase::ScopeIsolation,
+        Facts {
+            isolation_layer: Some(observation.layer),
+            isolation_file: Some(IsolationFile::from_path(observation.caller.file())),
+            isolation_line: Some(observation.caller.line() as u64),
+            isolation_reason: Some(observation.reason),
+            target_kinds: observation.target_kinds,
+            error: observation.error,
+            scope_state: observation.scope_state,
+            ..Facts::default()
+        },
+    );
+}
 
 impl DiagnosticTargetKind {
     pub(crate) fn from_native(kind: &str) -> Self {
@@ -4009,6 +4164,105 @@ mod tests {
 #[cfg(test)]
 #[path = "client_cleanup_diagnostic_tests.rs"]
 mod cleanup_tests;
+
+// Every isolation layer must name its own caller in a closed record. One test
+// writes through a local capture (shape); the other exercises the production
+// entry points through the process-wide sink a daemon would enable.
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+    use crate::native::client_session::ClientSession;
+    use crate::native::client_targets::ClientTargets;
+
+    fn rows(file: &tempfile::NamedTempFile) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+    fn kinds() -> serde_json::Value {
+        serde_json::Value::Array((0..12).map(|_| serde_json::json!(0)).collect())
+    }
+
+    #[test]
+    fn each_isolation_layer_names_its_call_point_in_a_closed_record() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let cases = [
+            (IsolationLayer::TargetSeal, IsolationReason::Explicit),
+            (
+                IsolationLayer::EnrollmentPoison,
+                IsolationReason::CleanupFailure,
+            ),
+            (
+                IsolationLayer::SessionQuarantine,
+                IsolationReason::UncertainOutcome,
+            ),
+        ];
+        for (layer, reason) in cases {
+            scope_isolation_into(
+                &capture,
+                IsolationObservation {
+                    layer,
+                    caller: std::panic::Location::caller(),
+                    reason,
+                    operation_seq: 44,
+                    target_kinds: Some([0; 12]),
+                    error: Some(ProtocolError::CleanupFailed),
+                    scope_state: Some(ScopeState::Quarantined),
+                },
+            );
+        }
+        let records = rows(&file);
+        assert_eq!(records.len(), cases.len());
+        for (record, (layer, reason)) in records.iter().zip(cases) {
+            assert_eq!(record["phase"], "ScopeIsolation");
+            assert_eq!(record["operationSeq"], 44);
+            assert_eq!(record["isolationFile"], "client-settlement-trace");
+            assert!(record["isolationLine"].as_u64().unwrap() > 0);
+            assert_eq!(record["isolationLayer"], serde_json::json!(layer));
+            assert_eq!(record["isolationReason"], serde_json::json!(reason));
+            assert_eq!(record["targetKinds"], kinds());
+            assert_eq!(record["error"], "cleanup-failed");
+            assert_eq!(record["scopeState"], "quarantined");
+        }
+    }
+
+    #[test]
+    fn target_seal_and_broker_quarantine_emit_through_the_shared_sink() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let Some(capture) = cleanup_capture(Some(file.path())) else {
+            return;
+        };
+        if CLEANUP_SINK.set(Some(capture)).is_err() {
+            return;
+        }
+        ClientTargets::new("context".into(), "scope".into()).seal();
+        ClientSession::new().quarantine().unwrap();
+        let records = rows(&file);
+        // The caller is this test, which is exactly what `#[track_caller]` must
+        // report: the transition function must not claim its own line. The
+        // sink is process-wide, so select this test's own call sites.
+        let seal = records
+            .iter()
+            .find(|record| {
+                record["isolationLayer"] == "target-seal"
+                    && record["isolationReason"] == "explicit"
+                    && record["isolationFile"] == "client-settlement-trace"
+            })
+            .expect("target seal wrote no isolation record");
+        assert_eq!(seal["targetKinds"], kinds());
+        let quarantine = records
+            .iter()
+            .find(|record| {
+                record["isolationLayer"] == "session-quarantine"
+                    && record["isolationFile"] == "client-settlement-trace"
+            })
+            .expect("broker quarantine wrote no isolation record");
+        assert_eq!(quarantine["scopeState"], "quarantined");
+    }
+}
 
 // Terminal cleanup diagnostics are also present in the production ELF.
 #[cfg(test)]

@@ -342,12 +342,15 @@ impl OperationRegistry {
         self.changed.notify_waiters();
         Some(deadline)
     }
+    #[track_caller]
     pub(crate) fn finish(&self, key: OperationKey, integrity_lost: bool) -> bool {
         self.finish_with_cause(key, integrity_lost, false)
     }
+    #[track_caller]
     pub(crate) fn finish_remote_eof(&self, key: OperationKey) -> bool {
         self.finish_with_cause(key, true, true)
     }
+    #[track_caller]
     fn finish_with_cause(&self, key: OperationKey, integrity_lost: bool, remote_eof: bool) -> bool {
         let Ok(mut entries) = self.entries.lock() else {
             return true;
@@ -397,13 +400,34 @@ impl OperationRegistry {
                     .record_cleanup_disposition(CleanupDisposition::IntegrityLost);
             }
             entry.state = ProducerState::IntegrityLost;
-            entry.integrity_reason.get_or_insert(if expired {
+            let reason = entry.integrity_reason.get_or_insert(if expired {
                 RetentionIntegrityReason::RetirementDeadline
             } else if remote_only {
                 RetentionIntegrityReason::RemoteConnectionLost
             } else {
                 RetentionIntegrityReason::LocalProducerFailed
             });
+            // The producer that lost retention proof is the isolation origin.
+            // Emitted here, at the fixed reason, so no producer can fail silently.
+            super::client_settlement_trace::scope_isolation(
+                super::client_settlement_trace::IsolationObservation {
+                    layer: super::client_settlement_trace::IsolationLayer::RetentionProducer,
+                    caller: std::panic::Location::caller(),
+                    reason: match reason {
+                        RetentionIntegrityReason::RetirementDeadline => {
+                            super::client_settlement_trace::IsolationReason::Terminal
+                        }
+                        RetentionIntegrityReason::OwnerAccountingLost => {
+                            super::client_settlement_trace::IsolationReason::Abandoned
+                        }
+                        _ => super::client_settlement_trace::IsolationReason::Failure,
+                    },
+                    operation_seq: key.operation_seq,
+                    target_kinds: None,
+                    error: None,
+                    scope_state: None,
+                },
+            );
             entry.disposition = None;
         } else {
             let snapshot = entry.journal.snapshot();

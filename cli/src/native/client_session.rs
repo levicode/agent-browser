@@ -1002,6 +1002,7 @@ impl ClientSession {
     }
 
     /// Control acknowledgement only. The action must still produce settlement.
+    #[track_caller]
     pub fn cancel(&self, generation: u64, sequence: u64) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
         Self::check_control(&inner, generation, sequence)?;
@@ -1009,6 +1010,19 @@ impl ClientSession {
             return Err(ProtocolError::OperationMissing);
         }
         Self::cancel_tree(&mut inner, sequence);
+        // A cancellation is the other cause of an in-flight read ending as
+        // `cancelled`; record it beside the scope's own isolation decisions.
+        super::client_settlement_trace::scope_isolation(
+            super::client_settlement_trace::IsolationObservation {
+                layer: super::client_settlement_trace::IsolationLayer::SessionCancel,
+                caller: std::panic::Location::caller(),
+                reason: super::client_settlement_trace::IsolationReason::Explicit,
+                operation_seq: sequence,
+                target_kinds: None,
+                error: None,
+                scope_state: None,
+            },
+        );
         Ok(())
     }
 
@@ -1126,6 +1140,7 @@ impl ClientSession {
             }
         }
     }
+    #[track_caller]
     pub(crate) fn settle_with_retention(
         &self,
         generation: u64,
@@ -1136,6 +1151,7 @@ impl ClientSession {
         self.settle_with_observation_proof(generation, sequence, effects, proof)
             .map(|(state, _)| state)
     }
+    #[track_caller]
     pub(crate) fn settle_with_observation_proof(
         &self,
         generation: u64,
@@ -1150,6 +1166,7 @@ impl ClientSession {
     /// are intact; the operation's evidence moved, so a fresh read reconciles
     /// the page. Genuine lost cleanup reaches the transport as a quarantined
     /// broker already, and unclassified Unknown outcomes still seal here.
+    #[track_caller]
     pub(crate) fn settle_stale_scope_refusal(
         &self,
         generation: u64,
@@ -1159,6 +1176,7 @@ impl ClientSession {
     ) -> Result<(ScopeState, Option<ObservationSettlement>), ProtocolError> {
         self.settle_with_observation_proof_classified(generation, sequence, effects, proof, true)
     }
+    #[track_caller]
     fn settle_with_observation_proof_classified(
         &self,
         generation: u64,
@@ -1213,6 +1231,17 @@ impl ClientSession {
         if effects == Effects::Unknown {
             if !retained && !stale_scope_keeps_usable && inner.health != ScopeState::Closed {
                 Self::seal(&mut inner, ScopeState::Quarantined);
+                super::client_settlement_trace::scope_isolation(
+                    super::client_settlement_trace::IsolationObservation {
+                        layer: super::client_settlement_trace::IsolationLayer::SessionQuarantine,
+                        caller: std::panic::Location::caller(),
+                        reason: super::client_settlement_trace::IsolationReason::UncertainOutcome,
+                        operation_seq: sequence,
+                        target_kinds: None,
+                        error: None,
+                        scope_state: Some(ScopeState::Quarantined),
+                    },
+                );
             }
             // Never apply the old selected decision after an uncertain child.
         } else if let Some(token) = operation.callback_token {
@@ -1707,6 +1736,7 @@ impl ClientSession {
         )
     }
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub(crate) fn decision_scoped_with_eval(
         &self,
         generation: u64,
@@ -1730,6 +1760,17 @@ impl ClientSession {
         }
         if inner.decisions.len() >= MAX_DECISIONS {
             Self::seal(&mut inner, ScopeState::Quarantined);
+            super::client_settlement_trace::scope_isolation(
+                super::client_settlement_trace::IsolationObservation {
+                    layer: super::client_settlement_trace::IsolationLayer::SessionQuarantine,
+                    caller: std::panic::Location::caller(),
+                    reason: super::client_settlement_trace::IsolationReason::Capacity,
+                    operation_seq: super::client_debt::current_operation_sequence(),
+                    target_kinds: None,
+                    error: Some(ProtocolError::CapacityExceeded),
+                    scope_state: Some(ScopeState::Quarantined),
+                },
+            );
             return Err(ProtocolError::CapacityExceeded);
         }
         // Interop is internal operation coordination, never background callback
@@ -2204,11 +2245,35 @@ impl ClientSession {
         }
     }
 
-    /// EOF / writer overflow: never claims browser teardown has already finished.
-    pub fn quarantine(&self) -> Result<(), ProtocolError> {
+    /// Claim terminal broker authority for an explicit close or shutdown. A
+    /// close is an intentional end, not an isolation decision, so it records no
+    /// `ScopeIsolation`; the closed receipt and shutdown checkpoint carry it.
+    pub(crate) fn quarantine_terminal(&self) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
         if inner.health != ScopeState::Closed {
             Self::seal(&mut inner, ScopeState::Quarantined);
+        }
+        Ok(())
+    }
+
+    /// EOF / writer overflow: never claims browser teardown has already finished.
+    #[track_caller]
+    pub fn quarantine(&self) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        let caller = std::panic::Location::caller();
+        if inner.health != ScopeState::Closed {
+            Self::seal(&mut inner, ScopeState::Quarantined);
+            super::client_settlement_trace::scope_isolation(
+                super::client_settlement_trace::IsolationObservation {
+                    layer: super::client_settlement_trace::IsolationLayer::SessionQuarantine,
+                    caller,
+                    reason: super::client_settlement_trace::IsolationReason::Explicit,
+                    operation_seq: super::client_debt::current_operation_sequence(),
+                    target_kinds: None,
+                    error: None,
+                    scope_state: Some(ScopeState::Quarantined),
+                },
+            );
         }
         Ok(())
     }

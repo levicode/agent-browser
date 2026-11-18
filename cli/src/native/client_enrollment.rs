@@ -1789,14 +1789,32 @@ impl ClientEnrollment {
         }
         Ok(())
     }
+    #[track_caller]
     fn poison(&self, error: ProtocolError) {
         if let Ok(mut index) = self.index.lock() {
             self.revoke_eval_authority();
-            index.failure.get_or_insert(error);
+            index.failure.get_or_insert(error.clone());
             for entry in index.sessions.values() {
                 let _ = self.page.network_incomplete(&entry.root);
             }
         }
+        // Recorded before the target seal it causes, so a trace names both the
+        // enrollment failure and the registry state it covered.
+        super::client_settlement_trace::scope_isolation(
+            super::client_settlement_trace::IsolationObservation {
+                layer: super::client_settlement_trace::IsolationLayer::EnrollmentPoison,
+                caller: std::panic::Location::caller(),
+                reason: if error == ProtocolError::CleanupFailed {
+                    super::client_settlement_trace::IsolationReason::CleanupFailure
+                } else {
+                    super::client_settlement_trace::IsolationReason::Failure
+                },
+                operation_seq: super::client_debt::current_operation_sequence(),
+                target_kinds: None,
+                error: Some(error),
+                scope_state: None,
+            },
+        );
         self.targets.seal();
         self.sealed.store(true, Ordering::Release);
         self.stop.send_replace(CancelSignal::SessionClosed);
