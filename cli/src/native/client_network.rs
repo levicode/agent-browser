@@ -6110,11 +6110,10 @@ mod bridge_tests {
                 )
                 .await
                 .unwrap();
+            // A paused request is admitted during a protected read by design
+            // (it carries no UI custody), so only the UI callbacks below still
+            // wait for the exclusive permit and must never rebind afterwards.
             for (method, params) in [
-                (
-                    "Fetch.requestPaused",
-                    json!({"requestId":"old-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
-                ),
                 (
                     "Fetch.authRequired",
                     json!({"requestId":"old-auth","request":{"url":"https://synthetic.test/"},"authChallenge":{"source":"Server","origin":"https://synthetic.test","scheme":"basic","realm":"synthetic"}}),
