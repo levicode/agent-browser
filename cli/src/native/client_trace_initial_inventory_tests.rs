@@ -22,6 +22,10 @@ enum Race {
     AttachOtherHeldRelease,
     Cancel,
     CancelDuringOwner,
+    CancelFinal,
+    OopifCancel,
+    HiddenOopifCancel,
+    OopifBrowserReply,
     Sealed,
     Reservation,
     Replacement,
@@ -117,6 +121,11 @@ impl Fixture {
                             | Race::AttachOtherTwice
                             | Race::AttachOtherHeldRelease
                             | Race::CancelDuringOwner
+                            | Race::Cancel
+                            | Race::CancelFinal
+                            | Race::OopifCancel
+                            | Race::HiddenOopifCancel
+                            | Race::OopifBrowserReply
                     )
             );
         }
@@ -131,6 +140,30 @@ impl Fixture {
             targets.enable_inventory_diagnostics_for_test();
         }
         ready(&targets).await;
+        if matches!(
+            race,
+            Race::OopifCancel | Race::HiddenOopifCancel | Race::OopifBrowserReply
+        ) {
+            let root = targets.owned_target("target").unwrap();
+            targets
+                .attached_enrolled_with_ancestry(
+                    "context",
+                    "child".into(),
+                    "child-session".into(),
+                    "iframe".into(),
+                    Some(&root),
+                    false,
+                )
+                .unwrap();
+            targets.configured("child").unwrap();
+            targets
+                .resume_permit("child")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap();
+        }
         let attached_others = Arc::new(Mutex::new(Vec::new()));
         let peer_attached_others = attached_others.clone();
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -170,6 +203,9 @@ impl Fixture {
                     | Race::ReleaseError
                     | Race::ReleaseWrongSession
                     | Race::CancelDuringOwner
+                    | Race::OopifCancel
+                    | Race::HiddenOopifCancel
+                    | Race::OopifBrowserReply
             );
             loop {
                 let text = tokio::select! {
@@ -186,6 +222,58 @@ impl Fixture {
                 let request: Value = serde_json::from_str(&text).unwrap();
                 peer_log.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap();
+                if request["sessionId"].as_str() == Some("child-session") {
+                    match method {
+                        "Page.getFrameTree" => {
+                            if race == Race::OopifCancel {
+                                if let Some(broker) = &peer_broker {
+                                    broker.cancel(1, 1).unwrap();
+                                } else {
+                                    peer_cancel.send_replace(CancelSignal::Requested);
+                                }
+                            }
+                            if race == Race::OopifBrowserReply {
+                                // The browser no longer knows this session, so
+                                // its answer arrives at the browser level with
+                                // no session id at all.
+                                let reply = json!({"id":request["id"],"result":{"frameTree":{"frame":{"id":"child","parentId":"frame","loaderId":"old-loader","url":"https://fixture.invalid/old"}}}});
+                                if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // The child renderer reports the same sampler loader
+                            // and URL the parent tree lists for this frame, so the
+                            // owned tree joins the parent sample instead of
+                            // reading as a stale renderer.
+                            let completed = peer_samples.load(Ordering::SeqCst);
+                            let loader =
+                                if completed == 0 || race == Race::Protected || attach_other {
+                                    "old-loader"
+                                } else {
+                                    "fresh-loader"
+                                };
+                            let url = if completed == 0 || race == Race::Protected || attach_other {
+                                "https://fixture.invalid/old"
+                            } else {
+                                "https://fixture.invalid/fresh"
+                            };
+                            let reply = json!({"id":request["id"],"sessionId":"child-session","result":{"frameTree":{"frame":{"id":"child","parentId":"frame","loaderId":loader,"url":url}}}});
+                            if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        "Page.createIsolatedWorld" => {
+                            let reply = json!({"id":request["id"],"sessionId":"child-session","result":{"executionContextId":1}});
+                            if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let mut failed = false;
                 let mut delay_final_ack = false;
                 let mut flush_final_ack = false;
@@ -220,6 +308,13 @@ impl Fixture {
                         if last {
                             trees = 0;
                             peer_samples.fetch_add(1, Ordering::SeqCst);
+                            if race == Race::CancelFinal {
+                                if let Some(broker) = &peer_broker {
+                                    broker.cancel(1, 1).unwrap();
+                                } else {
+                                    peer_cancel.send_replace(CancelSignal::Requested);
+                                }
+                            }
                             let invalidate = match race {
                                 Race::Continuous | Race::AttachOtherContinuous => true,
                                 Race::AttachOtherTwice => completed < 2,
@@ -275,7 +370,11 @@ impl Fixture {
                             if completed == 0 {
                                 match race {
                                     Race::Cancel => {
-                                        peer_cancel.send_replace(CancelSignal::Requested);
+                                        if let Some(broker) = &peer_broker {
+                                            broker.cancel(1, 1).unwrap();
+                                        } else {
+                                            peer_cancel.send_replace(CancelSignal::Requested);
+                                        }
                                     }
                                     Race::Sealed => peer_targets.seal_admission(),
                                     Race::Reservation => {
@@ -339,6 +438,15 @@ impl Fixture {
                             request["params"]["functionDeclaration"],
                             observation::FRAME_OWNER_GEOMETRY
                         );
+                        if race == Race::HiddenOopifCancel {
+                            if let Some(broker) = &peer_broker {
+                                broker.cancel(1, 1).unwrap();
+                            } else {
+                                peer_cancel.send_replace(CancelSignal::Requested);
+                            }
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                            failed = true;
+                        }
                         json!({"result":{"value":{"x":0,"y":0,"selector":"iframe"}}})
                     }
                     "Runtime.releaseObjectGroup" if readonly && child => {
