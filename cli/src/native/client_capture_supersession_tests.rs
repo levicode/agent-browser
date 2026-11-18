@@ -1612,7 +1612,7 @@ async fn remote_debt_wait_leaves_callback_ui_free_and_supersession_retires_witho
             .is_err()
     );
     // A late paused browser event must be able to enter and release the input.
-    let reservation = owner.ui.reserve_callback().unwrap();
+    let reservation = owner.ui.reserve_callback(false).unwrap();
     let (callback, _cancel_callback) = operation(3);
     let entered = tokio::time::timeout(
         Duration::from_millis(100),
