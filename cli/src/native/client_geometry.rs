@@ -818,6 +818,12 @@ fn quad_points(value: &Value) -> Result<[Point; 4], GeometryError> {
     }
     Ok(points)
 }
+/// A used content box with no area (display-none, zero width or height).
+fn empty_box(model: &Value) -> bool {
+    model["width"].as_f64().is_some_and(|width| width <= 0.0)
+        || model["height"].as_f64().is_some_and(|height| height <= 0.0)
+}
+
 fn quad(value: &Value) -> Result<[Point; 4], GeometryError> {
     let points = quad_points(value)?;
     validate_convex(&points)?;
@@ -1050,12 +1056,23 @@ async fn read_proofs(
                 semantic.is_some(),
             )
             .await?;
-            let size = size.ok_or(GeometryError::InvalidGeometry)?;
             let target = frames
                 .get_mut(&binding.frame)
                 .ok_or(GeometryError::IncompleteInventory)?;
-            target.owner_quad = Some(quad(&model["model"]["content"])?);
-            target.owner_size = Some(size);
+            match size {
+                Some(size) => {
+                    target.owner_quad = Some(quad(&model["model"]["content"])?);
+                    target.owner_size = Some(size);
+                }
+                // A display-none or zero-area frame owner has no measurable
+                // geometry. `read_exact_box` settled that from the box model
+                // alone, without issuing the frame-owner proof read.
+                None if empty_box(&model) => {
+                    target.owner_quad = Some([Point { x: 0., y: 0. }; 4]);
+                    target.owner_size = Some((0.0, 0.0));
+                }
+                None => return Err(GeometryError::InvalidGeometry),
+            }
         } else if input.owner.is_some() {
             return Err(GeometryError::IncompleteInventory);
         }
@@ -2024,6 +2041,14 @@ async fn read_exact_box_inner(
         if let Some(evidence) = evidence.as_mut() {
             evidence.origin = NodeGeometryOrigin::Other;
         }
+        // A display-none or zero-area frame owner has no measurable geometry.
+        // Settle that fact from the box model already in hand: never issue the
+        // frame-owner Runtime.callFunctionOn proof for it, so a caller that
+        // stops during the observation cannot cancel that read in flight
+        // (levicode/e2e#225, #228).
+        if require_owner_size && empty_box(&model) {
+            return Ok((model, None));
+        }
         // Recheck the same object against the isolated realm document after
         // geometry, not merely the frame loader: adoption can keep a node connected.
         let mut params =
@@ -2661,6 +2686,16 @@ mod tests {
         );
     }
     type MockLog = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+    #[test]
+    fn empty_box_detects_zero_area_owner_boxes() {
+        assert!(empty_box(&json!({"width":0.0,"height":10.0})));
+        assert!(empty_box(&json!({"width":10.0,"height":0.0})));
+        assert!(empty_box(&json!({"width":0.0,"height":0.0})));
+        assert!(!empty_box(&json!({"width":10.0,"height":10.0})));
+        // A missing size stays strict: only a proven zero area skips the proof.
+        assert!(!empty_box(&json!({})));
+    }
+
     async fn mock_geometry(
         fail_post_proof: bool,
     ) -> (
