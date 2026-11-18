@@ -2889,13 +2889,13 @@ impl ClientEnrollment {
             .values()
             .filter(|entry| {
                 (entry.application || entry.observation_only)
-                    && !capture_auxiliary_kind(&entry.kind)
+                    && !page_capture_auxiliary_kind(&entry.kind)
             })
             .count();
         let snapshot_entries = snapshot
             .entries
             .iter()
-            .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+            .filter(|entry| !page_capture_auxiliary_kind(&entry.kind))
             .count();
         if sealed
             || !index.reconciled
@@ -2909,7 +2909,7 @@ impl ClientEnrollment {
         for entry in snapshot
             .entries
             .iter()
-            .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+            .filter(|entry| !page_capture_auxiliary_kind(&entry.kind))
         {
             if !entry.resumed
                 || entry.application == entry.observation_only
@@ -2932,7 +2932,7 @@ impl ClientEnrollment {
         let document_tickets = snapshot
             .owned
             .iter()
-            .filter(|ticket| !capture_auxiliary_kind(&ticket.kind))
+            .filter(|ticket| !page_capture_auxiliary_kind(&ticket.kind))
             .cloned()
             .collect::<Vec<_>>();
         self.targets
@@ -3150,7 +3150,7 @@ impl ClientEnrollment {
             // it; it owns no captured storage, so it is not a contradiction.
             if owned.purpose == Some(TargetPurpose::Application)
                 && !entries.iter().any(|entry| entry.target == owned.target_id)
-                && !capture_auxiliary_kind(&owned.kind)
+                && !page_capture_auxiliary_kind(&owned.kind)
             {
                 return Err(ProtocolError::StaleScope);
             }
@@ -3276,7 +3276,7 @@ impl ClientEnrollment {
             snapshot
                 .entries
                 .iter()
-                .filter(|entry| !capture_auxiliary_kind(&entry.kind))
+                .filter(|entry| !page_capture_auxiliary_kind(&entry.kind))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -3284,7 +3284,7 @@ impl ClientEnrollment {
             snapshot
                 .owned
                 .iter()
-                .filter(|ticket| !capture_auxiliary_kind(&ticket.kind))
+                .filter(|ticket| !page_capture_auxiliary_kind(&ticket.kind))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -8726,6 +8726,13 @@ pub(crate) fn capture_auxiliary_kind(kind: &str) -> bool {
 /// poison the page scope. Their own startup/publication proofs stay their own.
 pub(crate) fn page_capture_auxiliary_kind(kind: &str) -> bool {
     capture_auxiliary_kind(kind) || matches!(kind, "service_worker" | "worker" | "shared_worker")
+}
+/// The targets a page read must wait for: every kind except the page-level
+/// auxiliaries. browser/tab/browser_ui and the worker kinds keep their own
+/// startup, acknowledgement and readiness proofs; an unclassified or
+/// unpartitioned target stays a fail-closed participant.
+pub(crate) fn page_read_target_kind(kind: &str) -> bool {
+    !page_capture_auxiliary_kind(kind)
 }
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()

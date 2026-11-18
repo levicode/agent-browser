@@ -1059,17 +1059,38 @@ impl Registry {
                     || (target.purpose.is_some() && target.configured)
             })
     }
-    /// Read admission waits for the scope's own enrollment instead of treating
-    /// a page's background target work as an unavailable scope. A target that
-    /// is still being attached/configured, a resume still in flight, a creation
-    /// reservation, or a pending auxiliary/popup claim is normal churn created
-    /// by the page being read; it is not evidence that the scope cannot be read.
-    /// A configured target whose resume is withheld stays a fail-closed
-    /// readiness refusal, a sealed or accounting-lost registry still fails
-    /// closed, and the caller's operation deadline still bounds the wait.
-    fn read_enrollment_settled(&self) -> bool {
-        self.inventory_complete()
-            && self.resuming == 0
+    /// The page scope's own document readiness. An auxiliary target
+    /// (browser/tab/browser_ui and the service_worker/worker/shared_worker
+    /// kinds) keeps its own startup, acknowledgement and readiness proofs, and
+    /// those proofs never gate a page read. Every other target, including an
+    /// unclassified or unpartitioned one, still participates.
+    fn page_inventory_complete(&self) -> bool {
+        self.reservations == 0
+            && self.targets.values().all(|target| {
+                !super::client_enrollment::page_read_target_kind(&target.kind)
+                    || (target.purpose.is_some() && target.configured)
+            })
+    }
+    /// A document target's resume still in flight is the page's own enrollment
+    /// work. An auxiliary target's resume belongs to that target's subject
+    /// semantics.
+    fn page_resume_pending(&self) -> bool {
+        self.targets.values().any(|target| {
+            super::client_enrollment::page_read_target_kind(&target.kind) && target.resume_pending
+        })
+    }
+    /// Read admission waits for the page's own document enrollment instead of
+    /// treating a background target's work as an unavailable scope. A document
+    /// target that is still being attached/configured, a page-resume in flight,
+    /// a creation reservation, or a pending auxiliary/popup claim is normal
+    /// churn created by the page being read; it is not evidence that the scope
+    /// cannot be read. A configured page target whose resume is withheld stays
+    /// a fail-closed readiness refusal, a sealed or accounting-lost registry
+    /// still fails closed, and the caller's operation deadline still bounds the
+    /// wait.
+    fn read_enrollment_settled_page(&self) -> bool {
+        self.page_inventory_complete()
+            && !self.page_resume_pending()
             && self
                 .auxiliary
                 .values()
@@ -1634,6 +1655,9 @@ impl ClientTargets {
         drop(authority.enter(self)?);
         authority.publish()
     }
+    /// The page-scope barrier a protected page read holds. Auxiliary targets
+    /// keep their own startup and acknowledgement proofs and never refuse the
+    /// page read; every other target must still be configured and resumed.
     pub fn protected_read_barrier(
         self: &Arc<Self>,
     ) -> Result<ProtectedTargetBarrier, ProtocolError> {
@@ -1645,15 +1669,15 @@ impl ClientTargets {
             || !state.enrollment_ready
             || state.protected_read.is_some()
             || state.reservations != 0
-            || state.resuming != 0
+            || state.page_resume_pending()
             || state
                 .auxiliary
                 .values()
                 .any(|entry| !entry.detached && entry.claimed_session.is_none())
-            || state
-                .targets
-                .values()
-                .any(|target| !target.configured || !target.resumed)
+            || state.targets.values().any(|target| {
+                super::client_enrollment::page_read_target_kind(&target.kind)
+                    && (!target.configured || !target.resumed)
+            })
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
@@ -2432,7 +2456,7 @@ impl ClientTargets {
                 .values()
                 .filter(|target| {
                     target.purpose == Some(TargetPurpose::Application)
-                        && !super::client_enrollment::capture_auxiliary_kind(&target.kind)
+                        && !super::client_enrollment::page_capture_auxiliary_kind(&target.kind)
                 })
                 .count()
                 != tickets.len()
@@ -2913,6 +2937,32 @@ impl ClientTargets {
             snapshot,
         ))
     }
+    /// The page-scope inventory a page read takes: an auxiliary target need not
+    /// be configured. Auxiliary targets keep their own startup, publication and
+    /// acknowledgement proofs, which never turn a readable page scope into an
+    /// unavailable one; every other target still gates.
+    pub(crate) fn inventory_page(&self) -> Result<(u64, Vec<OwnedTarget>), ProtocolError> {
+        self.inventory_with_diagnostic_page(false)
+            .map(|(revision, targets, _)| (revision, targets))
+    }
+    pub(crate) fn inventory_with_diagnostic_page(
+        &self,
+        observe: bool,
+    ) -> Result<(u64, Vec<OwnedTarget>, Option<RevisionSnapshot>), ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || !state.page_inventory_complete() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let snapshot = observe.then(|| state.revision_snapshot());
+        Ok((
+            state.revision,
+            state.targets.values().cloned().collect(),
+            snapshot,
+        ))
+    }
     /// The inventory a protected read may take, waiting out the page's own
     /// target enrollment. The registry notification is the only wait source;
     /// the caller's operation deadline and cancellation still bound it, and a
@@ -2938,7 +2988,7 @@ impl ClientTargets {
                 if let Some(error) = (*operation.cancellation.borrow()).error() {
                     return Err(error);
                 }
-                if state.read_enrollment_settled() {
+                if state.read_enrollment_settled_page() {
                     let snapshot = observe.then(|| state.revision_snapshot());
                     return Ok((
                         state.revision,
@@ -4483,7 +4533,7 @@ mod tests {
         state.targets.get_mut("page").unwrap().resumed = true;
         assert!(!state.targets["ui"].configured);
         assert!(state.inventory_complete());
-        assert!(state.read_enrollment_settled());
+        assert!(state.read_enrollment_settled_page());
         assert_eq!(
             state.targets["ui"].purpose,
             Some(TargetPurpose::Application)
@@ -6123,7 +6173,7 @@ mod owned_inventory_diagnostic_opt_in_tests {
             let late = state.targets.get("late").expect("late target registered");
             assert_eq!(late.purpose, Some(super::TargetPurpose::Application));
             assert!(!late.configured && !late.resumed);
-            assert!(!state.read_enrollment_settled());
+            assert!(!state.read_enrollment_settled_page());
         }
         let (_cancel, operation) =
             read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
@@ -6170,6 +6220,74 @@ mod owned_inventory_diagnostic_opt_in_tests {
         .expect("an auxiliary browser target renders no page document and must not gate a read");
         let (_, targets, _) = read.unwrap();
         assert_eq!(targets.len(), 2);
+    }
+
+    /// A headed page can own browser chrome and a starting service worker while
+    /// a read runs. Those targets keep their own subject readiness; the page
+    /// read admits on its document targets only.
+    #[tokio::test]
+    async fn page_read_admits_with_browser_ui_and_a_starting_service_worker() {
+        let registry = ready_read_registry();
+        for (id, kind) in [
+            ("ui-a", "browser_ui"),
+            ("ui-b", "browser_ui"),
+            ("worker", "service_worker"),
+        ] {
+            registry
+                .attached("ctx", id.into(), format!("{id}-session"), kind.into())
+                .unwrap();
+        }
+        let worker = registry
+            .service_worker_startup_permit("worker", "worker-session")
+            .await
+            .unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(
+                !state.inventory_complete(),
+                "an auxiliary target's startup still owns its own readiness"
+            );
+            assert!(state.read_enrollment_settled_page());
+            assert!(!state.targets["ui-a"].configured);
+            assert!(!state.targets["ui-b"].configured);
+            assert!(state.targets["worker"].resume_pending);
+        }
+        let (_cancel, operation) =
+            read_operation(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            registry.wait_read_inventory(&operation, false),
+        )
+        .await
+        .expect("auxiliary and worker targets must not gate a page read");
+        let (_, targets, _) = read.unwrap();
+        assert_eq!(targets.len(), 4);
+        assert!(targets
+            .iter()
+            .find(|target| target.kind == "page")
+            .is_some_and(|target| target.configured && target.resumed));
+        assert!(registry
+            .inventory_page()
+            .map(|(_, targets)| targets.len())
+            .is_ok_and(|len| len == 4));
+        assert!(
+            registry.inventory().is_err(),
+            "the all-target inventory still waits for the worker's own startup"
+        );
+        let barrier = registry.protected_read_barrier().unwrap();
+        barrier.check().unwrap();
+        drop(barrier);
+        assert!(
+            registry.check_settlement_integrity().is_err(),
+            "the starting worker still refuses its own settlement"
+        );
+        worker.complete().unwrap();
+        {
+            let state = registry.state.lock().unwrap();
+            assert!(state.inventory_complete());
+            assert!(state.read_enrollment_settled_page());
+        }
+        assert!(registry.check_settlement_integrity().is_ok());
     }
 
     #[tokio::test]
