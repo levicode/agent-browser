@@ -25,7 +25,6 @@ enum Race {
     CancelFinal,
     OopifCancel,
     HiddenOopifCancel,
-    OopifBrowserReply,
     Sealed,
     Reservation,
     Replacement,
@@ -125,7 +124,6 @@ impl Fixture {
                             | Race::CancelFinal
                             | Race::OopifCancel
                             | Race::HiddenOopifCancel
-                            | Race::OopifBrowserReply
                     )
             );
         }
@@ -140,10 +138,7 @@ impl Fixture {
             targets.enable_inventory_diagnostics_for_test();
         }
         ready(&targets).await;
-        if matches!(
-            race,
-            Race::OopifCancel | Race::HiddenOopifCancel | Race::OopifBrowserReply
-        ) {
+        if matches!(race, Race::OopifCancel | Race::HiddenOopifCancel) {
             let root = targets.owned_target("target").unwrap();
             targets
                 .attached_enrolled_with_ancestry(
@@ -205,7 +200,6 @@ impl Fixture {
                     | Race::CancelDuringOwner
                     | Race::OopifCancel
                     | Race::HiddenOopifCancel
-                    | Race::OopifBrowserReply
             );
             loop {
                 let text = tokio::select! {
@@ -231,16 +225,6 @@ impl Fixture {
                                 } else {
                                     peer_cancel.send_replace(CancelSignal::Requested);
                                 }
-                            }
-                            if race == Race::OopifBrowserReply {
-                                // The browser no longer knows this session, so
-                                // its answer arrives at the browser level with
-                                // no session id at all.
-                                let reply = json!({"id":request["id"],"result":{"frameTree":{"frame":{"id":"child","parentId":"frame","loaderId":"old-loader","url":"https://fixture.invalid/old"}}}});
-                                if socket.send(Message::Text(reply.to_string())).await.is_err() {
-                                    break;
-                                }
-                                continue;
                             }
                             // The child renderer reports the same sampler loader
                             // and URL the parent tree lists for this frame, so the
@@ -275,6 +259,7 @@ impl Fixture {
                     }
                 }
                 let mut failed = false;
+                let mut omit_session = false;
                 let mut delay_final_ack = false;
                 let mut flush_final_ack = false;
                 let mut wrong_session = false;
@@ -439,6 +424,10 @@ impl Fixture {
                             observation::FRAME_OWNER_GEOMETRY
                         );
                         if race == Race::HiddenOopifCancel {
+                            // The caller stops while its own owner read is in
+                            // flight; the browser then answers that retired
+                            // session at the browser level, without a session
+                            // id, after the stop.
                             if let Some(broker) = &peer_broker {
                                 broker.cancel(1, 1).unwrap();
                             } else {
@@ -446,6 +435,7 @@ impl Fixture {
                             }
                             tokio::time::sleep(Duration::from_millis(25)).await;
                             failed = true;
+                            omit_session = true;
                         }
                         json!({"result":{"value":{"x":0,"y":0,"selector":"iframe"}}})
                     }
@@ -525,6 +515,9 @@ impl Fixture {
                 }
                 if wrong_session {
                     response["sessionId"] = "other-session".into();
+                }
+                if omit_session {
+                    response.as_object_mut().unwrap().remove("sessionId");
                 }
                 if release_fence && (method == "Runtime.releaseObjectGroup" || delay_final_ack) {
                     // An early failed release may correctly refuse the remaining

@@ -591,11 +591,6 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
                     | Race::HiddenOopifCancel
             ) {
                 ProtocolError::Cancelled
-            } else if race == Race::OopifBrowserReply {
-                // The browser-level reply cannot be attributed to the exact
-                // frame session, so the fixed read refuses as a stale frame
-                // reference instead of settling the closed scope as unknown.
-                ProtocolError::StaleReference
             } else {
                 ProtocolError::StaleScope
             }
@@ -609,7 +604,6 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
                 | Race::CancelFinal
                 | Race::OopifCancel
                 | Race::HiddenOopifCancel
-                | Race::OopifBrowserReply
         ) {
             assert!(
                 targets.inventory().is_ok(),
@@ -854,11 +848,6 @@ async fn observe_receipt_caller_stop_during_owner_read_keeps_the_scope_usable() 
 #[tokio::test]
 async fn observe_receipt_hidden_oopif_owner_cancel_keeps_the_scope_usable() {
     retained_observe_receipt_control(Race::HiddenOopifCancel, false).await;
-}
-
-#[tokio::test]
-async fn observe_receipt_browser_level_oopif_read_reply_keeps_the_scope_usable() {
-    retained_observe_receipt_control(Race::OopifBrowserReply, false).await;
 }
 
 #[tokio::test]

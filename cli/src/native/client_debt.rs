@@ -535,6 +535,37 @@ pub(crate) struct OperationJournalHandle {
     ledger: Arc<OwnerDebtLedger>,
     journal: Arc<Journal>,
 }
+impl OperationJournalHandle {
+    pub(crate) fn stop_witness(&self) -> OperationStopWitness {
+        OperationStopWitness(Arc::downgrade(&self.journal))
+    }
+}
+/// Whether the exact operation that owns a pending command has stopped. A
+/// stopped caller is not waiting for the reply any more, so the reply's value
+/// has no authority; a live caller keeps the strict settlement.
+#[derive(Clone)]
+pub(crate) struct OperationStopWitness(std::sync::Weak<Journal>);
+impl OperationStopWitness {
+    fn stopped(&self) -> bool {
+        self.0.upgrade().is_some_and(|journal| journal.stopped())
+    }
+}
+impl Journal {
+    fn stopped(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        if state.submission_revoked || state.local_producers_finished {
+            return true;
+        }
+        state
+            .admission
+            .as_ref()
+            .is_some_and(|(deadline, cancellation)| {
+                Instant::now() >= *deadline || *cancellation.borrow() != CancelSignal::None
+            })
+    }
+}
 tokio::task_local! {
     static CURRENT_OPERATION: OperationJournalHandle;
     static COMMAND_OVERRIDE: CommandOverride;
@@ -1103,6 +1134,9 @@ struct CommandRecord {
     submitted: bool,
     mutation: bool,
     creation_slots: usize,
+    /// The read asked the browser to serialize its result instead of returning
+    /// a remote handle, so a handle-free reply created no page object.
+    by_value: bool,
     release_object: Option<String>,
     object_group: Option<String>,
     release_group: bool,
@@ -1111,6 +1145,10 @@ struct CommandRecord {
     grouped_creation: bool,
     group_release_proven: bool,
     objects_destroyed: bool,
+    /// The exact operation that submitted this command, so a late
+    /// browser-level reply can tell a caller that stopped waiting from one
+    /// that is still live.
+    stop: Option<OperationStopWitness>,
 }
 /// Only acquisition identities are retained, never the request payload or a
 /// continuation. The reader binds these before delivering a possibly late ACK.
@@ -3845,6 +3883,10 @@ impl OwnerDebtLedger {
                 submitted: false,
                 mutation: classification.mutation,
                 creation_slots,
+                by_value: params
+                    .and_then(|params| params.get("returnByValue"))
+                    .and_then(Value::as_bool)
+                    == Some(true),
                 release_object,
                 object_group,
                 release_group: method == "Runtime.releaseObjectGroup",
@@ -3853,6 +3895,7 @@ impl OwnerDebtLedger {
                 grouped_creation,
                 group_release_proven: false,
                 objects_destroyed: false,
+                stop: journal.map(OperationJournalHandle::stop_witness),
             },
         );
         Ok(CommandReservation {
@@ -4879,15 +4922,16 @@ pub(crate) struct SubmittedCommand {
 
 /// A late reply that cannot be attributed to its command's session proves
 /// nothing about a read that can neither write page content nor retain a page
-/// object. Its exact page effect is empty and its object custody is zero, so
-/// discharging the pending command cannot lose a cleanup proof. Writes, object
-/// producers, input, cleanup, lifecycle acquisitions and any unexpected remote
-/// handle keep the strict integrity loss.
+/// object, once its caller stopped waiting. Its exact page effect is empty and
+/// its object custody is zero, so discharging the pending command cannot lose a
+/// cleanup proof. A live caller, a write, an object producer, input, cleanup, a
+/// lifecycle acquisition and any unexpected remote handle keep the strict
+/// integrity loss.
 fn unattributed_read_has_no_page_effect(command: &CommandRecord, response: &CdpMessage) -> bool {
     command.category.application()
         && !command.mutation
         && !command.category.input()
-        && command.creation_slots == 0
+        && (command.creation_slots == 0 || command.by_value)
         && command.release_object.is_none()
         && !command.release_group
         && command.acquisition.is_none()
@@ -4987,6 +5031,10 @@ impl SubmittedCommand {
             // object producer, input, cleanup and lifecycle acquisition keep
             // the strict integrity loss.
             if response.session_id.is_none()
+                && command
+                    .stop
+                    .as_ref()
+                    .is_some_and(OperationStopWitness::stopped)
                 && unattributed_read_has_no_page_effect(command, response)
             {
                 command.status.set(CommandStatus::IntegrityLost);
@@ -5485,6 +5533,20 @@ pub(crate) mod tests {
             )
             .unwrap();
         (ledger, journal)
+    }
+    /// Bind the journal to a lease whose caller has already stopped, the way a
+    /// cancelled operation is observed after its producer returned.
+    fn stopped_lease(journal: &OperationJournalHandle) {
+        let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let lease = OperationLease {
+            is_callback: false,
+            generation: 7,
+            sequence: 1,
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+            cancellation,
+        };
+        journal.bind_operation(&lease).unwrap();
+        sender.send_replace(CancelSignal::Requested);
     }
     #[test]
     fn exact_session_retirement_requires_the_applied_detach_and_intact_ledger() {
@@ -6977,34 +7039,6 @@ pub(crate) mod tests {
         );
         assert_eq!(status.snapshot(), CommandStatus::IntegrityLost);
         assert!(ledger.snapshot().integrity_lost);
-    }
-
-    #[tokio::test]
-    async fn an_omitted_session_on_a_fixed_read_reply_discharges_only_its_command() {
-        let (ledger, _page) = owner();
-        let frame = frame_session(&ledger);
-        let read = ledger
-            .reserve_command(
-                Some(&frame),
-                "Page.getFrameTree",
-                Some(&json!({})),
-                Some("frame"),
-            )
-            .unwrap();
-        let status = read.status();
-        let read = read.submit().unwrap();
-        // A fixed read can neither change page content nor retain a page
-        // object. The browser-level reply cannot be attributed to its session,
-        // but the abandoned caller has no value and no custody to lose, so only
-        // this exact command is discharged; every other operation on the owner
-        // keeps its integrity.
-        read.settle(&serde_json::from_value(json!({"id":3,"result":{}})).unwrap());
-        let snapshot = ledger.snapshot();
-        assert_eq!(status.snapshot(), CommandStatus::IntegrityLost);
-        assert!(!snapshot.integrity_lost);
-        assert_eq!(snapshot.outstanding_commands, 0);
-        assert_eq!(snapshot.object_debt, 0);
-        assert_eq!(snapshot.input_debt, 0);
     }
 
     #[tokio::test]
@@ -8856,18 +8890,19 @@ pub(crate) mod tests {
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
     }
     #[test]
-    fn a_fixed_read_settles_an_unattributed_late_reply_without_losing_the_scope() {
+    fn a_stopped_callers_late_fixed_read_reply_discharges_only_its_command() {
         let (ledger, journal) = owner();
         let command = ledger
             .reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page"))
             .unwrap()
             .submit()
             .unwrap();
+        stopped_lease(&journal);
         // The browser answered a session-addressed fixed read at the browser
-        // level after that frame session retired. The abandoned caller has no
-        // value to lose, and the read can neither change page content nor
-        // retain a page object, so the pending command is discharged instead of
-        // contaminating every later operation on the scope.
+        // level after that frame session retired. The caller already stopped
+        // waiting, so it has no value to lose, and the read can neither change
+        // page content nor retain a page object: the pending command is
+        // discharged instead of contaminating every later operation.
         let reply = serde_json::from_value(
             json!({"id":1,"result":{"frameTree":{"frame":{"id":"frame","loaderId":"loader"}}}}),
         )
@@ -8887,6 +8922,7 @@ pub(crate) mod tests {
             .unwrap()
             .submit()
             .unwrap();
+        stopped_lease(&journal);
         // A fixed read cannot retain handles; an unexpected one is custody this
         // discharge may not drop, so the strict integrity loss stays.
         let reply = serde_json::from_value(
@@ -8927,10 +8963,29 @@ pub(crate) mod tests {
                 .unwrap()
                 .submit()
                 .unwrap();
+            stopped_lease(&journal);
             let reply = serde_json::from_value(json!({"id":1,"result":{}})).unwrap();
             let _ = command.settle_for_delivery(&reply);
             assert!(ledger.snapshot().integrity_lost, "{method}");
         }
+    }
+    #[tokio::test]
+    async fn an_omitted_session_on_a_success_reply_still_loses_ledger_integrity() {
+        let (ledger, _page) = owner();
+        let frame = frame_session(&ledger);
+        let read = ledger
+            .reserve_command(
+                Some(&frame),
+                "Page.getFrameTree",
+                Some(&json!({})),
+                Some("frame"),
+            )
+            .unwrap();
+        let status = read.status();
+        let read = read.submit().unwrap();
+        read.settle(&serde_json::from_value(json!({"id":3,"result":{}})).unwrap());
+        assert_eq!(status.snapshot(), CommandStatus::IntegrityLost);
+        assert!(ledger.snapshot().integrity_lost);
     }
     #[test]
     fn receiver_drop_between_settlement_and_delivery_still_selects_exact_disposal() {

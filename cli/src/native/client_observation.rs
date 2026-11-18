@@ -444,6 +444,21 @@ pub(crate) async fn retained_read_command(
         {
             Err(primary)
         }
+        // The reader discharges a session-less late reply only for a stopped
+        // caller, an object-free reply and a still-clean ledger. Such a read
+        // has no custody and no page effect left, so it settles as the stop
+        // rather than as a lost cleanup proof. Every other IntegrityLost
+        // status accompanies a contaminated ledger and keeps the strict loss.
+        Ok(Err(_)) | Err(_)
+            if status.as_ref().is_some_and(|status| {
+                status.snapshot() == super::client_debt::CommandStatus::IntegrityLost
+            }) && *lease.cancellation.borrow() != super::client_session::CancelSignal::None
+                && client
+                    .debt_ledger()
+                    .is_some_and(|ledger| !ledger.snapshot().integrity_lost) =>
+        {
+            Err(settled_stop(primary, lease))
+        }
         Ok(Err(_)) | Err(_) if requires_settlement => {
             super::client_settlement_trace::record_read_cleanup_cause(
                 super::client_settlement_trace::ReadCleanupCause::ReadSettlement,
