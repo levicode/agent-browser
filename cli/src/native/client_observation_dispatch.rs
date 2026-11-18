@@ -2978,7 +2978,7 @@ impl ObservationDispatch {
                             if refused == ProtocolError::BrowserFailure {
                                 let mut lost = None;
                                 if let Ok((_, targets)) =
-                                    capture_context.page.targets.inventory()
+                                    capture_context.page.targets.inventory_page()
                                 {
                                     let owned = targets
                                         .iter()
@@ -3285,7 +3285,7 @@ async fn node_identity_resample_proven(
     if !node_negative_frames_match(negatives, &context.frames) {
         return Ok(false);
     }
-    let (revision, _) = context.page.targets.inventory()?;
+    let (revision, _) = context.page.targets.inventory_page()?;
     let current = verified_frames(&context.page, operation).await?;
     // Includes page/session/frame/loader/parent/owner and URL, not just one
     // selected negative's frame. A different document is not this proof.
@@ -3352,7 +3352,7 @@ async fn document_retirement_proven(
     if check(&context.page, operation).is_err() {
         return Ok(false);
     }
-    let Ok((revision, targets)) = context.page.targets.inventory() else {
+    let Ok((revision, targets)) = context.page.targets.inventory_page() else {
         return Ok(false);
     };
     let page_present = targets.iter().any(|target| {
@@ -4230,7 +4230,7 @@ async fn single_root_fields_before<'a>(
     ProtocolError,
 > {
     check(page, operation)?;
-    let (revision, targets, before) = page.targets.inventory_with_diagnostic(false)?;
+    let (revision, targets, before) = page.targets.inventory_with_diagnostic_page(false)?;
     let main = targets
         .iter()
         .find(|target| {
@@ -4285,7 +4285,7 @@ async fn single_root_fields_after(
     check(page, operation)?;
     // A separate final fence preserves legacy semantics for unrelated target
     // churn; the initial revision is deliberately not an operation-wide lock.
-    let (revision, targets, before) = page.targets.inventory_with_diagnostic(false)?;
+    let (revision, targets, before) = page.targets.inventory_with_diagnostic_page(false)?;
     let main = targets
         .iter()
         .find(|target| {
@@ -4423,7 +4423,7 @@ async fn frame_inventory_attempt_once(
             // unrelated popup's held initializer.
             UnpartitionedInventory::Immediate => page
                 .targets
-                .inventory_with_diagnostic(screenshot.is_some())?,
+                .inventory_with_diagnostic_page(screenshot.is_some())?,
         }
     };
     #[cfg(test)]
@@ -4468,9 +4468,10 @@ async fn frame_inventory_attempt_once(
             // establish application frame ancestry.
             continue;
         }
-        if super::client_enrollment::capture_auxiliary_kind(&target.kind) {
-            // Auxiliary browser targets render no page document; their own
-            // configuration must not gate the page's frame inventory.
+        if super::client_enrollment::page_capture_auxiliary_kind(&target.kind) {
+            // Auxiliary targets render no page document; their own startup,
+            // acknowledgement and configuration must not gate the page's frame
+            // inventory.
             continue;
         }
         if !target.configured || !target.resumed {

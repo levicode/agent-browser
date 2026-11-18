@@ -45,7 +45,7 @@ impl ObservationDispatch {
             return false;
         };
         if targets.identity_scope != owner.scope.identity_scope
-            || targets.inventory().is_err()
+            || targets.inventory_page().is_err()
             || !targets.owned_target(&owner.target_id).is_ok_and(|current| {
                 owner.attachment.same_attachment(&current) && current.capture_ready()
             })
