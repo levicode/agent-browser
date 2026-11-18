@@ -1834,7 +1834,7 @@ where
                     }
                     // Claim terminal authority before any other admitted task
                     // can submit a new application command on this generation.
-                    let _ = broker.quarantine();
+                    let _ = broker.quarantine_terminal();
                     sink.close_publications();
                     closing_id = Some(id);
                     terminal_control = terminal_close_negotiated;
@@ -1862,7 +1862,7 @@ where
     settlement_trace!(0, ShutdownStarted);
     // Seal before cancelling native work. EOF never proves resource teardown.
     sink.close_publications();
-    let _ = broker.quarantine();
+    let _ = broker.quarantine_terminal();
     operations.abort_all();
     // Shutdown and control share one cutoff, never renewed by incoming traffic.
     // The executor starts even if the peer never asks for its receipt.

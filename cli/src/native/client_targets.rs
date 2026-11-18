@@ -1096,12 +1096,38 @@ impl Registry {
                 .values()
                 .all(|entry| entry.detached || entry.claimed_session.is_some())
     }
-    fn lose_integrity(&mut self, reason: diagnostic::InventoryFirstLoss) {
+    fn lose_integrity(
+        &mut self,
+        reason: diagnostic::InventoryFirstLoss,
+        caller: &'static std::panic::Location<'static>,
+    ) {
         self.first_loss.get_or_insert(reason);
         self.seal_cause
             .get_or_insert(diagnostic::InventorySealCause::from_reason(reason));
         self.sealed = true;
         self.integrity_lost = true;
+        // Every integrity loss is an isolation, wherever it starts. The
+        // observation is unconditional; a configured sink only decides output.
+        diagnostic::scope_isolation(diagnostic::IsolationObservation {
+            layer: diagnostic::IsolationLayer::TargetSeal,
+            caller,
+            reason: diagnostic::IsolationReason::from_loss(reason),
+            operation_seq: super::client_debt::current_operation_sequence(),
+            target_kinds: Some(self.kind_census()),
+            error: None,
+            scope_state: None,
+        });
+    }
+    /// Bounded kind census of the registry this seal covered.
+    fn kind_census(&self) -> [u16; 12] {
+        let mut kinds = [0u16; 12];
+        for target in self.targets.values() {
+            let index = diagnostic::DiagnosticTargetKind::from_native(&target.kind) as usize;
+            if let Some(slot) = kinds.get_mut(index) {
+                *slot = slot.saturating_add(1);
+            }
+        }
+        kinds
     }
 }
 pub struct ClientTargets {
@@ -1361,7 +1387,10 @@ impl ResumePermit {
                     || target.purpose != Some(TargetPurpose::Application)
                     || target.configured))
         {
-            state.lose_integrity(diagnostic::InventoryFirstLoss::ResumeIdentityMismatch);
+            state.lose_integrity(
+                diagnostic::InventoryFirstLoss::ResumeIdentityMismatch,
+                std::panic::Location::caller(),
+            );
             return Err(ProtocolError::StaleScope);
         }
         check_bounds()?;
@@ -1454,7 +1483,10 @@ impl Drop for ResumePermit {
                 }
                 state.resuming = state.resuming.saturating_sub(1);
                 if !self.completed {
-                    state.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::ResumePermitDropped,
+                        std::panic::Location::caller(),
+                    );
                 }
             }
             self.registry.changed.notify_waiters();
@@ -2038,7 +2070,10 @@ impl ClientTargets {
                 if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
                     revoke();
                     pending.failed = true;
-                    state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryCapacity);
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::AuxiliaryCapacity,
+                        std::panic::Location::caller(),
+                    );
                     self.changed.notify_waiters();
                     return Err(ProtocolError::CapacityExceeded);
                 }
@@ -2846,7 +2881,10 @@ impl ClientTargets {
             {
                 let Some(next) = tenure.query_revision.load(Ordering::Acquire).checked_add(1)
                 else {
-                    state.lose_integrity(diagnostic::InventoryFirstLoss::QueryRevisionExhausted);
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::QueryRevisionExhausted,
+                        std::panic::Location::caller(),
+                    );
                     return Err(ProtocolError::IdentifierExhausted);
                 };
                 tenure.query_revision.store(next, Ordering::Release);
@@ -2854,6 +2892,7 @@ impl ClientTargets {
                 let Some(next) = state.query_unknown_revision.checked_add(1) else {
                     state.lose_integrity(
                         diagnostic::InventoryFirstLoss::UnknownQueryRevisionExhausted,
+                        std::panic::Location::caller(),
                     );
                     return Err(ProtocolError::IdentifierExhausted);
                 };
@@ -3215,20 +3254,32 @@ impl ClientTargets {
             diagnostic,
         }
     }
+    #[track_caller]
     pub fn seal(&self) {
-        self.seal_with_cause(
+        self.seal_with_cause_at(
             diagnostic::InventoryFirstLoss::ExplicitSeal,
             diagnostic::InventorySealCause::Explicit,
+            std::panic::Location::caller(),
         );
     }
+    #[track_caller]
     pub(crate) fn seal_diagnostic(&self, reason: diagnostic::InventoryFirstLoss) {
         let cause = diagnostic::InventorySealCause::from_reason(reason);
         self.seal_with_cause(reason, cause);
     }
+    #[track_caller]
     pub(crate) fn seal_with_cause(
         &self,
         reason: diagnostic::InventoryFirstLoss,
         cause: diagnostic::InventorySealCause,
+    ) {
+        self.seal_with_cause_at(reason, cause, std::panic::Location::caller());
+    }
+    fn seal_with_cause_at(
+        &self,
+        reason: diagnostic::InventoryFirstLoss,
+        cause: diagnostic::InventorySealCause,
+        caller: &'static std::panic::Location<'static>,
     ) {
         self.eval_invalidation(|revoke| {
             revoke();
@@ -3236,18 +3287,31 @@ impl ClientTargets {
                 if state.seal_cause.is_none() {
                     state.seal_cause = Some(cause);
                 }
-                state.lose_integrity(reason);
+                state.lose_integrity(reason, caller);
             }
             self.changed.notify_waiters();
         })
     }
     /// Stop admission without inventing either cleanup success or accounting
     /// failure. Only an earlier owner-retirement stamp can certify settlement.
+    #[track_caller]
     pub(crate) fn seal_admission(&self) {
+        self.seal_admission_at(std::panic::Location::caller());
+    }
+    fn seal_admission_at(&self, caller: &'static std::panic::Location<'static>) {
         self.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.state.lock() {
                 state.sealed = true;
+                diagnostic::scope_isolation(diagnostic::IsolationObservation {
+                    layer: diagnostic::IsolationLayer::TargetSeal,
+                    caller,
+                    reason: diagnostic::IsolationReason::AdmissionClosed,
+                    operation_seq: super::client_debt::current_operation_sequence(),
+                    target_kinds: Some(state.kind_census()),
+                    error: None,
+                    scope_state: None,
+                });
             }
             self.changed.notify_waiters();
         })
@@ -3255,16 +3319,26 @@ impl ClientTargets {
     /// Called by the retained lifecycle owner before stopping enrollment. The
     /// first inventory is immutable: later cleanup cannot repair missing proof,
     /// and neither repeated retirement nor this stamp can clear a poison seal.
+    #[track_caller]
     pub(crate) fn seal_for_owner_retirement(
         &self,
         authority: &super::client_browser::OwnerRetirement,
+    ) {
+        self.seal_for_owner_retirement_at(authority, std::panic::Location::caller());
+    }
+    fn seal_for_owner_retirement_at(
+        &self,
+        authority: &super::client_browser::OwnerRetirement,
+        caller: &'static std::panic::Location<'static>,
     ) {
         self.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.state.lock() {
                 if !authority.authorizes(self) {
-                    state
-                        .lose_integrity(diagnostic::InventoryFirstLoss::InvalidRetirementAuthority);
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::InvalidRetirementAuthority,
+                        caller,
+                    );
                     self.changed.notify_waiters();
                     return;
                 }
@@ -3273,17 +3347,32 @@ impl ClientTargets {
                         Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
                 }
                 state.sealed = true;
+                diagnostic::scope_isolation(diagnostic::IsolationObservation {
+                    layer: diagnostic::IsolationLayer::TargetSeal,
+                    caller,
+                    reason: diagnostic::IsolationReason::OwnerRetirement,
+                    operation_seq: super::client_debt::current_operation_sequence(),
+                    target_kinds: Some(state.kind_census()),
+                    error: None,
+                    scope_state: None,
+                });
             }
             self.changed.notify_waiters();
         })
     }
     /// EOF closes admission, not accounting. All ordinary poison paths still
     /// set integrity_lost; this never clears an earlier loss.
+    #[track_caller]
     pub(crate) fn seal_remote_connection(&self, ledger: &Arc<super::client_debt::OwnerDebtLedger>) {
+        let caller = std::panic::Location::caller();
         if self.require_eval_owner(ledger).is_ok() && ledger.remote_eof_only() {
-            self.seal_admission();
+            self.seal_admission_at(caller);
         } else {
-            self.seal();
+            self.seal_with_cause_at(
+                diagnostic::InventoryFirstLoss::ExplicitSeal,
+                diagnostic::InventorySealCause::Explicit,
+                caller,
+            );
         }
     }
     #[cfg(test)]
@@ -3654,7 +3743,10 @@ impl AuxiliaryAttachmentReservation {
             entry.acknowledged_session = Some(session_id.into());
             if !valid {
                 entry.failed = true;
-                state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryAckMismatch);
+                state.lose_integrity(
+                    diagnostic::InventoryFirstLoss::AuxiliaryAckMismatch,
+                    std::panic::Location::caller(),
+                );
                 drop(state);
                 self.registry.changed.notify_waiters();
                 return Err(ProtocolError::StaleScope);
@@ -3678,7 +3770,10 @@ impl AuxiliaryAttachmentReservation {
                         entry.cleanup_owned.extend(entry.candidates.iter().cloned());
                     }
                 }
-                state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryAbandoned);
+                state.lose_integrity(
+                    diagnostic::InventoryFirstLoss::AuxiliaryAbandoned,
+                    std::panic::Location::caller(),
+                );
             }
             self.registry.changed.notify_waiters();
         })
@@ -3929,7 +4024,10 @@ impl Drop for CreationReservation {
                 // An abandoned create may still produce a late browser target.
                 // Never reinterpret that unclaimed bootstrap as application work.
                 if !self.claimed {
-                    state.lose_integrity(diagnostic::InventoryFirstLoss::CreationAbandoned);
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::CreationAbandoned,
+                        std::panic::Location::caller(),
+                    );
                     if self.purpose == TargetPurpose::StateBootstrap
                         && self.native_created_target.is_none()
                     {
@@ -6079,13 +6177,19 @@ mod first_loss_diagnostic_tests {
     fn first_loss_is_immutable_and_does_not_change_seal_semantics() {
         let mut registry = Registry::default();
         assert!(registry.first_loss.is_none());
-        registry.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
+        registry.lose_integrity(
+            diagnostic::InventoryFirstLoss::ResumePermitDropped,
+            std::panic::Location::caller(),
+        );
         assert!(registry.sealed && registry.integrity_lost);
         assert_eq!(
             registry.diagnostic_inventory().seal_cause,
             Some(diagnostic::InventorySealCause::Explicit)
         );
-        registry.lose_integrity(diagnostic::InventoryFirstLoss::ExplicitSeal);
+        registry.lose_integrity(
+            diagnostic::InventoryFirstLoss::ExplicitSeal,
+            std::panic::Location::caller(),
+        );
         assert_eq!(
             registry.first_loss,
             Some(diagnostic::InventoryFirstLoss::ResumePermitDropped)

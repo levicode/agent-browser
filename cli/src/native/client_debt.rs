@@ -606,6 +606,11 @@ pub(crate) struct CommandOverride {
 pub(crate) fn current_operation() -> Option<OperationJournalHandle> {
     CURRENT_OPERATION.try_with(Clone::clone).ok()
 }
+/// The admitted operation sequence when one is in scope; zero outside an
+/// operation (events, transport teardown), never a guessed sequence.
+pub(crate) fn current_operation_sequence() -> u64 {
+    current_operation().map_or(0, |handle| handle.key().operation_seq)
+}
 pub(crate) async fn command_scope<F: Future>(
     category: CommandCategory,
     mutation: bool,
