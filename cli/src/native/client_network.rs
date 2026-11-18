@@ -1735,7 +1735,12 @@ impl ClientNetwork {
         // of the lifecycle owner's exclusive restore/import work. Live-session
         // callbacks retain their original immediate reservation ordering.
         let callback_reservation = if callback_event && !unpublished_callback {
-            Some(self.ui_gate.reserve_callback()?)
+            // A paused request only needs a route decision, not UI custody.
+            // Let it overlap a protected read; dialogs and auth still wait.
+            Some(
+                self.ui_gate
+                    .reserve_callback(event.method == "Fetch.requestPaused")?,
+            )
         } else {
             None
         };
@@ -1804,7 +1809,7 @@ impl ClientNetwork {
                 if !this.session_tenure_live(&session.session_id, &session_tenure)? {
                     return Ok(());
                 }
-                Some(this.ui_gate.reserve_callback()?)
+                Some(this.ui_gate.reserve_callback(false)?)
             } else {
                 callback_reservation
             };
@@ -6105,11 +6110,10 @@ mod bridge_tests {
                 )
                 .await
                 .unwrap();
+            // A paused request is admitted during a protected read by design
+            // (it carries no UI custody), so only the UI callbacks below still
+            // wait for the exclusive permit and must never rebind afterwards.
             for (method, params) in [
-                (
-                    "Fetch.requestPaused",
-                    json!({"requestId":"old-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
-                ),
                 (
                     "Fetch.authRequired",
                     json!({"requestId":"old-auth","request":{"url":"https://synthetic.test/"},"authChallenge":{"source":"Server","origin":"https://synthetic.test","scheme":"basic","realm":"synthetic"}}),

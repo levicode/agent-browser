@@ -26,6 +26,10 @@ pub struct UiPermit {
 pub struct CallbackReservation {
     gate: Arc<UiGate>,
     pending: bool,
+    /// A paused network request carries no UI work: a protected read must not
+    /// hold it behind the gate, or a normal page's resource load can fill the
+    /// network task bound while the first observation is in flight.
+    admit_during_protection: bool,
 }
 struct WaitingWriter {
     gate: Arc<UiGate>,
@@ -44,7 +48,10 @@ impl Drop for WaitingWriter {
 impl UiGate {
     /// Called synchronously while an owned paused event is captured. Registry
     /// snapshot/token ownership is retained by the caller before any await.
-    pub fn reserve_callback(self: &Arc<Self>) -> Result<CallbackReservation, ProtocolError> {
+    pub fn reserve_callback(
+        self: &Arc<Self>,
+        admit_during_protection: bool,
+    ) -> Result<CallbackReservation, ProtocolError> {
         let mut state = self
             .state
             .lock()
@@ -59,6 +66,7 @@ impl UiGate {
         Ok(CallbackReservation {
             gate: self.clone(),
             pending: true,
+            admit_during_protection,
         })
     }
 
@@ -162,7 +170,7 @@ impl CallbackReservation {
                 if state.sealed {
                     return Err(ProtocolError::StaleScope);
                 }
-                if !state.exclusive {
+                if !state.exclusive || self.admit_during_protection {
                     state.readers = state
                         .readers
                         .checked_add(1)
@@ -236,7 +244,7 @@ mod tests {
             .enter(true, false, deadline, cancel.clone())
             .await
             .unwrap();
-        let reservation = gate.reserve_callback().unwrap();
+        let reservation = gate.reserve_callback(false).unwrap();
         let event = {
             let cancel = cancel.clone();
             tokio::spawn(async move { reservation.enter(deadline, cancel).await })
@@ -250,6 +258,29 @@ mod tests {
         assert_eq!(gate.state.lock().unwrap().readers, 1);
         drop(callback);
         gate.enter(true, false, deadline, cancel).await.unwrap();
+    }
+    #[tokio::test]
+    async fn paused_request_admits_during_protection_while_ui_callbacks_still_wait() {
+        let gate = Arc::new(UiGate::default());
+        let (_send, cancel) = watch::channel(CancelSignal::None);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let protected = gate
+            .enter(true, false, deadline, cancel.clone())
+            .await
+            .unwrap();
+        let paused = gate.reserve_callback(true).unwrap();
+        let permit = paused.enter(deadline, cancel.clone()).await.unwrap();
+        assert_eq!(gate.state.lock().unwrap().readers, 1);
+        drop(permit);
+        let dialog = gate.reserve_callback(false).unwrap();
+        let waiting = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { dialog.enter(deadline, cancel).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(protected);
+        assert!(waiting.await.unwrap().is_ok());
     }
     #[tokio::test]
     async fn waiting_protected_read_does_not_deadlock_parent_callback() {
