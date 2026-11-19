@@ -2024,11 +2024,8 @@ impl ObservationDispatch {
                     }
                 })?;
             let captured = async {
-                screenshot_stage(screenshot, ScreenshotStage::AnimationStabilization);
-                journal
-                    .stabilize_animations()
-                    .await
-                    .map_err(protected_error)?;
+                // Check the frame inventory before changing animation state so
+                // enrollment can refuse the observation before pixel effects.
                 screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
                 let frames = verified_frames_with_cleanup(
                     &context.page,
@@ -2037,6 +2034,12 @@ impl ObservationDispatch {
                 )
                 .await?;
                 same_frames(&context.frames, &frames)?;
+                journal.check().map_err(protected_error)?;
+                screenshot_stage(screenshot, ScreenshotStage::AnimationStabilization);
+                journal
+                    .stabilize_animations()
+                    .await
+                    .map_err(protected_error)?;
                 screenshot_stage(screenshot, ScreenshotStage::Geometry);
                 let geometry = observe_geometry_snapshot(
                     &context.page.client,
