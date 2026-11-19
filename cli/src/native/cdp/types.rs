@@ -146,6 +146,48 @@ pub(crate) fn is_object_not_found_message(message: &str) -> bool {
         ],
     )
 }
+/// A frame the page already detached. Closed browser text only; no other
+/// answer may become "the frame is gone".
+pub(crate) fn is_frame_not_found_message(message: &str) -> bool {
+    is_closed_browser_answer(message, &["frame with the given id was not found"])
+}
+/// A node the document already destroyed. Closed browser text only.
+pub(crate) fn is_node_not_found_message(message: &str) -> bool {
+    is_closed_browser_answer(message, &["no node with given id found"])
+}
+
+/// The exact browser object one closed error answer reports as already gone.
+/// Recording this taxonomy never widens which answers prove a paused request
+/// gone; each caller keeps its own closed allowlist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StaleBrowserObject {
+    Session,
+    Frame,
+    Object,
+    Node,
+}
+impl StaleBrowserObject {
+    /// Classifies only the closed answers above; every other error is `None`.
+    pub(crate) fn from_message(message: &str) -> Option<Self> {
+        if is_session_not_found_message(message) {
+            Some(Self::Session)
+        } else if is_frame_not_found_message(message) {
+            Some(Self::Frame)
+        } else if is_object_not_found_message(message) {
+            Some(Self::Object)
+        } else if is_node_not_found_message(message) {
+            Some(Self::Node)
+        } else {
+            None
+        }
+    }
+}
+impl CdpError {
+    /// The closed object taxonomy for this error answer, if it names one.
+    pub(crate) fn stale_object(&self) -> Option<StaleBrowserObject> {
+        StaleBrowserObject::from_message(&self.message)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CDP events (broadcast to subscribers)
@@ -709,5 +751,51 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn stale_object_taxonomy_accepts_only_closed_gone_answers() {
+        for (message, expected) in [
+            (
+                "Session with given id not found.",
+                StaleBrowserObject::Session,
+            ),
+            (
+                "CDP error (Fetch.continueRequest): Session with given id not found.",
+                StaleBrowserObject::Session,
+            ),
+            (
+                "Frame with the given id was not found",
+                StaleBrowserObject::Frame,
+            ),
+            (
+                "CDP error (DOM.getFrameOwner): Frame with the given id was not found.",
+                StaleBrowserObject::Frame,
+            ),
+            (
+                "Could not find object with given id",
+                StaleBrowserObject::Object,
+            ),
+            ("No node with given id found", StaleBrowserObject::Node),
+        ] {
+            assert_eq!(StaleBrowserObject::from_message(message), Some(expected));
+        }
+        for message in [
+            "Invalid InterceptionId.",
+            "No frame for given id found",
+            "Object is gone",
+            "CDP error (Fetch.continueRequest): synthetic rejection",
+        ] {
+            assert_eq!(StaleBrowserObject::from_message(message), None);
+        }
+        assert_eq!(
+            CdpError {
+                code: Some(-32000),
+                message: "Session with given id not found.".into(),
+                data: None,
+            }
+            .stale_object(),
+            Some(StaleBrowserObject::Session)
+        );
     }
 }

@@ -1723,8 +1723,27 @@ impl ClientNetwork {
             }
         }
         if tasks.len() >= 64 {
-            self.broker.quarantine()?;
-            return Err(ProtocolError::CapacityExceeded);
+            // Capacity never quarantines the scope. The callback-only task
+            // bound refuses this occurrence; a paused Fetch request stays
+            // paused for scope cleanup (its pending occurrence is retained)
+            // and dialogs/auth are retired by their cleanup path.
+            super::client_settlement_trace::network_callback_failure(
+                super::client_settlement_trace::NetworkCallbackFailureObservation {
+                    command: super::client_settlement_trace::NetworkTaskCommand::from_method(
+                        &event.method,
+                    ),
+                    failure: super::client_settlement_trace::NetworkFailureClass::EventCapacity,
+                    capacity: Some(super::client_settlement_trace::NetworkCapacityObservation {
+                        reason: super::client_settlement_trace::NetworkCapacityReason::Count,
+                        count: 64,
+                        count_limit: 64,
+                        bytes: 0,
+                        bytes_limit: 0,
+                    }),
+                    ..Default::default()
+                },
+            );
+            return Ok(());
         }
         let callback_event = matches!(
             event.method.as_str(),
@@ -1876,6 +1895,14 @@ impl ClientNetwork {
                 Ok(()) => Ok(()),
                 Err(NetworkTaskFailure::Operation(error)) => Err(error),
                 Err(NetworkTaskFailure::Command(failure)) => {
+                    if failure.local_capacity() {
+                        // A local account pool refused this terminal command
+                        // before any CDP write: no bytes reached the browser,
+                        // no cleanup obligation exists. Keep the paused
+                        // occurrence (scope cleanup still fails it through its
+                        // own admission) and do not quarantine the scope.
+                        return Ok(());
+                    }
                     if failure.request_gone() {
                         // The browser itself proved the exact paused request or
                         // interception is gone (a page-created frame detached
@@ -2723,14 +2750,13 @@ impl ClientNetwork {
         if let Some(prompt) = prompt {
             arguments["promptText"] = json!(prompt);
         }
+        // A pre-submit local refusal carries its own classification so the
+        // callback handler can localize it exactly like a Fetch terminal
+        // command; any other refusal quarantines as before.
         let reservation = self
             .client
-            .reserve_tracked_command(
-                "Page.handleJavaScriptDialog",
-                Some(&arguments),
-                Some(session),
-            )
-            .map_err(|_| ProtocolError::BrowserFailure)?;
+            .reserve_network_task_command("Page.handleJavaScriptDialog", &arguments, session)
+            .map_err(NetworkTaskFailure::Command)?;
         if let Some(reservation) = &reservation {
             let owner = self
                 .client
@@ -6226,7 +6252,13 @@ mod bridge_tests {
         for index in 0..64 {
             network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("held-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
         }
-        assert_eq!(network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"overflow","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}),Err(ProtocolError::CapacityExceeded));
+        // A full callback-task bound refuses only this occurrence; it never
+        // quarantines the scope. The paused request stays tracked for cleanup.
+        assert_eq!(network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"overflow","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}),Ok(()));
+        assert_eq!(
+            network.broker.health().unwrap(),
+            (1, super::super::client_protocol::ScopeState::Usable)
+        );
         network.close().await.unwrap();
         assert_eq!(network.pending_callbacks().unwrap(), 0);
         assert!(events.try_recv().is_err());

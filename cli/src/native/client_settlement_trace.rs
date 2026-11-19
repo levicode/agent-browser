@@ -375,6 +375,22 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_failure: Option<NetworkFailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_stale_object: Option<NetworkStaleObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_reservation: Option<NetworkReservationFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_ledger_error: Option<ProtocolError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_capacity: Option<NetworkCapacityReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_capacity_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_capacity_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_capacity_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_capacity_bytes_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted: Option<bool>,
@@ -1082,8 +1098,33 @@ diagnostic_enum!(NetworkFailureClass {
     ErrorAck,
     InterceptionGone,
     LocalFailure,
+    InitializationCancelled,
+    InitializationDeadline,
+    EventCapacity,
     ChannelClosed,
     Deadline
+});
+// The typed reason a callback terminal command's reservation was refused
+// before any CDP write. `Ledger` carries its closed ProtocolError separately.
+diagnostic_enum!(NetworkReservationFailure {
+    OwnerChanged,
+    OwnerRequired,
+    Ledger
+});
+// Which bound refused a pre-submit command reservation. Count and bytes are
+// the category pool; global is the shared object/descriptor budget.
+diagnostic_enum!(NetworkCapacityReason {
+    Count,
+    Bytes,
+    Global
+});
+// The closed browser object an error ACK reports as already gone. None of
+// these strings is CDP prose; they mirror the fixed predicates.
+diagnostic_enum!(NetworkStaleObject {
+    Session,
+    Frame,
+    Object,
+    Node
 });
 impl NetworkTaskCommand {
     pub(crate) fn from_method(method: &str) -> Self {
@@ -1097,15 +1138,51 @@ impl NetworkTaskCommand {
         }
     }
 }
-pub(crate) fn network_callback_failure(command: NetworkTaskCommand, failure: NetworkFailureClass) {
+impl NetworkStaleObject {
+    pub(crate) fn from_browser_object(value: super::cdp::types::StaleBrowserObject) -> Self {
+        match value {
+            super::cdp::types::StaleBrowserObject::Session => Self::Session,
+            super::cdp::types::StaleBrowserObject::Frame => Self::Frame,
+            super::cdp::types::StaleBrowserObject::Object => Self::Object,
+            super::cdp::types::StaleBrowserObject::Node => Self::Node,
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub(crate) struct NetworkCapacityObservation {
+    pub reason: NetworkCapacityReason,
+    pub count: u64,
+    pub count_limit: u64,
+    pub bytes: u64,
+    pub bytes_limit: u64,
+}
+#[derive(Clone, Default)]
+pub(crate) struct NetworkCallbackFailureObservation {
+    pub command: NetworkTaskCommand,
+    pub failure: NetworkFailureClass,
+    pub stale_object: Option<NetworkStaleObject>,
+    pub reservation: Option<NetworkReservationFailure>,
+    pub ledger_error: Option<ProtocolError>,
+    pub capacity: Option<NetworkCapacityObservation>,
+}
+pub(crate) fn network_callback_failure(observation: NetworkCallbackFailureObservation) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        let capacity = observation.capacity;
         record_capture(
             capture,
-            0,
+            super::client_debt::current_operation_sequence(),
             Phase::NetworkCallbackFailure,
             Facts {
-                network_command: Some(command),
-                network_failure: Some(failure),
+                network_command: Some(observation.command),
+                network_failure: Some(observation.failure),
+                network_stale_object: observation.stale_object,
+                network_reservation: observation.reservation,
+                network_ledger_error: observation.ledger_error,
+                network_capacity: capacity.map(|value| value.reason),
+                network_capacity_count: capacity.map(|value| value.count),
+                network_capacity_limit: capacity.map(|value| value.count_limit),
+                network_capacity_bytes: capacity.map(|value| value.bytes),
+                network_capacity_bytes_limit: capacity.map(|value| value.bytes_limit),
                 ..Facts::default()
             },
         );
@@ -4236,6 +4313,28 @@ mod isolation_tests {
     fn kinds() -> serde_json::Value {
         serde_json::Value::Array((0..12).map(|_| serde_json::json!(0)).collect())
     }
+    /// Facts keys only, without the ten common record fields.
+    fn fact_keys(record: &serde_json::Value) -> Vec<&str> {
+        const COMMON: [&str; 10] = [
+            "schemaVersion",
+            "source",
+            "pid",
+            "record",
+            "operationSeq",
+            "phase",
+            "droppedBefore",
+            "emittedBefore",
+            "suppressedBefore",
+            "overflow",
+        ];
+        record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !COMMON.contains(key))
+            .collect()
+    }
 
     #[test]
     fn each_isolation_layer_names_its_call_point_in_a_closed_record() {
@@ -4292,10 +4391,43 @@ mod isolation_tests {
         }
         ClientTargets::new("context".into(), "scope".into()).seal();
         ClientSession::new().quarantine().unwrap();
-        network_callback_failure(
-            NetworkTaskCommand::ContinueRequest,
-            NetworkFailureClass::InterceptionGone,
-        );
+        network_callback_failure(NetworkCallbackFailureObservation {
+            command: NetworkTaskCommand::ContinueRequest,
+            failure: NetworkFailureClass::InterceptionGone,
+            ..Default::default()
+        });
+        network_callback_failure(NetworkCallbackFailureObservation {
+            command: NetworkTaskCommand::FulfillRequest,
+            failure: NetworkFailureClass::LocalFailure,
+            stale_object: Some(NetworkStaleObject::Session),
+            ..Default::default()
+        });
+        network_callback_failure(NetworkCallbackFailureObservation {
+            command: NetworkTaskCommand::FailRequest,
+            failure: NetworkFailureClass::ReservationRejected,
+            reservation: Some(NetworkReservationFailure::Ledger),
+            ledger_error: Some(ProtocolError::StaleScope),
+            ..Default::default()
+        });
+        network_callback_failure(NetworkCallbackFailureObservation {
+            command: NetworkTaskCommand::ContinueWithAuth,
+            failure: NetworkFailureClass::InitializationCancelled,
+            ..Default::default()
+        });
+        network_callback_failure(NetworkCallbackFailureObservation {
+            command: NetworkTaskCommand::ContinueRequest,
+            failure: NetworkFailureClass::ReservationRejected,
+            reservation: Some(NetworkReservationFailure::Ledger),
+            ledger_error: Some(ProtocolError::CapacityExceeded),
+            capacity: Some(NetworkCapacityObservation {
+                reason: NetworkCapacityReason::Count,
+                count: 32,
+                count_limit: 32,
+                bytes: 9_120,
+                bytes_limit: 65_536,
+            }),
+            ..Default::default()
+        });
         let records = rows(&file);
         // The caller is this test, which is exactly what `#[track_caller]` must
         // report: the transition function must not claim its own line. The
@@ -4326,7 +4458,57 @@ mod isolation_tests {
             .expect("network callback failure wrote no record");
         assert_eq!(callback["operationSeq"], 0);
         assert_eq!(callback["networkFailure"], "interception-gone");
-        assert_eq!(callback.as_object().unwrap().len(), 5);
+        assert_eq!(fact_keys(callback), ["networkCommand", "networkFailure"]);
+        let stale = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure"
+                    && record["networkCommand"] == "fulfill-request"
+            })
+            .expect("network callback failure with a gone object wrote no record");
+        assert_eq!(stale["networkStaleObject"], "session");
+        assert_eq!(
+            fact_keys(stale),
+            ["networkCommand", "networkFailure", "networkStaleObject"]
+        );
+        let refused = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure"
+                    && record["networkCommand"] == "fail-request"
+            })
+            .expect("reservation refusal wrote no record");
+        assert_eq!(refused["networkFailure"], "reservation-rejected");
+        assert_eq!(refused["networkReservation"], "ledger");
+        assert_eq!(refused["networkLedgerError"], "stale-scope");
+        assert_eq!(
+            fact_keys(refused),
+            [
+                "networkCommand",
+                "networkFailure",
+                "networkLedgerError",
+                "networkReservation"
+            ]
+        );
+        let full = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure" && record["networkCapacity"] == "count"
+            })
+            .expect("capacity refusal wrote no record");
+        assert_eq!(full["networkCapacityCount"], 32);
+        assert_eq!(full["networkCapacityLimit"], 32);
+        assert_eq!(full["networkCapacityBytes"], 9_120);
+        assert_eq!(full["networkCapacityBytesLimit"], 65_536);
+        let cancelled = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure"
+                    && record["networkCommand"] == "continue-with-auth"
+            })
+            .expect("initialization cancellation wrote no record");
+        assert_eq!(cancelled["networkFailure"], "initialization-cancelled");
+        assert_eq!(fact_keys(cancelled), ["networkCommand", "networkFailure"]);
     }
 }
 
