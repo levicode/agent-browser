@@ -97,6 +97,10 @@ pub(crate) struct NetworkCommandFailure {
     /// targeted (a page-created frame can detach while a network decision is
     /// in flight). The command is moot, not a lost scope-cleanup proof.
     request_gone: bool,
+    /// A local account pool refused the reservation before any CDP write. No
+    /// browser side effect or cleanup obligation exists, so the callback is a
+    /// local failure rather than a lost scope-cleanup proof.
+    local_capacity: bool,
 }
 impl std::fmt::Debug for NetworkCommandFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,12 +116,16 @@ impl NetworkCommandFailure {
     pub(crate) fn request_gone(&self) -> bool {
         self.request_gone
     }
+    pub(crate) fn local_capacity(&self) -> bool {
+        self.local_capacity
+    }
 }
 impl From<String> for NetworkCommandFailure {
     fn from(_: String) -> Self {
         Self {
             retirement: None,
             request_gone: false,
+            local_capacity: false,
         }
     }
 }
@@ -354,25 +362,63 @@ async fn retire_detached_waiters(pending: &PendingMap, event: &CdpEvent) {
         .await
         .retain(|_, waiter| waiter.session.as_deref() != Some(session));
 }
+/// The initialization budget's own outer outcome, kept distinct from the
+/// command pipeline's legacy string error so a callback can record which one
+/// actually stopped it.
+enum InitializationFailure {
+    Cancelled,
+    Deadline,
+    Inner(String),
+}
+impl InitializationFailure {
+    fn legacy_message(self) -> String {
+        match self {
+            Self::Cancelled => "Native initialization cancelled".into(),
+            Self::Deadline => "Native initialization deadline expired".into(),
+            Self::Inner(message) => message,
+        }
+    }
+}
+/// The closed diagnostics projection of a reservation refusal. Kept separate
+/// from the legacy String the failure value still carries.
+fn callback_reservation_failure(
+    failure: &TrackedReservationFailure,
+) -> (
+    Option<super::super::client_settlement_trace::NetworkReservationFailure>,
+    Option<ProtocolError>,
+) {
+    use super::super::client_settlement_trace::NetworkReservationFailure;
+    match failure {
+        TrackedReservationFailure::OwnerChanged => {
+            (Some(NetworkReservationFailure::OwnerChanged), None)
+        }
+        TrackedReservationFailure::OwnerRequired => {
+            (Some(NetworkReservationFailure::OwnerRequired), None)
+        }
+        TrackedReservationFailure::Ledger(error) => {
+            (Some(NetworkReservationFailure::Ledger), Some(error.clone()))
+        }
+    }
+}
 async fn within_initialization<T>(
     budget: Option<(
         std::time::Instant,
         watch::Receiver<super::super::client_session::CancelSignal>,
     )>,
     future: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+) -> Result<T, InitializationFailure> {
     if let Some((deadline, mut cancellation)) = budget {
         if *cancellation.borrow() != super::super::client_session::CancelSignal::None {
-            return Err("Native initialization cancelled".into());
+            return Err(InitializationFailure::Cancelled);
         }
         tokio::select! {
             biased;
-            _ = cancellation.changed() => Err("Native initialization cancelled".into()),
-            _ = tokio::time::sleep_until(deadline.into()) => Err("Native initialization deadline expired".into()),
-            result = future => result,
+            _ = cancellation.changed() => Err(InitializationFailure::Cancelled),
+            _ = tokio::time::sleep_until(deadline.into()) => Err(InitializationFailure::Deadline),
+            result = future => result.map_err(InitializationFailure::Inner),
         }
     } else {
-        future.await
+        future.await.map_err(InitializationFailure::Inner)
     }
 }
 type WsTx = Arc<
@@ -1850,14 +1896,88 @@ impl CdpClient {
                 | "Fetch.continueWithAuth"
                 | "Page.handleJavaScriptDialog"
         ) {
+            super::super::client_settlement_trace::network_callback_failure(
+                super::super::client_settlement_trace::NetworkCallbackFailureObservation {
+                    command: super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
+                    failure: super::super::client_settlement_trace::NetworkFailureClass::ReservationRejected,
+                    ..Default::default()
+                },
+            );
             return Err(NetworkCommandFailure {
                 retirement: None,
                 request_gone: false,
+                local_capacity: false,
             });
         }
-        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        let reservation = self.reserve_network_task_command(method, &params, session)?;
         self.send_reserved_network_task_command(method, params, session, reservation)
             .await
+    }
+    /// One callback terminal command's reservation, recorded unconditionally so
+    /// a refusal names its closed protocol cause instead of only "rejected".
+    /// The legacy String projection is unchanged for the failure value.
+    pub(crate) fn reserve_network_task_command(
+        &self,
+        method: &str,
+        params: &Value,
+        session: &str,
+    ) -> Result<Option<CommandReservation>, NetworkCommandFailure> {
+        let mut stop = AdmissionObservation::default();
+        match self.reserve_tracked_command_observed_typed(
+            method,
+            Some(params),
+            Some(session),
+            &mut stop,
+        ) {
+            Ok(reservation) => Ok(reservation),
+            Err(failure) => {
+                let (reservation, ledger_error) = callback_reservation_failure(&failure);
+                let capacity = match &failure {
+                    TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded) => {
+                        super::super::client_debt::OwnerDebtLedger::take_last_capacity_refusal()
+                            .map(|refusal| {
+                                use super::super::client_settlement_trace::NetworkCapacityReason;
+                                super::super::client_settlement_trace::NetworkCapacityObservation {
+                                    reason: match refusal.reason {
+                                        super::super::client_debt::CapacityRefusalReason::Count => {
+                                            NetworkCapacityReason::Count
+                                        }
+                                        super::super::client_debt::CapacityRefusalReason::Bytes => {
+                                            NetworkCapacityReason::Bytes
+                                        }
+                                        super::super::client_debt::CapacityRefusalReason::Global => {
+                                            NetworkCapacityReason::Global
+                                        }
+                                    },
+                                    count: refusal.count,
+                                    count_limit: refusal.count_limit,
+                                    bytes: refusal.bytes,
+                                    bytes_limit: refusal.bytes_limit,
+                                }
+                            })
+                    }
+                    _ => None,
+                };
+                super::super::client_settlement_trace::network_callback_failure(
+                    super::super::client_settlement_trace::NetworkCallbackFailureObservation {
+                        command: super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
+                        failure: super::super::client_settlement_trace::NetworkFailureClass::ReservationRejected,
+                        reservation,
+                        ledger_error,
+                        capacity,
+                        ..Default::default()
+                    },
+                );
+                Err(NetworkCommandFailure {
+                    retirement: None,
+                    request_gone: false,
+                    local_capacity: matches!(
+                        failure,
+                        TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded)
+                    ),
+                })
+            }
+        }
     }
     /// Dialogs already own a reservation/status used by borrowed cleanup. Reuse
     /// that exact reservation rather than charging or submitting a second one.
@@ -1879,7 +1999,7 @@ impl CdpClient {
         session: &str,
         deadline: std::time::Instant,
     ) -> Result<Value, NetworkCommandFailure> {
-        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        let reservation = self.reserve_network_task_command(method, &params, session)?;
         self.send_reserved_network_task_command_bound(
             method,
             params,
@@ -1908,9 +2028,20 @@ impl CdpClient {
             reservation.is_owner_cleanup()
                 || !reservation.matches_envelope(method, Some(&params), Some(session))
         }) {
+            super::super::client_settlement_trace::network_callback_failure(
+                super::super::client_settlement_trace::NetworkCallbackFailureObservation {
+                    command: super::super::client_settlement_trace::NetworkTaskCommand::from_method(
+                        method,
+                    ),
+                    failure:
+                        super::super::client_settlement_trace::NetworkFailureClass::EnvelopeMismatch,
+                    ..Default::default()
+                },
+            );
             return Err(NetworkCommandFailure {
                 retirement: None,
                 request_gone: false,
+                local_capacity: false,
             });
         }
         let mut capture = match (self.owner.as_ref(), reservation.as_ref()) {
@@ -1928,6 +2059,22 @@ impl CdpClient {
             .as_ref()
             .and_then(CommandReservation::initialization_budget);
         let mut request_gone = false;
+        // Closed evidence for the callback-command failure branch: which fixed
+        // terminal command failed and at which stage, never the CDP prose.
+        let command =
+            super::super::client_settlement_trace::NetworkTaskCommand::from_method(method);
+        let failure = |class, stale_object, reservation, ledger_error, capacity| {
+            super::super::client_settlement_trace::network_callback_failure(
+                super::super::client_settlement_trace::NetworkCallbackFailureObservation {
+                    command,
+                    failure: class,
+                    stale_object,
+                    reservation,
+                    ledger_error,
+                    capacity,
+                },
+            );
+        };
         let result = within_initialization(budget, async {
             let response = self
                 .submit_reserved_command_bound(
@@ -1937,7 +2084,16 @@ impl CdpClient {
                     reservation,
                     None,
                 )
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::SubmitFailed,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                })?;
             let reply = self
                 .await_command_reply_observed(response, response_deadline, capture.as_mut())
                 .await;
@@ -1949,26 +2105,92 @@ impl CdpClient {
                     // detached). Nothing application-visible is left paused;
                     // the callback owner settles instead of quarantining the
                     // whole scope for a moot terminal command.
-                    if error.is_interception_not_found() {
+                    let interception_gone = error.is_interception_not_found();
+                    if interception_gone {
                         request_gone = true;
                     }
+                    failure(
+                        if interception_gone {
+                            super::super::client_settlement_trace::NetworkFailureClass::InterceptionGone
+                        } else {
+                            super::super::client_settlement_trace::NetworkFailureClass::ErrorAck
+                        },
+                        error
+                            .stale_object()
+                            .map(super::super::client_settlement_trace::NetworkStaleObject::from_browser_object),
+                        None,
+                        None,
+                        None,
+                    );
                     Err(format!("CDP error ({}): {}", method, error))
                 }
                 // These fixed terminal methods carry no remote-object courier.
                 // An unvalidated envelope is never a success or retirement ACK.
-                Ok(CommandReply::LocalFailure(_)) => {
+                Ok(CommandReply::LocalFailure(response)) => {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::LocalFailure,
+                        response
+                            .error
+                            .as_ref()
+                            .and_then(CdpError::stale_object)
+                            .map(super::super::client_settlement_trace::NetworkStaleObject::from_browser_object),
+                        None,
+                        None,
+                        None,
+                    );
                     Err("Unvalidated network terminal reply".into())
                 }
-                Err(CommandWaitFailure::ChannelClosed) => Err("CDP response channel closed".into()),
+                Err(CommandWaitFailure::ChannelClosed) => {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::ChannelClosed,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                    Err("CDP response channel closed".into())
+                }
                 Err(CommandWaitFailure::Deadline) => {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::Deadline,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
                     Err(format!("CDP command timed out: {}", method))
                 }
             }
         })
         .await;
+        let result = match result {
+            Ok(result) => Ok(result),
+            Err(InitializationFailure::Inner(message)) => Err(message),
+            Err(InitializationFailure::Cancelled) => {
+                failure(
+                    super::super::client_settlement_trace::NetworkFailureClass::InitializationCancelled,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                Err("Native initialization cancelled".into())
+            }
+            Err(InitializationFailure::Deadline) => {
+                failure(
+                    super::super::client_settlement_trace::NetworkFailureClass::InitializationDeadline,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                Err("Native initialization deadline expired".into())
+            }
+        };
         result.map_err(|_| NetworkCommandFailure {
             retirement: capture.and_then(|capture| capture.retirement),
             request_gone,
+            local_capacity: false,
         })
     }
     fn capture_network_retirement(&self, capture: &mut NetworkFailureCapture) {
@@ -2193,7 +2415,8 @@ impl CdpClient {
                         Some((expected.clone(), deadline)),
                     ),
                 )
-                .await?;
+                .await
+                .map_err(InitializationFailure::legacy_message)?;
                 Ok((response, budget, status))
             };
             let submitted = tokio::time::timeout_at(deadline.into(), submission)
@@ -2735,6 +2958,7 @@ impl CdpClient {
             ),
         )
         .await
+        .map_err(InitializationFailure::legacy_message)
     }
     /// Fixed cleanup for an interrupted navigation in the existing producer.
     /// Preserve its journal/input debt and check the absolute cleanup bound
@@ -3359,6 +3583,7 @@ impl CdpClient {
                 .map_err(|e| format!("Failed to send CDP command: {}", e))
         })
         .await
+        .map_err(InitializationFailure::legacy_message)
     }
 
     /// Send raw JSON through the WebSocket without tracking a response.
@@ -3668,6 +3893,29 @@ mod owner_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_reservation_refusal_keeps_its_typed_reason() {
+        use crate::native::client_protocol::ProtocolError;
+        use crate::native::client_settlement_trace::NetworkReservationFailure;
+        assert_eq!(
+            callback_reservation_failure(&TrackedReservationFailure::OwnerChanged),
+            (Some(NetworkReservationFailure::OwnerChanged), None)
+        );
+        assert_eq!(
+            callback_reservation_failure(&TrackedReservationFailure::OwnerRequired),
+            (Some(NetworkReservationFailure::OwnerRequired), None)
+        );
+        assert_eq!(
+            callback_reservation_failure(&TrackedReservationFailure::Ledger(
+                ProtocolError::StaleScope
+            )),
+            (
+                Some(NetworkReservationFailure::Ledger),
+                Some(ProtocolError::StaleScope)
+            )
+        );
+    }
+
     #[tokio::test]
     async fn point_drag_setup_preserves_only_typed_local_capacity_and_exact_cancellation() {
         use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};

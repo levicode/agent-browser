@@ -705,6 +705,180 @@ async fn invalid_interception_ack_retires_the_callback_without_quarantining() {
     close_peer(peer).await;
 }
 
+#[tokio::test]
+async fn many_paused_requests_never_quarantine_the_scope() {
+    let peer = peer().await;
+    let broker = Arc::new(ClientSession::new());
+    let (sink, _emitted) = ClientEventSink::test_channel(broker.clone());
+    let scope = BlobScope {
+        generation: 1,
+        identity_scope: SCOPE.into(),
+    };
+    let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+    blobs.activate_scope(scope.clone()).unwrap();
+    let network = Arc::new(ClientNetwork::new(
+        peer.client.clone(),
+        broker.clone(),
+        sink,
+        scope,
+        blobs,
+        Arc::new(super::super::client_ui::UiGate::default()),
+        NetworkPolicy::default(),
+    ));
+    enroll(&network, CHILD_SESSION, CHILD_SESSION, false);
+    let operation = broker.admit(1, 1, 5_000).unwrap();
+    assert!(broker.start(1, 1).unwrap());
+    let _ = operation;
+    let mut peer = peer;
+    // Hundreds of paused requests exceed the bounded callback-task slots. A
+    // full bound refuses only the extra occurrences; it must never quarantine
+    // the scope or cancel the page read.
+    for index in 0..200 {
+        peer.emit
+            .send(
+                json!({"method":"Fetch.requestPaused","sessionId":CHILD_SESSION,
+                "params":{"requestId":format!("burst-{index}"),
+                "request":{"url":"https://fixture.invalid/burst","method":"GET","headers":{}}}}),
+            )
+            .unwrap();
+        let event = tokio::time::timeout(WAIT, peer.reader.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.method, "Fetch.requestPaused");
+        network.event(&event).unwrap();
+    }
+    assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+    assert_eq!(network.pending_interceptions.lock().unwrap().len(), 200);
+    assert_eq!(peer.ledger.snapshot().outstanding_commands, 0);
+    // The page read still completes on the usable scope.
+    let client = peer.client.clone();
+    let read = tokio::spawn(async move {
+        client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"location.href"})),
+                Some(ROOT_SESSION),
+            )
+            .await
+    });
+    let request = next_command(&mut peer, "Runtime.evaluate", ROOT_SESSION).await;
+    peer.emit
+        .send(json!({"id":request["id"],"sessionId":ROOT_SESSION,
+            "result":{"result":{"type":"string","value":"https://fixture.invalid/a"}}}))
+        .unwrap();
+    let value = tokio::time::timeout(WAIT, read).await.unwrap().unwrap();
+    assert_eq!(
+        value.unwrap()["result"]["value"],
+        "https://fixture.invalid/a"
+    );
+}
+
+#[tokio::test]
+async fn pre_submit_capacity_refusal_keeps_the_scope_usable() {
+    let mut peer = peer().await;
+    let broker = Arc::new(ClientSession::new());
+    let (sink, mut emitted) = ClientEventSink::test_channel(broker.clone());
+    let scope = BlobScope {
+        generation: 1,
+        identity_scope: SCOPE.into(),
+    };
+    let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+    blobs.activate_scope(scope.clone()).unwrap();
+    let network = Arc::new(ClientNetwork::new(
+        peer.client.clone(),
+        broker.clone(),
+        sink,
+        scope,
+        blobs,
+        Arc::new(super::super::client_ui::UiGate::default()),
+        NetworkPolicy::default(),
+    ));
+    enroll(&network, CHILD_SESSION, CHILD_SESSION, false);
+    let operation = broker.admit(1, 1, 5_000).unwrap();
+    assert!(broker.start(1, 1).unwrap());
+    let _ = operation;
+    // The exact account pool the terminal Fetch command charges is full, so
+    // its reservation is refused locally before any CDP write.
+    peer.ledger.saturate_security_pool_for_test();
+    let (entered, release) = take_result_gate(&network);
+    peer.emit
+        .send(json!({"method":"Fetch.requestPaused","sessionId":CHILD_SESSION,
+            "params":{"requestId":"capacity-request","request":{"url":"https://fixture.invalid/beacon",
+            "method":"POST","headers":{},"postData":"fixed"}}}))
+        .unwrap();
+    let event = tokio::time::timeout(WAIT, peer.reader.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.method, "Fetch.requestPaused");
+    network.event(&event).unwrap();
+    let event = tokio::time::timeout(WAIT, emitted.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let ServerMessage::Event {
+        event,
+        decision: Some(token),
+        ..
+    } = event
+    else {
+        panic!("expected actual request callback decision");
+    };
+    assert_eq!(event, "network.request");
+    broker
+        .resolve(
+            1,
+            &token.token,
+            Decision::Continue {
+                overrides: Default::default(),
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(WAIT, entered).await.unwrap().unwrap();
+    release.send(()).unwrap();
+    let outcome = join_network_task(&network).await;
+    // A pre-submit local refusal is not a lost cleanup proof: nothing reached
+    // the browser, so the scope stays usable and the occurrence stays paused
+    // for scope cleanup (which has its own admission).
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+    assert_eq!(network.pending_interceptions.lock().unwrap().len(), 1);
+    let debt = peer.ledger.snapshot();
+    assert_eq!(debt.outstanding_commands, 0);
+    assert!(!debt.integrity_lost);
+    assert!(
+        peer.log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|command| command["method"] != "Fetch.continueRequest"),
+        "a refused reservation must not write the terminal command"
+    );
+    // The page read on the surviving root session still works.
+    let client = peer.client.clone();
+    let read = tokio::spawn(async move {
+        client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"location.href"})),
+                Some(ROOT_SESSION),
+            )
+            .await
+    });
+    let request = next_command(&mut peer, "Runtime.evaluate", ROOT_SESSION).await;
+    peer.emit
+        .send(json!({"id":request["id"],"sessionId":ROOT_SESSION,
+            "result":{"result":{"type":"string","value":"https://fixture.invalid/a"}}}))
+        .unwrap();
+    let value = tokio::time::timeout(WAIT, read).await.unwrap().unwrap();
+    assert_eq!(
+        value.unwrap()["result"]["value"],
+        "https://fixture.invalid/a"
+    );
+    close_peer(peer).await;
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LocalFailureCase {
     ForeignSessionThenDetach,

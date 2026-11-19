@@ -5,6 +5,7 @@ use super::cdp::types::{CdpEvent, CdpMessage};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -503,6 +504,27 @@ impl CommandCategory {
         matches!(self, Self::ApplicationInput | Self::CleanupInput)
     }
 }
+/// Which bound refused a command reservation, with the observed counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapacityRefusalReason {
+    Count,
+    Bytes,
+    Global,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CapacityRefusal {
+    pub reason: CapacityRefusalReason,
+    pub count: u64,
+    pub count_limit: u64,
+    pub bytes: u64,
+    pub bytes_limit: u64,
+}
+thread_local! {
+    /// Set synchronously by the refusing reservation and taken by its exact
+    /// same-thread caller; never a cross-command or cross-thread cache.
+    static LAST_CAPACITY_REFUSAL: Cell<Option<CapacityRefusal>> = const { Cell::new(None) };
+}
+
 #[derive(Clone, Default)]
 struct JournalState {
     mutation_dispatched: bool,
@@ -3194,6 +3216,18 @@ impl OwnerDebtLedger {
         Ok(ReadonlyRelease::Reserved(reservation))
     }
 
+    /// Takes the capacity breakdown of the refusal this same thread just
+    /// observed. No other path reads it.
+    pub(crate) fn take_last_capacity_refusal() -> Option<CapacityRefusal> {
+        LAST_CAPACITY_REFUSAL.with(|slot| slot.take())
+    }
+    #[cfg(test)]
+    pub(crate) fn saturate_security_pool_for_test(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let index = CommandCategory::Security.index();
+            state.counts[index] = CommandCategory::Security.limits().0;
+        }
+    }
     pub(crate) fn reserve_command_observed(
         self: &Arc<Self>,
         journal: Option<&OperationJournalHandle>,
@@ -3694,23 +3728,41 @@ impl OwnerDebtLedger {
                 + object_group.as_ref().map_or(0, String::len);
         let index = classification.category.index();
         let (maximum_count, maximum_bytes) = classification.category.limits();
-        if state.counts[index] >= maximum_count
-            || state.bytes[index]
-                .checked_add(footprint)
-                .is_none_or(|bytes| bytes > maximum_bytes)
-            || object_count(&state)
-                .checked_add(creation_slots + usize::from(new_group_footprint > 0))
-                .is_none_or(|count| count > MAX_OBJECT_DEBT as usize)
-            || descriptor_usage(&state)
-                .saturating_add(footprint)
-                .saturating_add(new_group_footprint)
-                .saturating_add(creation_slots * 8448)
-                > if classification.category == CommandCategory::Destroy {
-                    512 * 1024
-                } else {
-                    508 * 1024
-                }
-        {
+        let count = state.counts[index];
+        let bytes = state.bytes[index];
+        let count_over = count >= maximum_count;
+        let bytes_over = bytes
+            .checked_add(footprint)
+            .is_none_or(|bytes| bytes > maximum_bytes);
+        let object_over = object_count(&state)
+            .checked_add(creation_slots + usize::from(new_group_footprint > 0))
+            .is_none_or(|count| count > MAX_OBJECT_DEBT as usize);
+        let descriptor_over = descriptor_usage(&state)
+            .saturating_add(footprint)
+            .saturating_add(new_group_footprint)
+            .saturating_add(creation_slots * 8448)
+            > if classification.category == CommandCategory::Destroy {
+                512 * 1024
+            } else {
+                508 * 1024
+            };
+        if count_over || bytes_over || object_over || descriptor_over {
+            let reason = if count_over {
+                CapacityRefusalReason::Count
+            } else if bytes_over {
+                CapacityRefusalReason::Bytes
+            } else {
+                CapacityRefusalReason::Global
+            };
+            LAST_CAPACITY_REFUSAL.with(|slot| {
+                slot.set(Some(CapacityRefusal {
+                    reason,
+                    count: count as u64,
+                    count_limit: maximum_count as u64,
+                    bytes: bytes as u64,
+                    bytes_limit: maximum_bytes as u64,
+                }));
+            });
             return Err(ProtocolError::CapacityExceeded);
         }
         let id = state
@@ -5439,6 +5491,26 @@ pub(crate) mod tests {
             .unwrap();
         (ledger, journal)
     }
+    #[test]
+    fn saturated_security_pool_refusal_names_the_binding_bound() {
+        let (ledger, _journal) = owner();
+        ledger.saturate_security_pool_for_test();
+        let result = ledger.reserve_command_observed(
+            None,
+            "Fetch.continueRequest",
+            None,
+            Some("page"),
+            &mut AdmissionObservation::default(),
+        );
+        assert!(matches!(result, Err(ProtocolError::CapacityExceeded)));
+        let refusal = OwnerDebtLedger::take_last_capacity_refusal().unwrap();
+        assert_eq!(refusal.reason, CapacityRefusalReason::Count);
+        assert_eq!(refusal.count, 32);
+        assert_eq!(refusal.count_limit, 32);
+        assert_eq!(refusal.bytes_limit, 64 * 1024);
+        assert!(OwnerDebtLedger::take_last_capacity_refusal().is_none());
+    }
+
     #[test]
     fn exact_session_retirement_requires_the_applied_detach_and_intact_ledger() {
         let (ledger, _journal) = owner();
