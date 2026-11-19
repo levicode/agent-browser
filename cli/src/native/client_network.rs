@@ -1722,7 +1722,11 @@ impl ClientNetwork {
                 return Err(ProtocolError::BrowserFailure);
             }
         }
-        if tasks.len() >= 64 {
+        // A paused-request wave can legitimately exceed the old 64-task bound
+        // while its terminal commands drain through a smaller account pool.
+        // Keep the same bounded admission as the UI gate's callback cap so a
+        // real overload still fails closed, without quarantining the wave.
+        if tasks.len() >= 256 {
             self.broker.quarantine()?;
             return Err(ProtocolError::CapacityExceeded);
         }
@@ -6223,7 +6227,7 @@ mod bridge_tests {
         network.sessions.lock().unwrap()["owned"]
             .configuration_ready
             .send_replace(false);
-        for index in 0..64 {
+        for index in 0..256 {
             network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("held-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
         }
         assert_eq!(network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"overflow","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}),Err(ProtocolError::CapacityExceeded));

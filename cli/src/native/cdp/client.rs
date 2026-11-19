@@ -1855,7 +1855,28 @@ impl CdpClient {
                 request_gone: false,
             });
         }
-        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        // A protected read and a wave of paused-request decisions overlap: both
+        // charge fixed terminal commands against the same account pools. When
+        // one admission is refused only because a pool is momentarily full,
+        // wait for a slot instead of quarantining the scope; the command still
+        // fails closed once the bounded window expires.
+        let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reservation = loop {
+            match self.reserve_tracked_command_observed_typed(
+                method,
+                Some(&params),
+                Some(session),
+                &mut AdmissionObservation::default(),
+            ) {
+                Ok(reservation) => break reservation,
+                Err(TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded))
+                    if std::time::Instant::now() < retry_deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+                Err(failure) => return Err(failure.legacy_message().to_owned().into()),
+            }
+        };
         self.send_reserved_network_task_command(method, params, session, reservation)
             .await
     }
