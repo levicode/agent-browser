@@ -397,6 +397,8 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_stage: Option<ActionStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_preflight_reason: Option<ActionPreflightReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub action_cdp_method: Option<ActionCdpMethod>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_cdp_failure: Option<ActionCdpFailure>,
@@ -1183,9 +1185,15 @@ diagnostic_enum!(ActionKind {
 });
 // The last fallible step the action reached. Together with the CDP method and
 // failure class this names where a `browser-failure` was produced without
-// recording any selector, node identity, coordinate or renderer prose.
+// recording any selector, node identity, coordinate or renderer prose. The
+// admission and preflight stages exist because a `browser.perform` can be
+// refused before `ClientActions::execute` ever runs.
 diagnostic_enum!(ActionStage {
     Unknown,
+    Admission,
+    FrameInventory,
+    GeometrySnapshot,
+    ReferenceSnapshot,
     Locate,
     FrameOwner,
     Visibility,
@@ -1198,6 +1206,34 @@ diagnostic_enum!(ActionStage {
     Keyboard,
     Settle
 });
+// Which check inside an action preflight refused the operation. The stage names
+// the preflight; this closed reason names the check that failed inside it, so a
+// receipt produced before the action context exists is still explainable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ActionPreflightReason {
+    FrameTopology,
+    FrameTargetUnenrolled,
+    FrameBinding,
+    FrameCancelled,
+    FrameDeadline,
+    FrameCleanup,
+    FrameRead,
+    GeometryInvalid,
+    GeometryIncomplete,
+    GeometryStale,
+    GeometryCancelled,
+    GeometrySuperseded,
+    GeometryDeadline,
+    GeometryBackend,
+    GeometryCleanup,
+    ReferenceUnavailable,
+    ReferenceStale,
+    ReferenceCancelled,
+    ReferenceDeadline,
+    ReferencePublication,
+    ReferenceFailed,
+}
 // Fixed CDP methods an action may issue. Any other method maps to `Other`.
 diagnostic_enum!(ActionCdpMethod {
     Other,
@@ -1264,6 +1300,10 @@ impl ActionStage {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
+            Self::Admission => "admission",
+            Self::FrameInventory => "frame-inventory",
+            Self::GeometrySnapshot => "geometry-snapshot",
+            Self::ReferenceSnapshot => "reference-snapshot",
             Self::Locate => "locate",
             Self::FrameOwner => "frame-owner",
             Self::Visibility => "visibility",
@@ -1311,6 +1351,7 @@ impl ActionStaleObject {
 pub(crate) struct ActionFailureObservation {
     pub kind: ActionKind,
     pub stage: ActionStage,
+    pub preflight: Option<ActionPreflightReason>,
     pub method: Option<ActionCdpMethod>,
     pub failure: Option<ActionCdpFailure>,
     pub stale_object: Option<ActionStaleObject>,
@@ -1333,6 +1374,7 @@ pub(crate) fn action_failure(operation_seq: u64, observation: ActionFailureObser
             Facts {
                 action_kind: Some(observation.kind),
                 action_stage: Some(observation.stage),
+                action_preflight_reason: observation.preflight,
                 action_cdp_method: observation.method,
                 action_cdp_failure: observation.failure,
                 action_stale_object: observation.stale_object,

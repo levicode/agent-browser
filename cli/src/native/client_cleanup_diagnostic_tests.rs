@@ -1090,3 +1090,57 @@ fn semantic_read_failure_maximal_closed_record_keeps_existing_byte_bound() {
         assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
     }
 }
+
+#[test]
+fn action_failure_names_a_preflight_stage_and_closed_reason() {
+    for (stage, reason, stage_name, reason_name) in [
+        (
+            ActionStage::FrameInventory,
+            ActionPreflightReason::FrameTopology,
+            "frame-inventory",
+            "frame-topology",
+        ),
+        (
+            ActionStage::GeometrySnapshot,
+            ActionPreflightReason::GeometryStale,
+            "geometry-snapshot",
+            "geometry-stale",
+        ),
+        (
+            ActionStage::ReferenceSnapshot,
+            ActionPreflightReason::ReferenceUnavailable,
+            "reference-snapshot",
+            "reference-unavailable",
+        ),
+    ] {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: std::process::id(),
+            record: 1,
+            operation_seq: 7,
+            phase: Phase::ActionFailure,
+            dropped_before: 0,
+            emitted_before: 0,
+            suppressed_before: 0,
+            overflow: false,
+            facts: Facts {
+                action_kind: Some(ActionKind::Swipe),
+                action_stage: Some(stage),
+                action_preflight_reason: Some(reason),
+                error: Some(ProtocolError::BrowserFailure),
+                effects: Some(Effects::NotDispatched),
+                ..Facts::default()
+            },
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["phase"], "ActionFailure");
+        assert_eq!(value["operationSeq"], 7);
+        assert_eq!(value["actionKind"], "swipe");
+        assert_eq!(value["actionStage"], stage_name);
+        assert_eq!(value["actionPreflightReason"], reason_name);
+        assert_eq!(value["error"], "browser-failure");
+        assert_eq!(value["effects"], "not-dispatched");
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+    }
+}

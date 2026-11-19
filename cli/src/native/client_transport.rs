@@ -1698,6 +1698,25 @@ where
                         }
                         continue;
                     }
+                    // One failure-only record per failed `browser.perform`,
+                    // settled by this wire receipt even when the executor is
+                    // never reached. The record keys on the operation sequence
+                    // the caller sees; registration happens before admission
+                    // so a preflight or admission refusal cannot stay silent.
+                    let action_diagnostic = if command == "browser.perform" {
+                        super::client_action_diagnostic::register(
+                            generation,
+                            operation_seq,
+                            super::client_settlement_trace::ActionKind::from_wire(
+                                args.get("action")
+                                    .and_then(|action| action.get("kind"))
+                                    .and_then(serde_json::Value::as_str),
+                            ),
+                            super::client_settlement_trace::ActionStage::Admission,
+                        )
+                    } else {
+                        None
+                    };
                     let admitted = if recovery_negotiated
                         && command == "scope.reconnect"
                         && callback_token.is_none()
@@ -1746,18 +1765,21 @@ where
                             let executor = executor.clone();
                             let broker = broker.clone();
                             operations.spawn(async move {
-                                (
-                                    operation_seq,
-                                    execute_bounded(
-                                        executor,
-                                        broker,
-                                        command,
-                                        args,
-                                        lease,
-                                        continuation_negotiated,
-                                    )
-                                    .await,
+                                let outcome = execute_bounded(
+                                    executor,
+                                    broker,
+                                    command,
+                                    args,
+                                    lease,
+                                    continuation_negotiated,
                                 )
+                                .await;
+                                if let (Some(mut diagnostic), Err(error)) =
+                                    (action_diagnostic, &outcome.result)
+                                {
+                                    diagnostic.emit(error.clone(), outcome.effects);
+                                }
+                                (operation_seq, outcome)
                             });
                         }
                         Err(code) => {
@@ -1779,6 +1801,9 @@ where
                             } else {
                                 code
                             };
+                            if let Some(mut diagnostic) = action_diagnostic {
+                                diagnostic.emit(code.clone(), Effects::NotDispatched);
+                            }
                             if !enqueue(
                                 &sender,
                                 result_message(

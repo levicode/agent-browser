@@ -3826,6 +3826,27 @@ pub(crate) async fn verified_action_frame_inventory(
     operation: &OperationLease,
     check_owner: impl Fn() -> Result<(), ProtocolError>,
 ) -> Result<VerifiedFrameInventory, ProtocolError> {
+    verified_action_frame_inventory_diagnosed(page, operation, check_owner)
+        .await
+        .map_err(|failure| failure.error)
+}
+/// The action preflight keeps the closed reason of whichever frame-inventory
+/// check refused it, so a receipt produced before the action context exists can
+/// still name its cause. Retry, refusal and deadline semantics are unchanged.
+pub(crate) async fn verified_action_frame_inventory_diagnosed(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    check_owner: impl Fn() -> Result<(), ProtocolError>,
+) -> Result<VerifiedFrameInventory, ActionPreflightFailure> {
+    verified_action_frame_inventory_core(page, operation, check_owner)
+        .await
+        .map_err(ActionPreflightFailure::from_inventory)
+}
+async fn verified_action_frame_inventory_core(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    check_owner: impl Fn() -> Result<(), ProtocolError>,
+) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     check_owner()?;
     let ledger = page.client.debt_ledger();
@@ -3859,26 +3880,24 @@ pub(crate) async fn verified_action_frame_inventory(
         }
         Err(failure) => {
             if !failure.revision_only() {
-                return Err(failure.record(None));
+                return Err(failure);
             }
             check(page, operation)?;
             check_owner()?;
             if !prefix_settled() {
-                return Err(failure.record(None));
+                return Err(failure);
             }
             tokio::task::yield_now().await;
             check(page, operation)?;
             check_owner()?;
             if !prefix_settled() {
-                return Err(failure.record(None));
+                return Err(failure);
             }
-            let inventory = frame_inventory_attempt(page, operation, None, None)
-                .await
-                .map_err(|failure| failure.record(None))?;
+            let inventory = frame_inventory_attempt(page, operation, None, None).await?;
             check(page, operation)?;
             check_owner()?;
             if !prefix_settled() {
-                return Err(ProtocolError::ScopeUnavailable);
+                return Err(ProtocolError::ScopeUnavailable.into());
             }
             Ok(inventory)
         }
@@ -3936,6 +3955,45 @@ impl FrameInventoryFailure {
                 error
             }
         }
+    }
+}
+/// An action preflight's classified refusal. `error` is the unchanged receipt
+/// code; `reason` only feeds the failure-only diagnostic record.
+pub(crate) struct ActionPreflightFailure {
+    pub error: ProtocolError,
+    pub reason: diagnostic::ActionPreflightReason,
+}
+impl ActionPreflightFailure {
+    fn from_inventory(failure: FrameInventoryFailure) -> Self {
+        let (error, reason) = match failure {
+            // The acquisition revision fence refuses only when the target or
+            // frame inventory moved under the read: a topology difference.
+            FrameInventoryFailure::Fence { error, .. } => {
+                (error, diagnostic::ActionPreflightReason::FrameTopology)
+            }
+            FrameInventoryFailure::Read(error) => {
+                let reason = match &error {
+                    ProtocolError::ScopeUnavailable => {
+                        diagnostic::ActionPreflightReason::FrameTargetUnenrolled
+                    }
+                    // The structural lineage checks and their parents refuse as
+                    // stale scope; the loader/version and owner binding checks
+                    // refuse as stale reference.
+                    ProtocolError::StaleScope => diagnostic::ActionPreflightReason::FrameTopology,
+                    ProtocolError::StaleReference => {
+                        diagnostic::ActionPreflightReason::FrameBinding
+                    }
+                    ProtocolError::Cancelled => diagnostic::ActionPreflightReason::FrameCancelled,
+                    ProtocolError::DeadlineExceeded => {
+                        diagnostic::ActionPreflightReason::FrameDeadline
+                    }
+                    ProtocolError::CleanupFailed => diagnostic::ActionPreflightReason::FrameCleanup,
+                    _ => diagnostic::ActionPreflightReason::FrameRead,
+                };
+                (error, reason)
+            }
+        };
+        Self { error, reason }
     }
 }
 async fn frame_inventory_attempt(

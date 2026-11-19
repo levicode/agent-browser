@@ -18,13 +18,14 @@ use super::cdp::types::StaleBrowserObject;
 use super::client_protocol::{Effects, ProtocolError};
 use super::client_settlement_trace::{
     self as trace, ActionCdpFailure, ActionCdpMethod, ActionFailureObservation, ActionKind,
-    ActionStage, ActionStaleObject,
+    ActionPreflightReason, ActionStage, ActionStaleObject,
 };
 
 #[derive(Clone, Copy)]
 struct State {
     kind: ActionKind,
     stage: ActionStage,
+    preflight: Option<ActionPreflightReason>,
     method: Option<ActionCdpMethod>,
     failure: Option<ActionCdpFailure>,
     stale_object: Option<ActionStaleObject>,
@@ -51,9 +52,10 @@ pub(crate) struct ActionRegistration {
 }
 
 impl ActionRegistration {
-    /// Emit one unconditional record for the settled failure. Called from the
-    /// one place that produces the public `ActionFailure`, so no failure branch
-    /// can stay silent.
+    /// Emit one unconditional record for the settled failure. The transport
+    /// calls this from the one place that settles the wire receipt, so a
+    /// failure before the action context, and every failure inside it, still
+    /// produces exactly one record.
     pub(crate) fn emit(&mut self, error: ProtocolError, effects: Effects) {
         let state = active()
             .lock()
@@ -62,6 +64,7 @@ impl ActionRegistration {
         let state = state.unwrap_or(State {
             kind: self.kind,
             stage: ActionStage::Unknown,
+            preflight: None,
             method: None,
             failure: None,
             stale_object: None,
@@ -72,6 +75,7 @@ impl ActionRegistration {
             ActionFailureObservation {
                 kind: state.kind,
                 stage: state.stage,
+                preflight: state.preflight,
                 method: state.method,
                 failure: state.failure,
                 stale_object: state.stale_object,
@@ -95,10 +99,14 @@ impl Drop for ActionRegistration {
 }
 
 /// Register one `browser.perform` operation when cleanup diagnostics are on.
+/// The caller owns the wire receipt, so it can register before admission and
+/// emit once the final outcome is known, even when the failure happens before
+/// the action context exists.
 pub(crate) fn register(
     generation: u64,
     sequence: u64,
     kind: ActionKind,
+    stage: ActionStage,
 ) -> Option<ActionRegistration> {
     if !trace::cleanup_diagnostics_enabled() {
         return None;
@@ -107,7 +115,8 @@ pub(crate) fn register(
         (generation, sequence),
         State {
             kind,
-            stage: ActionStage::Unknown,
+            stage,
+            preflight: None,
             method: None,
             failure: None,
             stale_object: None,
@@ -143,6 +152,12 @@ fn update(change: impl FnOnce(&mut State)) {
 /// The last fallible action step that started.
 pub(crate) fn stage(value: ActionStage) {
     update(|state| state.stage = value);
+}
+
+/// The closed check that refused the action preflight. Set before the failure
+/// is settled so the one action record can name it.
+pub(crate) fn preflight(reason: ActionPreflightReason) {
+    update(|state| state.preflight = Some(reason));
 }
 
 /// One action-context CDP command failed before its reply could authorize
@@ -215,6 +230,7 @@ mod tests {
             State {
                 kind,
                 stage: ActionStage::Unknown,
+                preflight: None,
                 method: None,
                 failure: None,
                 stale_object: None,

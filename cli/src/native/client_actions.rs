@@ -11,8 +11,8 @@ use super::client_page::ClientPageState;
 use super::client_protocol::{Effects, ProtocolError};
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_settlement_trace::{
-    self as diagnostic, ActionKind, ActionStage, ReadonlyAck, ReadonlyCleanup,
-    ReadonlyPrepareFailure, ReadonlyWindow,
+    self as diagnostic, ActionStage, ReadonlyAck, ReadonlyCleanup, ReadonlyPrepareFailure,
+    ReadonlyWindow,
 };
 use super::recording::{self, CaptureOptions, RecordingOptions, RecordingState};
 use super::{
@@ -1302,26 +1302,10 @@ impl ClientActions {
         name: &str,
         args: &Value,
     ) -> Result<Value, ActionFailure> {
-        // Only `browser.perform` carries the locator action vocabulary this
-        // record names. Every other command keeps its existing single boundary.
-        if name != "browser.perform" {
-            return self.execute_observed(ctx, name, args).await;
-        }
-        let kind = ActionKind::from_wire(
-            args.get("action")
-                .and_then(|action| action.get("kind"))
-                .and_then(Value::as_str),
-        );
-        let mut diagnostic = client_action_diagnostic::register(
-            ctx.operation.generation,
-            ctx.operation.sequence,
-            kind,
-        );
-        let result = self.execute_observed(ctx, name, args).await;
-        if let (Some(diagnostic), Err(failure)) = (diagnostic.as_mut(), &result) {
-            diagnostic.emit(failure.error.clone(), failure.effects);
-        }
-        result
+        // The transport owns the one action-failure record, because it registers
+        // before admission and settles the receipt even when this function is
+        // never reached. Stage and preflight setters here only feed that record.
+        self.execute_observed(ctx, name, args).await
     }
     async fn execute_observed(
         &self,

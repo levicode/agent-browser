@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 use super::cdp::client::CdpClient;
+use super::client_action_diagnostic as action_diagnostic;
 use super::client_protocol::ProtocolError;
 use super::client_settlement_trace::{
-    self as cleanup_trace, CleanupComponent as CleanupPart, TerminalCleanupStage,
+    self as cleanup_trace, ActionPreflightReason, ActionStage, CleanupComponent as CleanupPart,
+    TerminalCleanupStage,
 };
 
 #[path = "client_interop_adoption.rs"]
@@ -2263,6 +2265,20 @@ pub(super) fn dispatch_modifies_page(
         | DispatchRequest::Correlate(_) => false,
     }
 }
+/// Closed reason for a `browser.perform` that failed while taking the reference
+/// snapshot, before the action context exists.
+fn reference_preflight_reason(error: &ProtocolError) -> ActionPreflightReason {
+    match error {
+        ProtocolError::ScopeUnavailable => ActionPreflightReason::ReferenceUnavailable,
+        ProtocolError::StaleScope | ProtocolError::StaleReference => {
+            ActionPreflightReason::ReferenceStale
+        }
+        ProtocolError::Cancelled => ActionPreflightReason::ReferenceCancelled,
+        ProtocolError::DeadlineExceeded => ActionPreflightReason::ReferenceDeadline,
+        _ => ActionPreflightReason::ReferenceFailed,
+    }
+}
+
 // This is the retained observation boundary used by ClientBrowser before the
 // transport settles the admitted operation in ClientSession.
 pub(super) fn settle_observation_dispatch(
@@ -4476,15 +4492,30 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     let _ui = ui_permit;
                     let _input = input_permit;
                     let preflight = async {
-                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions, opaque_frames } = super::client_observation_dispatch::verified_action_frame_inventory(&page, &lease, || {
+                        action_diagnostic::stage(ActionStage::FrameInventory);
+                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions, opaque_frames } = match super::client_observation_dispatch::verified_action_frame_inventory_diagnosed(&page, &lease, || {
                             page.permit.check()?;
                             if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) { return Err(ProtocolError::StaleScope); }
                             if !action_broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
                             action_tasks.check_input_dispatch(journal.key())?;
                             observation.check_publication_fence(publication_fence)
-                        }).await?;
+                        }).await {
+                            Ok(inventory) => inventory,
+                            Err(failure) => { action_diagnostic::preflight(failure.reason); return Err(failure.error); }
+                        };
+                        action_diagnostic::stage(ActionStage::GeometrySnapshot);
                         let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(&page.client, &page.page_session_id, &frames, &opaque_frames, &lease).await.map_err(|error| {
                             use super::client_geometry::GeometryError;
+                            action_diagnostic::preflight(match &error {
+                                GeometryError::InvalidGeometry => ActionPreflightReason::GeometryInvalid,
+                                GeometryError::IncompleteInventory => ActionPreflightReason::GeometryIncomplete,
+                                GeometryError::StaleIdentity => ActionPreflightReason::GeometryStale,
+                                GeometryError::Cancelled => ActionPreflightReason::GeometryCancelled,
+                                GeometryError::Superseded => ActionPreflightReason::GeometrySuperseded,
+                                GeometryError::DeadlineExceeded => ActionPreflightReason::GeometryDeadline,
+                                GeometryError::BackendFailure => ActionPreflightReason::GeometryBackend,
+                                GeometryError::CleanupFailed { .. } => ActionPreflightReason::GeometryCleanup,
+                            });
                             match error {
                                 GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
                                 GeometryError::Cancelled => ProtocolError::Cancelled,
@@ -4493,8 +4524,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 _ => ProtocolError::BrowserFailure,
                             }
                         })?;
-                        let (revision, refs, observed_revision) = observation.snapshot_with_observation(&lease).await?;
-                        observation.check_publication_fence(publication_fence)?;
+                        action_diagnostic::stage(ActionStage::ReferenceSnapshot);
+                        let (revision, refs, observed_revision) = match observation.snapshot_with_observation(&lease).await {
+                            Ok(value) => value,
+                            Err(error) => { action_diagnostic::preflight(reference_preflight_reason(&error)); return Err(error); }
+                        };
+                        if let Err(error) = observation.check_publication_fence(publication_fence) {
+                            action_diagnostic::preflight(ActionPreflightReason::ReferencePublication);
+                            return Err(error);
+                        }
                         Ok((revision, refs, frames, sessions, geometry, observed_revision))
                     }.await;
                     let (revision, refs, frames, sessions, geometry, observed_revision) = match preflight {

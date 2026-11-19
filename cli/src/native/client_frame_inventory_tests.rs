@@ -9,6 +9,7 @@ use crate::native::client_browser::{ExecutionGate, OwnedBrowser};
 use crate::native::client_geometry::{GeometrySnapshot, BOX_PROOF};
 use crate::native::client_page::ClientPageState;
 use crate::native::client_protocol::Effects;
+use crate::native::client_settlement_trace::ActionPreflightReason;
 use crate::native::client_targets::ClientTargets;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -530,6 +531,99 @@ async fn verified_inventory_rejects_old_replaced_and_foreign_native_identity() {
 }
 
 #[tokio::test]
+async fn a_refused_action_preflight_keeps_its_receipt_code_and_closed_reason() {
+    // The diagnosed preflight returns the same public refusal the ordinary one
+    // does, plus the closed check family that produced it. Both are needed by a
+    // `browser.perform` that fails before its action context exists.
+    for (oopif, fault, error, reason) in [
+        (
+            false,
+            Fault::OldPageSession,
+            ProtocolError::StaleScope,
+            ActionPreflightReason::FrameTopology,
+        ),
+        (
+            false,
+            Fault::LoaderChanged,
+            ProtocolError::StaleReference,
+            ActionPreflightReason::FrameBinding,
+        ),
+        (
+            true,
+            Fault::ForeignParent,
+            ProtocolError::StaleScope,
+            ActionPreflightReason::FrameTopology,
+        ),
+        (
+            true,
+            Fault::RetiredIframeStuck,
+            ProtocolError::BrowserFailure,
+            ActionPreflightReason::FrameRead,
+        ),
+    ] {
+        let peer = if fault == Fault::RetiredIframeStuck {
+            Peer::with_deadline(true, fault, Duration::from_millis(300)).await
+        } else {
+            Peer::new(oopif, fault).await
+        };
+        let failure =
+            verified_action_frame_inventory_diagnosed(&peer.page, &peer.operation, || Ok(()))
+                .await
+                .err()
+                .unwrap();
+        assert_eq!(failure.error, error, "oopif={oopif}, {fault:?}");
+        assert_eq!(failure.reason, reason, "oopif={oopif}, {fault:?}");
+        assert!(peer.inputs().is_empty());
+    }
+}
+
+#[test]
+fn action_preflight_reason_classification_is_closed() {
+    for (error, reason) in [
+        (
+            ProtocolError::ScopeUnavailable,
+            ActionPreflightReason::FrameTargetUnenrolled,
+        ),
+        (
+            ProtocolError::StaleScope,
+            ActionPreflightReason::FrameTopology,
+        ),
+        (
+            ProtocolError::StaleReference,
+            ActionPreflightReason::FrameBinding,
+        ),
+        (
+            ProtocolError::Cancelled,
+            ActionPreflightReason::FrameCancelled,
+        ),
+        (
+            ProtocolError::DeadlineExceeded,
+            ActionPreflightReason::FrameDeadline,
+        ),
+        (
+            ProtocolError::CleanupFailed,
+            ActionPreflightReason::FrameCleanup,
+        ),
+        (
+            ProtocolError::BrowserFailure,
+            ActionPreflightReason::FrameRead,
+        ),
+    ] {
+        let failure =
+            ActionPreflightFailure::from_inventory(FrameInventoryFailure::Read(error.clone()));
+        assert_eq!(failure.error, error);
+        assert_eq!(failure.reason, reason);
+    }
+    let fence = ActionPreflightFailure::from_inventory(FrameInventoryFailure::Fence {
+        error: ProtocolError::StaleScope,
+        revision_only: true,
+        diagnostic: None,
+    });
+    assert_eq!(fence.error, ProtocolError::StaleScope);
+    assert_eq!(fence.reason, ActionPreflightReason::FrameTopology);
+}
+
+#[tokio::test]
 async fn frame_only_projection_preserves_primary_error_and_cleanup_flag() {
     for paired in [false, true] {
         let peer = Peer::new(false, Fault::InventoryStaleCleanup).await;
@@ -577,9 +671,17 @@ fn all_production_action_contexts_consume_the_verified_renderer_map() {
         5
     );
     assert_eq!(source.matches("::verified_frame_inventory(").count(), 4);
+    // The action path uses the diagnosed variant so a preflight refusal keeps
+    // its closed reason. The ordinary verified form remains for reads.
+    assert_eq!(
+        source
+            .matches("::verified_action_frame_inventory_diagnosed(")
+            .count(),
+        1
+    );
     assert_eq!(
         source.matches("::verified_action_frame_inventory(").count(),
-        1
+        0
     );
     assert_eq!(
         source
