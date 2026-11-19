@@ -114,6 +114,9 @@ pub mod client_test_faults;
 pub(crate) mod client_settlement_trace;
 
 #[allow(dead_code)]
+pub(crate) mod client_action_diagnostic;
+
+#[allow(dead_code)]
 pub mod client_restart;
 
 #[allow(dead_code)]

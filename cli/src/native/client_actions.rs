@@ -11,10 +11,14 @@ use super::client_page::ClientPageState;
 use super::client_protocol::{Effects, ProtocolError};
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_settlement_trace::{
-    self as diagnostic, ReadonlyAck, ReadonlyCleanup, ReadonlyPrepareFailure, ReadonlyWindow,
+    self as diagnostic, ActionKind, ActionStage, ReadonlyAck, ReadonlyCleanup,
+    ReadonlyPrepareFailure, ReadonlyWindow,
 };
-use super::element::{self, ExactBinding, RefMap};
 use super::recording::{self, CaptureOptions, RecordingOptions, RecordingState};
+use super::{
+    client_action_diagnostic,
+    element::{self, ExactBinding, RefMap},
+};
 #[path = "client_point_drag.rs"]
 mod point_drag;
 
@@ -1008,6 +1012,7 @@ impl Resolved {
         let released =
             release_call_handles(ctx, d, &self.session, &result, Some(&self.object)).await;
         if result.get("exceptionDetails").is_some() {
+            client_action_diagnostic::script_threw();
             return Err(ProtocolError::BrowserFailure);
         }
         released?;
@@ -1214,6 +1219,7 @@ async fn resolve(
             entry.backend_node_id.ok_or(ProtocolError::StaleReference)?,
         )
     };
+    action_stage(ActionStage::FrameOwner);
     ctx.bounded(async {
         Ok(element::validate_exact_binding_typed(
             &ctx.page.client,
@@ -1227,6 +1233,7 @@ async fn resolve(
     let (context, realm) = match &ctx.realm_authority {
         ActionRealmAuthority::Enrolled(enrollment) => {
             let capture = enrollment.reserve_exact_realm(ctx.page, &binding, ctx.operation)?;
+            action_stage(ActionStage::Locate);
             let context = ctx
                 .bounded(async {
                     Ok(element::create_exact_realm(&ctx.page.client, &binding).await)
@@ -1243,6 +1250,7 @@ async fn resolve(
         #[cfg(test)]
         ActionRealmAuthority::UntrackedFixture => (None, None),
     };
+    action_stage(ActionStage::Locate);
     let object = resolve_action_object_in_realm(ctx, d, &binding, backend, context).await?;
     if let Some(ticket) = &realm {
         if let Err(primary) = ticket.verify_resolution_owner(ctx.operation).await {
@@ -1289,6 +1297,33 @@ impl ClientActions {
         request.capture_options(None).map(|_| ())
     }
     pub async fn execute(
+        &self,
+        ctx: ActionContext<'_>,
+        name: &str,
+        args: &Value,
+    ) -> Result<Value, ActionFailure> {
+        // Only `browser.perform` carries the locator action vocabulary this
+        // record names. Every other command keeps its existing single boundary.
+        if name != "browser.perform" {
+            return self.execute_observed(ctx, name, args).await;
+        }
+        let kind = ActionKind::from_wire(
+            args.get("action")
+                .and_then(|action| action.get("kind"))
+                .and_then(Value::as_str),
+        );
+        let mut diagnostic = client_action_diagnostic::register(
+            ctx.operation.generation,
+            ctx.operation.sequence,
+            kind,
+        );
+        let result = self.execute_observed(ctx, name, args).await;
+        if let (Some(diagnostic), Err(failure)) = (diagnostic.as_mut(), &result) {
+            diagnostic.emit(failure.error.clone(), failure.effects);
+        }
+        result
+    }
+    async fn execute_observed(
         &self,
         ctx: ActionContext<'_>,
         name: &str,
@@ -1499,11 +1534,7 @@ impl DirectPointRunner<'_, '_> {
     ) -> Result<(), ProtocolError> {
         self.check()?;
         self.dispatch.mark();
-        action_stage(match kind {
-            "mousePressed" => "input.press.dispatch",
-            "mouseReleased" => "input.release.dispatch",
-            _ => "input.move.dispatch",
-        });
+        action_stage(ActionStage::Input);
         self.context
             .page_state
             .pointer_event(
@@ -1823,6 +1854,7 @@ async fn keyboard(
     ctx.check()?;
     ClientPageState::validate_keyboard_command(action, value)?;
     d.mark();
+    action_stage(ActionStage::Keyboard);
     ctx.page_state
         .execute(
             ctx.page,
@@ -1846,11 +1878,7 @@ async fn pointer_event(
     ctx.check()?;
     d.mark();
     // Static stage labels only: no node IDs, text, URL, keys or coordinates.
-    action_stage(match kind {
-        "mousePressed" => "input.press.dispatch",
-        "mouseReleased" => "input.release.dispatch",
-        _ => "input.move.dispatch",
-    });
+    action_stage(ActionStage::Input);
     // Shared page input state is the single owner of held keys/buttons.
     let result = ctx
         .page_state
@@ -1864,13 +1892,6 @@ async fn pointer_event(
             delta,
         )
         .await;
-    if result.is_ok() {
-        action_stage(match kind {
-            "mousePressed" => "input.press.ack",
-            "mouseReleased" => "input.release.ack",
-            _ => "input.move.ack",
-        });
-    }
     result
 }
 async fn viewport(ctx: &ActionContext<'_>, d: &Dispatch) -> Result<(f64, f64), ProtocolError> {
@@ -1886,19 +1907,25 @@ async fn viewport(ctx: &ActionContext<'_>, d: &Dispatch) -> Result<(f64, f64), P
     let size = result
         .get("cssLayoutViewport")
         .or_else(|| result.get("layoutViewport"))
-        .ok_or(ProtocolError::BrowserFailure)?;
+        .ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Page.getLayoutMetrics");
+            ProtocolError::BrowserFailure
+        })?;
     Ok((
-        size["clientWidth"]
-            .as_f64()
-            .ok_or(ProtocolError::BrowserFailure)?,
-        size["clientHeight"]
-            .as_f64()
-            .ok_or(ProtocolError::BrowserFailure)?,
+        size["clientWidth"].as_f64().ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Page.getLayoutMetrics");
+            ProtocolError::BrowserFailure
+        })?,
+        size["clientHeight"].as_f64().ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Page.getLayoutMetrics");
+            ProtocolError::BrowserFailure
+        })?,
     ))
 }
 async fn rendered(ctx: &ActionContext<'_>, d: &Dispatch) -> Result<(), ProtocolError> {
     let result=ctx.command(d,false,&ctx.page.page_session_id,"Runtime.evaluate",json!({"expression":"document.hidden?true:new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))","awaitPromise":true,"returnByValue":true})).await?;
     if result.get("exceptionDetails").is_some() {
+        client_action_diagnostic::script_threw();
         return Err(ProtocolError::BrowserFailure);
     }
     Ok(())
@@ -1911,6 +1938,7 @@ async fn scroll(
     momentum: Momentum,
     extent: (f64, f64),
 ) -> Result<(), ProtocolError> {
+    action_stage(ActionStage::Scroll);
     let delta = wheel(direction, momentum, extent.0, extent.1)?;
     if let Some(point) = point {
         pointer_event(ctx, d, "mouseMoved", Some(point), None, None, None).await?;
@@ -2051,6 +2079,11 @@ async fn action_target(
         if released.is_ok() && value.get("exceptionDetails").is_none() {
             ctx.check()?;
         }
+        if value.get("exceptionDetails").is_some() {
+            client_action_diagnostic::script_threw();
+        } else if candidate.is_none() {
+            client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
+        }
         return Err(if value.get("exceptionDetails").is_some() {
             ProtocolError::BrowserFailure
         } else if released.is_err() {
@@ -2115,6 +2148,7 @@ async fn retarget_upload_label(
         .await?;
         ctx.check()?;
         if value.get("exceptionDetails").is_some() {
+            client_action_diagnostic::script_threw();
             return Err(ProtocolError::BrowserFailure);
         }
         if value["result"]["value"] == "unchanged" && candidate.is_none() {
@@ -2171,6 +2205,7 @@ async fn wheel_at_known_pointer(
     else {
         return Ok(None);
     };
+    action_stage(ActionStage::Geometry);
     let geometry = match ctx
         .geometry
         .refresh_after_scroll(&ctx.page.client, ctx.operation)
@@ -2198,6 +2233,7 @@ async fn wheel_at_known_pointer(
     }}"#,
         element::BLOCKER_AT_JS
     );
+    action_stage(ActionStage::Reachability);
     let size = node
         .call(
             ctx,
@@ -2223,11 +2259,17 @@ async fn wheel_at_known_pointer(
     let width = size["width"]
         .as_f64()
         .filter(|n| n.is_finite() && *n > 0.)
-        .ok_or(ProtocolError::BrowserFailure)?;
+        .ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
+            ProtocolError::BrowserFailure
+        })?;
     let height = size["height"]
         .as_f64()
         .filter(|n| n.is_finite() && *n > 0.)
-        .ok_or(ProtocolError::BrowserFailure)?;
+        .ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
+            ProtocolError::BrowserFailure
+        })?;
     Ok(Some((width, height)))
 }
 
@@ -2430,11 +2472,10 @@ fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
         GeometryError::BackendFailure => ProtocolError::BrowserFailure,
     }
 }
-fn action_stage(stage: &'static str) {
+fn action_stage(stage: ActionStage) {
+    client_action_diagnostic::stage(stage);
     #[cfg(test)]
-    eprintln!("native-action-stage {stage}");
-    #[cfg(not(test))]
-    let _ = stage;
+    eprintln!("native-action-stage {}", stage.as_str());
 }
 async fn center_once(
     ctx: &ActionContext<'_>,
@@ -2442,7 +2483,10 @@ async fn center_once(
     node: &Resolved,
     enabled: bool,
 ) -> Result<(Point, (f64, f64)), ProtocolError> {
-    let probe = node.call(ctx,d,false,r#"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};const rect=this.getBoundingClientRect();const style=getComputedStyle(this);if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {status:'not-actionable'};return true;}"#,vec![]).await;
+    action_stage(ActionStage::Visibility);
+    let probe = node
+        .call(ctx, d, false, ELEMENT_VISIBILITY_PROBE, vec![])
+        .await;
     if matches!(&probe, Err(ProtocolError::NotActionable))
         && d.readonly_preparation_enabled.load(Ordering::SeqCst)
         && !d.readonly_preparation_disqualified.load(Ordering::SeqCst)
@@ -2462,7 +2506,7 @@ async fn center_once(
         });
     }
     probe?;
-    action_stage("scroll.dispatch");
+    action_stage(ActionStage::Scroll);
     ctx.command(
         d,
         true,
@@ -2471,15 +2515,14 @@ async fn center_once(
         json!({"objectId":node.object}),
     )
     .await?;
-    action_stage("scroll.ack");
-    action_stage("geometry.refresh.dispatch");
+    action_stage(ActionStage::Geometry);
     let geometry = ctx
         .geometry
         .refresh_after_scroll(&ctx.page.client, ctx.operation)
         .await
         .map_err(|e| geometry_failure(d, e))?;
-    action_stage("geometry.refresh.ack");
-    let bounds = ctx
+    action_stage(ActionStage::BoxModel);
+    let bounds = match ctx
         .command(
             d,
             false,
@@ -2487,19 +2530,28 @@ async fn center_once(
             "DOM.getBoxModel",
             json!({"objectId":node.object}),
         )
-        .await?;
+        .await
+    {
+        Ok(bounds) => bounds,
+        Err(ProtocolError::BrowserFailure) => {
+            return Err(reclassify_box_model_failure(ctx, d, node).await);
+        }
+        Err(error) => return Err(error),
+    };
     let quad = bounds["model"]["border"]
         .as_array()
         .ok_or(ProtocolError::NotActionable)?;
     if quad.len() != 8 {
+        client_action_diagnostic::reply_malformed("DOM.getBoxModel");
         return Err(ProtocolError::BrowserFailure);
     }
     let values = quad
         .iter()
         .map(|v| {
-            v.as_f64()
-                .filter(|v| v.is_finite())
-                .ok_or(ProtocolError::BrowserFailure)
+            v.as_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                client_action_diagnostic::reply_malformed("DOM.getBoxModel");
+                ProtocolError::BrowserFailure
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let local = GeometryPoint {
@@ -2529,6 +2581,28 @@ async fn center_once(
     let size = hit_test_action_point(ctx, d, node, &geometry, root, enabled).await?;
     Ok((rounded, size))
 }
+/// A box-model read can fail when the page replaced the exact target between
+/// the visibility probe and that read (a virtualized list rebuilding on the
+/// scroll this action dispatched). Re-run the visibility probe once: a
+/// successful stale/not-actionable answer, or a closed gone-object answer, is
+/// the real reason. A connected visible target keeps the original failure.
+async fn reclassify_box_model_failure(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    node: &Resolved,
+) -> ProtocolError {
+    match node
+        .call(ctx, d, false, ELEMENT_VISIBILITY_PROBE, vec![])
+        .await
+    {
+        Ok(_) => ProtocolError::BrowserFailure,
+        Err(error @ (ProtocolError::StaleReference | ProtocolError::NotActionable)) => error,
+        Err(ProtocolError::BrowserFailure) if client_action_diagnostic::exact_target_gone() => {
+            ProtocolError::StaleReference
+        }
+        Err(error) => error,
+    }
+}
 async fn hit_test_action_point(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -2537,6 +2611,7 @@ async fn hit_test_action_point(
     root: GeometryPoint,
     enabled: bool,
 ) -> Result<(f64, f64), ProtocolError> {
+    action_stage(ActionStage::Reachability);
     let local = geometry
         .root_to_frame_point(&node.binding.frame, root)
         .map_err(|e| geometry_failure(d, e))?;
@@ -2616,12 +2691,14 @@ async fn hit_test_action_point(
         .map_err(|e| geometry_failure(d, e))?;
     ctx.check()?;
     Ok((
-        size["width"]
-            .as_f64()
-            .ok_or(ProtocolError::BrowserFailure)?,
-        size["height"]
-            .as_f64()
-            .ok_or(ProtocolError::BrowserFailure)?,
+        size["width"].as_f64().ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
+            ProtocolError::BrowserFailure
+        })?,
+        size["height"].as_f64().ok_or_else(|| {
+            client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
+            ProtocolError::BrowserFailure
+        })?,
     ))
 }
 
@@ -2740,7 +2817,7 @@ impl ClientActions {
         };
         d.readonly_preparation_enabled
             .store(readonly_preparation.is_some(), Ordering::SeqCst);
-        action_stage("exact.resolve.dispatch");
+        action_stage(ActionStage::Locate);
         let node = match action_target(ctx, d, &request.reference).await {
             Err(error) => {
                 if error == ProtocolError::NotActionable
@@ -2762,7 +2839,7 @@ impl ClientActions {
         } else {
             node
         };
-        action_stage("exact.resolve.ack");
+        action_stage(ActionStage::Settle);
         d.preparation_enabled
             .store(preparation.is_some(), Ordering::SeqCst);
         let result = self.perform_node(ctx, d, &node, request.action).await;
@@ -3022,6 +3099,7 @@ impl ClientActions {
         };
         let result = async {
             pointer_event(ctx, d, "mouseMoved", Some(point), None, None, None).await?;
+            action_stage(ActionStage::Reachability);
             let receiver = node
                 .call(ctx, d, false, TAP_RECEIVER_AFTER_HOVER, vec![])
                 .await;
@@ -3033,10 +3111,12 @@ impl ClientActions {
                 d.tap_detached_before_press.store(true, Ordering::SeqCst);
             }
             if receiver? != Value::Bool(true) {
+                client_action_diagnostic::reply_malformed("Runtime.callFunctionOn");
                 return Err(ProtocolError::BrowserFailure);
             }
             // Hover handlers can move or cover a still-connected receiver too.
             // Recheck the same root point and native owner chain, not a new node.
+            action_stage(ActionStage::Geometry);
             let geometry = ctx
                 .geometry
                 .refresh_after_scroll(&ctx.page.client, ctx.operation)
@@ -3079,6 +3159,7 @@ impl ClientActions {
         directory_name: Option<String>,
         files: Vec<UploadFile>,
     ) -> Result<(), ProtocolError> {
+        action_stage(ActionStage::Upload);
         if files.len() > 10000 || directory_name.as_ref().is_some_and(|n| !component(n)) {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -3201,6 +3282,9 @@ async fn focus(
     node.call(ctx,d,true,"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};if(typeof this.focus!=='function')return {status:'not-actionable'};this.focus();return true;}",vec![]).await?;
     Ok(())
 }
+// The pre-scroll visibility probe. Shared with the box-model failure path so a
+// target the page replaced mid-action is classified from the same predicates.
+const ELEMENT_VISIBILITY_PROBE: &str = r#"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};const rect=this.getBoundingClientRect();const style=getComputedStyle(this);if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {status:'not-actionable'};return true;}"#;
 // Exact read after the acknowledged hover, before any button press. This is
 // not a locator and cannot retarget a replacement or synthesize a click.
 const TAP_RECEIVER_AFTER_HOVER: &str = r#"function(){
@@ -3311,9 +3395,8 @@ async fn set_checked(
     node: &Resolved,
     wanted: bool,
 ) -> Result<(), ProtocolError> {
-    action_stage("checked.before.dispatch");
+    action_stage(ActionStage::Reachability);
     let before = node.call(ctx, d, false, CHECKED_STATE, vec![]).await?;
-    action_stage("checked.before.ack");
     if before["checked"] == wanted {
         return Ok(());
     }

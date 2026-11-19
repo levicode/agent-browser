@@ -2336,6 +2336,9 @@ impl CdpClient {
     ) -> Result<Value, String> {
         let reservation =
             self.reserve_tracked_command_observed(method, params.as_ref(), session_id, stop);
+        if let Err(message) = &reservation {
+            super::super::client_action_diagnostic::command_failed(method, message);
+        }
         #[cfg(test)]
         self.activation_command_diagnostic(
             "cdp-reserve",
@@ -2352,6 +2355,11 @@ impl CdpClient {
                 stop,
             )
             .await;
+        // Inside an action's operation this names the exact command that failed.
+        // Every other caller has no action registration, so nothing is recorded.
+        if let Err(message) = &result {
+            super::super::client_action_diagnostic::command_failed(method, message);
+        }
         #[cfg(test)]
         self.activation_command_diagnostic(
             "cdp-result",
