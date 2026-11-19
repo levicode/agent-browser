@@ -1922,62 +1922,146 @@ impl CdpClient {
         params: &Value,
         session: &str,
     ) -> Result<Option<CommandReservation>, NetworkCommandFailure> {
-        let mut stop = AdmissionObservation::default();
-        match self.reserve_tracked_command_observed_typed(
+        self.try_reserve_network_task_command(method, params, session)
+            .map_err(|(failure, witness)| {
+                super::super::client_settlement_trace::network_callback_failure(witness);
+                failure
+            })
+    }
+
+    /// A paused request already owns its routing decision and event budget.
+    /// Wait for an ACK to free a count slot before submitting that decision.
+    /// The same bound applies to every actual reservation. `false` means
+    /// custody remains with the original scope because nothing was submitted.
+    pub(crate) async fn continue_paused_request(
+        &self,
+        params: Value,
+        session: &str,
+        deadline: std::time::Instant,
+        mut cancellation: watch::Receiver<super::super::client_session::CancelSignal>,
+        is_current: impl Fn() -> Result<bool, ProtocolError>,
+    ) -> Result<bool, NetworkCommandFailure> {
+        use super::super::client_settlement_trace::{
+            network_callback_failure, NetworkCapacityReason,
+        };
+        let method = "Fetch.continueRequest";
+        let current =
+            || is_current().map_err(|error| NetworkCommandFailure::from(format!("{error:?}")));
+        if *cancellation.borrow() != super::super::client_session::CancelSignal::None || !current()?
+        {
+            return Ok(false);
+        }
+        let Some(ledger) = self.debt_ledger() else {
+            return self
+                .send_network_task_command(method, params, session)
+                .await
+                .map(|_| true);
+        };
+        loop {
+            let changed = ledger.command_capacity_changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.try_reserve_network_task_command(method, &params, session) {
+                Ok(reservation) => {
+                    if !current()? {
+                        return Ok(false);
+                    }
+                    return self
+                        .send_reserved_network_task_command(method, params, session, reservation)
+                        .await
+                        .map(|_| true);
+                }
+                Err((failure, witness)) => {
+                    if !witness.capacity.is_some_and(|capacity| {
+                        matches!(capacity.reason, NetworkCapacityReason::Count)
+                    }) {
+                        network_callback_failure(witness);
+                        return Err(failure);
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.changed() => return Ok(false),
+                        _ = tokio::time::sleep_until(deadline.into()) => {
+                            network_callback_failure(witness);
+                            return Err(failure);
+                        }
+                        _ = &mut changed => {}
+                    }
+                    if !current()? {
+                        return Ok(false);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        network_callback_failure(witness);
+                        return Err(failure);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep reservation diagnostics attached to the exact attempted envelope.
+    fn try_reserve_network_task_command(
+        &self,
+        method: &str,
+        params: &Value,
+        session: &str,
+    ) -> Result<
+        Option<CommandReservation>,
+        (
+            NetworkCommandFailure,
+            super::super::client_settlement_trace::NetworkCallbackFailureObservation,
+        ),
+    > {
+        use super::super::client_debt::CapacityRefusalReason;
+        use super::super::client_settlement_trace::{
+            NetworkCallbackFailureObservation, NetworkCapacityObservation, NetworkCapacityReason,
+            NetworkFailureClass, NetworkTaskCommand,
+        };
+        self.reserve_tracked_command_observed_typed(
             method,
             Some(params),
             Some(session),
-            &mut stop,
-        ) {
-            Ok(reservation) => Ok(reservation),
-            Err(failure) => {
-                let (reservation, ledger_error) = callback_reservation_failure(&failure);
-                let capacity = match &failure {
-                    TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded) => {
-                        super::super::client_debt::OwnerDebtLedger::take_last_capacity_refusal()
-                            .map(|refusal| {
-                                use super::super::client_settlement_trace::NetworkCapacityReason;
-                                super::super::client_settlement_trace::NetworkCapacityObservation {
-                                    reason: match refusal.reason {
-                                        super::super::client_debt::CapacityRefusalReason::Count => {
-                                            NetworkCapacityReason::Count
-                                        }
-                                        super::super::client_debt::CapacityRefusalReason::Bytes => {
-                                            NetworkCapacityReason::Bytes
-                                        }
-                                        super::super::client_debt::CapacityRefusalReason::Global => {
-                                            NetworkCapacityReason::Global
-                                        }
-                                    },
-                                    count: refusal.count,
-                                    count_limit: refusal.count_limit,
-                                    bytes: refusal.bytes,
-                                    bytes_limit: refusal.bytes_limit,
-                                }
-                            })
+            &mut AdmissionObservation::default(),
+        )
+        .map_err(|failure| {
+            let (reservation, ledger_error) = callback_reservation_failure(&failure);
+            let local_capacity = matches!(
+                failure,
+                TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded)
+            );
+            let capacity = if local_capacity {
+                OwnerDebtLedger::take_last_capacity_refusal().map(|refusal| {
+                    NetworkCapacityObservation {
+                        reason: match refusal.reason {
+                            CapacityRefusalReason::Count => NetworkCapacityReason::Count,
+                            CapacityRefusalReason::Bytes => NetworkCapacityReason::Bytes,
+                            CapacityRefusalReason::Global => NetworkCapacityReason::Global,
+                        },
+                        count: refusal.count,
+                        count_limit: refusal.count_limit,
+                        bytes: refusal.bytes,
+                        bytes_limit: refusal.bytes_limit,
                     }
-                    _ => None,
-                };
-                super::super::client_settlement_trace::network_callback_failure(
-                    super::super::client_settlement_trace::NetworkCallbackFailureObservation {
-                        command: super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
-                        failure: super::super::client_settlement_trace::NetworkFailureClass::ReservationRejected,
-                        reservation,
-                        ledger_error,
-                        capacity,
-                        ..Default::default()
-                    },
-                );
-                Err(NetworkCommandFailure {
+                })
+            } else {
+                None
+            };
+            (
+                NetworkCommandFailure {
                     retirement: None,
                     request_gone: false,
-                    local_capacity: matches!(
-                        failure,
-                        TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded)
-                    ),
-                })
-            }
-        }
+                    local_capacity,
+                },
+                NetworkCallbackFailureObservation {
+                    command: NetworkTaskCommand::from_method(method),
+                    failure: NetworkFailureClass::ReservationRejected,
+                    reservation,
+                    ledger_error,
+                    capacity,
+                    ..Default::default()
+                },
+            )
+        })
     }
     /// Dialogs already own a reservation/status used by borrowed cleanup. Reuse
     /// that exact reservation rather than charging or submitting a second one.

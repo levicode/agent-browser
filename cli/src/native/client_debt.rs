@@ -3221,6 +3221,11 @@ impl OwnerDebtLedger {
     pub(crate) fn take_last_capacity_refusal() -> Option<CapacityRefusal> {
         LAST_CAPACITY_REFUSAL.with(|slot| slot.take())
     }
+    /// Subscribe before trying a callback reservation so an ACK cannot be lost
+    /// between the capacity refusal and the wait.
+    pub(crate) fn command_capacity_changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
     #[cfg(test)]
     pub(crate) fn saturate_security_pool_for_test(&self) {
         if let Ok(mut state) = self.state.lock() {
