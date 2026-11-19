@@ -762,6 +762,9 @@ pub struct GeometrySnapshot {
     /// policy/budget/hidden traversal omissions plus opaque `<object>`/`<embed>`
     /// plugin subtrees. A revalidation must accept the exact same omissions.
     excluded: HashSet<String>,
+    /// Action captures also prove which iframe subtrees have no content area.
+    /// Their frame identities remain in the inventory.
+    empty_action_frames: Option<HashSet<String>>,
 }
 #[derive(Debug, Clone)]
 struct FrameInput {
@@ -904,12 +907,61 @@ fn tree_frames(tree: &Value) -> Result<HashMap<String, TreeFrame>, GeometryError
     }
     Ok(result)
 }
+/// Visit each parent before measuring any of its descendants' geometry.
+fn action_frame_order<'a>(
+    inputs: &'a [FrameInput],
+    root: &str,
+) -> Result<Vec<&'a FrameInput>, GeometryError> {
+    let mut children = HashMap::<&str, Vec<&FrameInput>>::new();
+    for input in inputs {
+        if let Some(parent) = &input.parent {
+            children.entry(parent).or_default().push(input);
+        }
+    }
+    let root = inputs
+        .iter()
+        .find(|input| input.binding.frame == root)
+        .ok_or(GeometryError::IncompleteInventory)?;
+    let mut ordered = vec![root];
+    let mut index = 0;
+    while let Some(parent) = ordered.get(index) {
+        ordered.extend(
+            children
+                .remove(parent.binding.frame.as_str())
+                .into_iter()
+                .flatten(),
+        );
+        index += 1;
+    }
+    if ordered.len() != inputs.len() {
+        return Err(GeometryError::IncompleteInventory);
+    }
+    Ok(ordered)
+}
+/// Read the viewport for a renderer with geometry included in this capture.
+async fn read_viewport(
+    client: &CdpClient,
+    session: &str,
+    operation: &OperationLease,
+) -> Result<Viewport, GeometryError> {
+    metrics(
+        &command(
+            client,
+            session,
+            "Page.getLayoutMetrics",
+            json!({}),
+            operation,
+        )
+        .await?,
+    )
+}
 async fn read_proofs(
     client: &CdpClient,
     page_session: &str,
     inputs: &[FrameInput],
     excluded: &HashSet<String>,
     semantic: Option<&SemanticFrameProof>,
+    mut empty_action_frames: Option<&mut HashSet<String>>,
     operation: &OperationLease,
 ) -> Result<(HashMap<String, FrameProof>, HashMap<String, SessionProof>), GeometryError> {
     if inputs.is_empty() || inputs.len() > MAX_FRAMES {
@@ -953,19 +1005,12 @@ async fn read_proofs(
                 .ok_or(GeometryError::IncompleteInventory)?
                 .to_owned();
             trees.insert(binding.session.clone(), tree_frames(&tree["frameTree"])?);
-            let viewport = if inputs.iter().any(|input| {
-                input.binding.session == binding.session && !excluded.contains(&input.binding.frame)
-            }) {
-                Some(metrics(
-                    &command(
-                        client,
-                        &binding.session,
-                        "Page.getLayoutMetrics",
-                        json!({}),
-                        operation,
-                    )
-                    .await?,
-                )?)
+            let viewport = if empty_action_frames.is_none()
+                && inputs.iter().any(|input| {
+                    input.binding.session == binding.session
+                        && !excluded.contains(&input.binding.frame)
+                }) {
+                Some(read_viewport(client, &binding.session, operation).await?)
             } else {
                 None
             };
@@ -993,7 +1038,12 @@ async fn read_proofs(
             return Err(GeometryError::IncompleteInventory);
         }
     }
-    for input in inputs {
+    let ordered = if empty_action_frames.is_some() {
+        action_frame_order(inputs, &main.root)?
+    } else {
+        inputs.iter().collect()
+    };
+    for input in ordered {
         let binding = &input.binding;
         let native = trees
             .get(&binding.session)
@@ -1020,9 +1070,9 @@ async fn read_proofs(
         if native_parent != input.parent.as_ref() {
             return Err(GeometryError::StaleIdentity);
         }
-        if let Some(parent) = &input.parent {
+        if let Some(parent_id) = &input.parent {
             let parent = frames
-                .get(parent)
+                .get(parent_id)
                 .ok_or(GeometryError::IncompleteInventory)?;
             let owner = command(
                 client,
@@ -1048,33 +1098,61 @@ async fn read_proofs(
                 loader: parent.loader.clone(),
                 actionable: false,
             };
-            let (model, size) = read_exact_box(
+            let kind = if let Some(empty) = &mut empty_action_frames {
+                if empty.contains(parent_id) {
+                    empty.insert(binding.frame.clone());
+                    continue;
+                }
+                BoxKind::ActionOwner
+            } else {
+                BoxKind::Owner
+            };
+            let geometry = read_exact_box_with_evidence(
                 client,
                 &parent_binding,
                 backend,
                 operation,
+                kind,
                 semantic.is_some(),
+                None,
             )
             .await?;
             let target = frames
                 .get_mut(&binding.frame)
                 .ok_or(GeometryError::IncompleteInventory)?;
-            match size {
-                Some(size) => {
+            match geometry {
+                ExactBox::Model(model, Some(size)) => {
                     target.owner_quad = Some(quad(&model["model"]["content"])?);
                     target.owner_size = Some(size);
                 }
                 // A display-none or zero-area frame owner has no measurable
                 // geometry. `read_exact_box` settled that from the box model
                 // alone, without issuing the frame-owner proof read.
-                None if empty_box(&model) => {
+                ExactBox::Model(model, None) if empty_box(&model) => {
                     target.owner_quad = Some([Point { x: 0., y: 0. }; 4]);
                     target.owner_size = Some((0.0, 0.0));
                 }
-                None => return Err(GeometryError::InvalidGeometry),
+                ExactBox::EmptyIframe => {
+                    empty_action_frames
+                        .as_mut()
+                        .ok_or(GeometryError::IncompleteInventory)?
+                        .insert(binding.frame.clone());
+                }
+                _ => return Err(GeometryError::InvalidGeometry),
             }
         } else if input.owner.is_some() {
             return Err(GeometryError::IncompleteInventory);
+        }
+    }
+    if let Some(empty) = empty_action_frames {
+        for (session, proof) in &mut sessions {
+            if inputs.iter().any(|input| {
+                input.binding.session == *session
+                    && !excluded.contains(&input.binding.frame)
+                    && !empty.contains(&input.binding.frame)
+            }) {
+                proof.viewport = Some(read_viewport(client, session, operation).await?);
+            }
         }
     }
     Ok((frames, sessions))
@@ -1187,6 +1265,7 @@ impl GeometrySnapshot {
             frames,
             None,
             &HashSet::new(),
+            false,
             operation,
         )
         .await
@@ -1201,7 +1280,36 @@ impl GeometrySnapshot {
         opaque_frames: &HashSet<String>,
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
-        Self::capture_impl(client, page_session, frames, None, opaque_frames, operation).await
+        Self::capture_impl(
+            client,
+            page_session,
+            frames,
+            None,
+            opaque_frames,
+            false,
+            operation,
+        )
+        .await
+    }
+    /// Frame identity is still strict. There is no coordinate space inside an
+    /// exactly resolved iframe with no rendered content area.
+    pub(crate) async fn capture_for_action(
+        client: &CdpClient,
+        page_session: &str,
+        frames: &[ObservationFrame],
+        opaque_frames: &HashSet<String>,
+        operation: &OperationLease,
+    ) -> Result<Self, GeometryError> {
+        Self::capture_impl(
+            client,
+            page_session,
+            frames,
+            None,
+            opaque_frames,
+            true,
+            operation,
+        )
+        .await
     }
     /// Semantic-only omission requires the producer proof of the frozen policy,
     /// emitted document order/budget, and genuine hidden-owner evidence.
@@ -1233,6 +1341,7 @@ impl GeometrySnapshot {
             frames,
             Some(proof.clone()),
             opaque_frames,
+            false,
             operation,
         )
         .await
@@ -1243,6 +1352,7 @@ impl GeometrySnapshot {
         frames: &[ObservationFrame],
         semantic_frames: Option<SemanticFrameProof>,
         opaque_frames: &HashSet<String>,
+        action: bool,
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
         // Policy/budget/hidden omissions plus the inventory's proven opaque
@@ -1259,12 +1369,14 @@ impl GeometrySnapshot {
                 owner: f.owner_backend_id,
             })
             .collect::<Vec<_>>();
+        let mut empty_action_frames = action.then(HashSet::new);
         let (frames, sessions) = read_proofs(
             client,
             page_session,
             &inputs,
             &excluded,
             semantic_frames.as_ref(),
+            empty_action_frames.as_mut(),
             operation,
         )
         .await?;
@@ -1284,7 +1396,11 @@ impl GeometrySnapshot {
         }
         let mut clips = HashMap::new();
         for frame in frames.values() {
-            if excluded.contains(&frame.id) {
+            if excluded.contains(&frame.id)
+                || empty_action_frames
+                    .as_ref()
+                    .is_some_and(|empty| empty.contains(&frame.id))
+            {
                 continue;
             }
             let mut current = frame;
@@ -1327,6 +1443,7 @@ impl GeometrySnapshot {
             viewport,
             semantic_frames,
             excluded,
+            empty_action_frames,
         })
     }
     pub async fn revalidate(
@@ -1355,16 +1472,21 @@ impl GeometrySnapshot {
                 .await
                 .map_err(hidden_proof_error)?;
         }
+        let mut empty_action_frames = self.empty_action_frames.as_ref().map(|_| HashSet::new());
         let (frames, sessions) = read_proofs(
             client,
             &self.page_session,
             &inputs,
             &self.excluded,
             self.semantic_frames.as_ref(),
+            empty_action_frames.as_mut(),
             operation,
         )
         .await?;
-        if frames != self.frames || sessions != self.sessions {
+        if frames != self.frames
+            || sessions != self.sessions
+            || empty_action_frames != self.empty_action_frames
+        {
             return Err(GeometryError::StaleIdentity);
         }
         Ok(())
@@ -1401,11 +1523,13 @@ impl GeometrySnapshot {
                 },
             })
             .collect::<Vec<_>>();
-        let fresh = Self::capture_excluding_opaque(
+        let fresh = Self::capture_impl(
             client,
             &self.page_session,
             &inputs,
+            None,
             &self.excluded,
+            self.empty_action_frames.is_some(),
             operation,
         )
         .await?;
@@ -1437,6 +1561,7 @@ impl GeometrySnapshot {
         point: Point,
     ) -> Result<Point, GeometryError> {
         self.check_input_viewports()?;
+        self.require_included(frame_id)?;
         let frame = self
             .frames
             .get(frame_id)
@@ -1474,12 +1599,15 @@ impl GeometrySnapshot {
         }
         Ok(())
     }
-    fn require_included(&self, frame: &str) -> Result<(), GeometryError> {
-        if self
-            .semantic_frames
+    /// Even actions with no coordinate conversion must refuse references into
+    /// an iframe whose content area was absent at preflight.
+    pub(crate) fn action_frame_has_no_area(&self, frame: &str) -> bool {
+        self.empty_action_frames
             .as_ref()
-            .is_some_and(|proof| proof.excluded_frames().contains(frame))
-        {
+            .is_some_and(|empty| empty.contains(frame))
+    }
+    fn require_included(&self, frame: &str) -> Result<(), GeometryError> {
+        if self.excluded.contains(frame) || self.action_frame_has_no_area(frame) {
             return Err(GeometryError::IncompleteInventory);
         }
         Ok(())
@@ -1488,9 +1616,9 @@ impl GeometrySnapshot {
         if self.semantic_frames.is_some() {
             return Err(GeometryError::IncompleteInventory);
         }
-        if self.sessions.values().any(|s| {
-            s.viewport
-                .is_none_or(|v| v.scale != 1. || v.offset_x != 0. || v.offset_y != 0.)
+        if self.sessions.values().any(|s| match s.viewport {
+            Some(v) => v.scale != 1. || v.offset_x != 0. || v.offset_y != 0.,
+            None => self.empty_action_frames.is_none(),
         }) {
             return Err(GeometryError::InvalidGeometry);
         }
@@ -1500,6 +1628,7 @@ impl GeometrySnapshot {
         // Pinch/visual-viewport coordinate convention needs its separate browser
         // proof. This is not a fallback to a guessed coordinate system.
         self.check_input_viewports()?;
+        self.require_included(frame_id)?;
         let frame = self
             .frames
             .get(frame_id)
@@ -1690,16 +1819,19 @@ impl GeometrySnapshot {
         {
             return Err(GeometryError::StaleIdentity);
         }
-        let (model, _) = read_exact_box_with_evidence(
+        let ExactBox::Model(model, _) = read_exact_box_with_evidence(
             client,
             &frame.binding,
             backend,
             operation,
-            false,
+            BoxKind::Node,
             true,
             evidence,
         )
-        .await?;
+        .await?
+        else {
+            return Err(GeometryError::InvalidGeometry);
+        };
         self.project_semantic_quad(
             &frame.binding.frame,
             quad_points(&model["model"]["border"])?,
@@ -1744,6 +1876,34 @@ pub(crate) const BOX_PROOF: &str = r#"function(){
  if(s.boxSizing==='border-box'){width-=parseFloat(s.paddingLeft)+parseFloat(s.paddingRight)+parseFloat(s.borderLeftWidth)+parseFloat(s.borderRightWidth);height-=parseFloat(s.paddingTop)+parseFloat(s.paddingBottom)+parseFloat(s.borderTopWidth)+parseFloat(s.borderBottomWidth);}
  return {connected:true,frameOwner:true,width,height};
 }"#;
+
+// The parent realm owns this exact iframe even when Chromium cannot produce
+// a box model for it. A border may still intercept input, which is checked
+// independently by the action's hit test.
+const EMPTY_IFRAME_PROOF: &str = r#"function(){
+ const p=Node.prototype;
+ const connected=Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this)&&Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this)===document;
+ if(!connected)return {connected:false};
+ if(this.nodeType!==1||this.namespaceURI!=='http://www.w3.org/1999/xhtml'||this.localName!=='iframe')
+   return {connected:true,empty:false};
+ if(!this.getClientRects().length)return {connected:true,empty:true};
+ const s=getComputedStyle(this);let width=parseFloat(s.width),height=parseFloat(s.height);
+ if(s.boxSizing==='border-box'){width-=parseFloat(s.paddingLeft)+parseFloat(s.paddingRight)+parseFloat(s.borderLeftWidth)+parseFloat(s.borderRightWidth);height-=parseFloat(s.paddingTop)+parseFloat(s.paddingBottom)+parseFloat(s.borderTopWidth)+parseFloat(s.borderBottomWidth);}
+ return {connected:true,empty:(width===0&&Number.isFinite(height)&&height>=0)||(height===0&&Number.isFinite(width)&&width>=0)};
+}"#;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoxKind {
+    Node,
+    Owner,
+    ActionOwner,
+}
+
+enum ExactBox {
+    Model(Value, Option<(f64, f64)>),
+    EmptyIframe,
+}
+
 async fn read_exact_box(
     client: &CdpClient,
     binding: &element::ExactBinding,
@@ -1763,26 +1923,34 @@ async fn read_exact_box_impl(
     require_owner_size: bool,
     readonly_disposal: bool,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
-    read_exact_box_with_evidence(
+    match read_exact_box_with_evidence(
         client,
         binding,
         backend,
         operation,
-        require_owner_size,
+        if require_owner_size {
+            BoxKind::Owner
+        } else {
+            BoxKind::Node
+        },
         readonly_disposal,
         None,
     )
-    .await
+    .await?
+    {
+        ExactBox::Model(model, size) => Ok((model, size)),
+        ExactBox::EmptyIframe => Err(GeometryError::InvalidGeometry),
+    }
 }
 async fn read_exact_box_with_evidence(
     client: &CdpClient,
     binding: &element::ExactBinding,
     backend: i64,
     operation: &OperationLease,
-    require_owner_size: bool,
+    kind: BoxKind,
     readonly_disposal: bool,
     evidence: Option<&mut SemanticNodeReadEvidence>,
-) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
+) -> Result<ExactBox, GeometryError> {
     check(operation)?;
     if readonly_disposal
         && client.debt_ledger().is_some()
@@ -1832,7 +2000,7 @@ async fn read_exact_box_with_evidence(
                     binding,
                     backend,
                     operation,
-                    require_owner_size,
+                    kind,
                     Some(&group),
                     evidence,
                 ),
@@ -1868,16 +2036,7 @@ async fn read_exact_box_with_evidence(
             primary: result.err().map(Box::new),
         });
     }
-    read_exact_box_inner(
-        client,
-        binding,
-        backend,
-        operation,
-        require_owner_size,
-        None,
-        evidence,
-    )
-    .await
+    read_exact_box_inner(client, binding, backend, operation, kind, None, evidence).await
 }
 // A positive native negative identity proof refuses this exact node. In the
 // readonly path the outer group still owns every acquired object on refusal;
@@ -1921,15 +2080,50 @@ fn box_resolution_failure(
     }
 }
 
+/// Read an exact object's identity and account for any returned handles.
+async fn read_box_proof(
+    client: &CdpClient,
+    binding: &element::ExactBinding,
+    object: &str,
+    function: &str,
+    readonly_group: Option<&str>,
+    operation: &OperationLease,
+    owned_objects: &mut Vec<String>,
+) -> Result<Value, GeometryError> {
+    let mut params = json!({"objectId":object,"functionDeclaration":function,"returnByValue":true});
+    if let Some(group) = readonly_group {
+        params["objectGroup"] = group.into();
+    }
+    let proof = command(
+        client,
+        &binding.session,
+        "Runtime.callFunctionOn",
+        params,
+        operation,
+    )
+    .await?;
+    for value in [
+        &proof["result"]["objectId"],
+        &proof["exceptionDetails"]["exception"]["objectId"],
+    ] {
+        if let Some(id) = value.as_str() {
+            if !owned_objects.iter().any(|owned| owned == id) {
+                owned_objects.push(id.to_owned());
+            }
+        }
+    }
+    Ok(proof)
+}
+
 async fn read_exact_box_inner(
     client: &CdpClient,
     binding: &element::ExactBinding,
     backend: i64,
     operation: &OperationLease,
-    require_owner_size: bool,
+    kind: BoxKind,
     readonly_group: Option<&str>,
     mut evidence: Option<&mut SemanticNodeReadEvidence>,
-) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
+) -> Result<ExactBox, GeometryError> {
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
     let observe_node = evidence.is_some();
@@ -2028,6 +2222,27 @@ async fn read_exact_box_inner(
         evidence.origin = NodeGeometryOrigin::BoxRead;
     }
     let result = async {
+        if kind == BoxKind::ActionOwner {
+            let proof = read_box_proof(
+                client,
+                binding,
+                &object,
+                EMPTY_IFRAME_PROOF,
+                readonly_group,
+                operation,
+                &mut owned_objects,
+            )
+            .await?;
+            let value = &proof["result"]["value"];
+            if proof.get("exceptionDetails").is_some() || value["connected"] != true {
+                return Err(GeometryError::StaleIdentity);
+            }
+            match value["empty"].as_bool() {
+                Some(true) => return Ok(ExactBox::EmptyIframe),
+                Some(false) => {}
+                None => return Err(GeometryError::InvalidGeometry),
+            }
+        }
         let model = command(
             client,
             &binding.session,
@@ -2046,34 +2261,21 @@ async fn read_exact_box_inner(
         // frame-owner Runtime.callFunctionOn proof for it, so a caller that
         // stops during the observation cannot cancel that read in flight
         // (levicode/e2e#225, #228).
-        if require_owner_size && empty_box(&model) {
-            return Ok((model, None));
+        if kind != BoxKind::Node && empty_box(&model) {
+            return Ok(ExactBox::Model(model, None));
         }
         // Recheck the same object against the isolated realm document after
         // geometry, not merely the frame loader: adoption can keep a node connected.
-        let mut params =
-            json!({"objectId":object,"functionDeclaration":BOX_PROOF,"returnByValue":true});
-        if let Some(group) = readonly_group {
-            params["objectGroup"] = group.into();
-        }
-        let proof = command(
+        let proof = read_box_proof(
             client,
-            &binding.session,
-            "Runtime.callFunctionOn",
-            params,
+            binding,
+            &object,
+            BOX_PROOF,
+            readonly_group,
             operation,
+            &mut owned_objects,
         )
         .await?;
-        for value in [
-            &proof["result"]["objectId"],
-            &proof["exceptionDetails"]["exception"]["objectId"],
-        ] {
-            if let Some(id) = value.as_str() {
-                if !owned_objects.iter().any(|owned| owned == id) {
-                    owned_objects.push(id.to_owned());
-                }
-            }
-        }
         if proof.get("exceptionDetails").is_some() || proof["result"]["value"]["connected"] != true
         {
             if let Some(evidence) = evidence.as_mut() {
@@ -2087,7 +2289,7 @@ async fn read_exact_box_inner(
             return Err(GeometryError::StaleIdentity);
         }
         let value = &proof["result"]["value"];
-        let size = if require_owner_size && value["frameOwner"] == true {
+        let size = if kind != BoxKind::Node && value["frameOwner"] == true {
             let w = number(value, "width")?;
             let h = number(value, "height")?;
             if w <= 0. || h <= 0. {
@@ -2097,7 +2299,7 @@ async fn read_exact_box_inner(
         } else {
             None
         };
-        Ok((model, size))
+        Ok(ExactBox::Model(model, size))
     }
     .await;
     if readonly_group.is_some() {
@@ -2337,6 +2539,7 @@ mod tests {
             viewport: viewport(),
             semantic_frames: None,
             excluded: HashSet::new(),
+            empty_action_frames: None,
         };
         let root = proof
             .frame_to_root_point("leaf", Point { x: 5., y: 7. })
@@ -3006,7 +3209,7 @@ mod tests {
             });
             let excluded = HashSet::from(["child".into()]);
             let (frames, sessions) =
-                read_proofs(&client, "page", &inputs, &excluded, None, &operation)
+                read_proofs(&client, "page", &inputs, &excluded, None, None, &operation)
                     .await
                     .unwrap();
             assert_eq!(frames.len(), 2);
@@ -3091,7 +3294,7 @@ mod tests {
             let mut wrong = inputs.clone();
             wrong[1].owner = Some(8);
             assert_eq!(
-                read_proofs(&client, "page", &wrong, &excluded, None, &operation)
+                read_proofs(&client, "page", &wrong, &excluded, None, None, &operation)
                     .await
                     .unwrap_err(),
                 GeometryError::StaleIdentity
@@ -3099,7 +3302,7 @@ mod tests {
             let mut replaced = inputs.clone();
             replaced[1].binding.loader = "replacement".into();
             assert_eq!(
-                read_proofs(&client, "page", &replaced, &excluded, None, &operation)
+                read_proofs(&client, "page", &replaced, &excluded, None, None, &operation)
                     .await
                     .unwrap_err(),
                 GeometryError::StaleIdentity
@@ -3115,6 +3318,7 @@ mod tests {
                     "page",
                     &inputs[..1],
                     &HashSet::new(),
+                    None,
                     None,
                     &operation
                 )

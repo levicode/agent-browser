@@ -26,15 +26,16 @@ use super::client_protocol::{
     Decision, DecisionNotice, ProtocolError, RequestOverrides, MAX_TIMEOUT_MS,
 };
 use super::client_session::{
-    CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
-    ObservedOperationFailure, OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
-    DEFAULT_DECISION_TIMEOUT_MS,
+    CancelSignal, ClientSession, DecisionAdmission, DecisionKind, DecisionLease, DecisionOutcome,
+    DecisionOwner, ObservedOperationFailure, OperationLease, ParkedRouteRegistry,
+    RouteRegistryTransfer, DEFAULT_DECISION_TIMEOUT_MS,
 };
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
 use base64::Engine;
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +61,7 @@ pub struct ClientNetwork {
     cancellation: tokio::sync::watch::Sender<CancelSignal>,
     sessions: Mutex<HashMap<String, EnrolledSession>>,
     tasks: Mutex<tokio::task::JoinSet<Result<(), ProtocolError>>>,
+    deferred_requests: Mutex<DeferredRequests>,
     #[cfg(test)]
     task_result_gate: Mutex<
         Option<(
@@ -83,6 +85,38 @@ pub struct ClientNetwork {
     download_subscriptions: Mutex<std::collections::HashSet<String>>,
 }
 
+const MAX_ACTIVE_NETWORK_TASKS: usize = 64;
+type NetworkWork =
+    Box<dyn FnOnce(Arc<ClientNetwork>) -> BoxFuture<'static, Result<(), ProtocolError>> + Send>;
+
+/// Waiting requests own their original interception and retained event bytes.
+/// Only running tasks consume the 64 callback execution slots.
+#[derive(Default)]
+struct DeferredRequests {
+    active: usize,
+    waiting: VecDeque<NetworkWork>,
+}
+
+/// Name a final refusal when the callback cannot occupy or retain an execution slot.
+fn record_task_capacity(method: &str) {
+    use super::client_settlement_trace::{
+        network_callback_failure, NetworkCallbackFailureObservation, NetworkCapacityObservation,
+        NetworkCapacityReason, NetworkFailureClass, NetworkTaskCommand,
+    };
+    network_callback_failure(NetworkCallbackFailureObservation {
+        command: NetworkTaskCommand::from_method(method),
+        failure: NetworkFailureClass::EventCapacity,
+        capacity: Some(NetworkCapacityObservation {
+            reason: NetworkCapacityReason::Count,
+            count: MAX_ACTIVE_NETWORK_TASKS as u64,
+            count_limit: MAX_ACTIVE_NETWORK_TASKS as u64,
+            bytes: 0,
+            bytes_limit: 0,
+        }),
+        ..Default::default()
+    });
+}
+
 /// Private per-occurrence receipt survives the callback task's cancellation.
 /// The owner-bound reader still owns command/debt settlement.
 struct DialogCommandReceipt {
@@ -95,6 +129,7 @@ struct DialogCommandReceipt {
 enum NetworkTaskFailure {
     Operation(ProtocolError),
     Command(super::cdp::client::NetworkCommandFailure),
+    Unsubmitted,
 }
 impl From<ProtocolError> for NetworkTaskFailure {
     fn from(error: ProtocolError) -> Self {
@@ -523,6 +558,7 @@ impl ClientNetwork {
             cancellation,
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
+            deferred_requests: Mutex::new(DeferredRequests::default()),
             #[cfg(test)]
             task_result_gate: Mutex::new(None),
             blocking_reads: Mutex::new(tokio::task::JoinSet::new()),
@@ -1529,16 +1565,25 @@ impl ClientNetwork {
                     return Err(ProtocolError::BrowserFailure);
                 }
             }
-            if tasks.len() >= 64 {
+            let mut deferred = self
+                .deferred_requests
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if deferred.active >= MAX_ACTIVE_NETWORK_TASKS
+                || (budget.is_none() && tasks.len() >= MAX_ACTIVE_NETWORK_TASKS)
+            {
                 self.broker.quarantine()?;
                 return Err(ProtocolError::CapacityExceeded);
             }
-            let this = self.clone();
             let params = event.params.clone();
-            tasks.spawn(async move {
-                let _budget = budget;
-                this.download_finished(params).await
+            deferred.active += 1;
+            let work: NetworkWork = Box::new(move |this| {
+                Box::pin(async move {
+                    let _budget = budget;
+                    this.download_finished(params).await
+                })
             });
+            tasks.spawn(self.clone().run_network_work(work));
             return Ok(());
         }
         let Some(session_id) = event.session_id.as_deref() else {
@@ -1722,27 +1767,19 @@ impl ClientNetwork {
                 return Err(ProtocolError::BrowserFailure);
             }
         }
-        if tasks.len() >= 64 {
+        let mut deferred = self
+            .deferred_requests
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let retained_request = event.method == "Fetch.requestPaused" && budget.is_some();
+        let at_capacity = deferred.active >= MAX_ACTIVE_NETWORK_TASKS
+            || (budget.is_none() && tasks.len() >= MAX_ACTIVE_NETWORK_TASKS);
+        if at_capacity && !retained_request {
             // Capacity never quarantines the scope. The callback-only task
             // bound refuses this occurrence; a paused Fetch request stays
             // paused for scope cleanup (its pending occurrence is retained)
             // and dialogs/auth are retired by their cleanup path.
-            super::client_settlement_trace::network_callback_failure(
-                super::client_settlement_trace::NetworkCallbackFailureObservation {
-                    command: super::client_settlement_trace::NetworkTaskCommand::from_method(
-                        &event.method,
-                    ),
-                    failure: super::client_settlement_trace::NetworkFailureClass::EventCapacity,
-                    capacity: Some(super::client_settlement_trace::NetworkCapacityObservation {
-                        reason: super::client_settlement_trace::NetworkCapacityReason::Count,
-                        count: 64,
-                        count_limit: 64,
-                        bytes: 0,
-                        bytes_limit: 0,
-                    }),
-                    ..Default::default()
-                },
-            );
+            record_task_capacity(&event.method);
             return Ok(());
         }
         let callback_event = matches!(
@@ -1753,7 +1790,7 @@ impl ClientNetwork {
         // A paused request from an unpublished page must not reserve UI ahead
         // of the lifecycle owner's exclusive restore/import work. Live-session
         // callbacks retain their original immediate reservation ordering.
-        let callback_reservation = if callback_event && !unpublished_callback {
+        let callback_reservation = if callback_event && !unpublished_callback && !at_capacity {
             // A paused request only needs a route decision, not UI custody.
             // Let it overlap a protected read; dialogs and auth still wait.
             Some(
@@ -1764,17 +1801,28 @@ impl ClientNetwork {
             None
         };
         let captured = if event.method == "Fetch.requestPaused" {
-            Some(self.capture_request(
+            let admission = if at_capacity {
+                DecisionAdmission::WaitingRequest
+            } else {
+                DecisionAdmission::Required
+            };
+            match self.capture_request(
                 &session.session_id,
-                DecisionOwner::Scope,
                 self.callback_decision_timeout_ms(),
-            )?)
+                admission,
+            ) {
+                Ok(captured) => Some(captured),
+                Err(ProtocolError::CapacityExceeded) if at_capacity => {
+                    record_task_capacity(&event.method);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
-        let this = self.clone();
         let event = event.clone();
-        tasks.spawn(async move {
+        let work = move |this: Arc<ClientNetwork>| async move {
             let _budget = budget;
             let deadline = captured
                 .as_ref()
@@ -1784,6 +1832,11 @@ impl ClientNetwork {
                 network: &this,
                 token: lease.token.clone(),
             });
+            if at_capacity && std::time::Instant::now() >= deadline {
+                // The queue item never ran. The original paused occurrence is
+                // still held for scope cleanup, just as for a full queue.
+                return Ok(());
+            }
             if callback_event {
                 if let Err(error) = this
                     .wait_for_configuration(configuration_ready, deadline)
@@ -1829,6 +1882,8 @@ impl ClientNetwork {
                     return Ok(());
                 }
                 Some(this.ui_gate.reserve_callback(false)?)
+            } else if at_capacity {
+                Some(this.ui_gate.reserve_callback(true)?)
             } else {
                 callback_reservation
             };
@@ -1859,11 +1914,37 @@ impl ClientNetwork {
             }
             let result = match event.method.as_str() {
                 "Fetch.requestPaused" => {
+                    let is_current = || {
+                        let sessions = this
+                            .sessions
+                            .lock()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                        if this.sealed.load(Ordering::Acquire)
+                            || !sessions.get(&session.session_id).is_some_and(|entry| {
+                                entry
+                                    .configuration_ready
+                                    .subscribe()
+                                    .same_channel(&session_tenure)
+                            })
+                        {
+                            return Ok(false);
+                        }
+                        let pending = this
+                            .pending_interceptions
+                            .lock()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                        Ok(pending_key
+                            .as_ref()
+                            .and_then(|key| pending.get(key))
+                            .zip(pending_occurrence.as_ref())
+                            .is_some_and(|(current, captured)| Arc::ptr_eq(current, captured)))
+                    };
                     this.paused_request_captured(
                         &session.session_id,
                         event.params,
                         captured.ok_or(ProtocolError::DecisionMissing)?,
                         &sink,
+                        retained_request.then_some(is_current),
                     )
                     .await
                 }
@@ -1893,6 +1974,7 @@ impl ClientNetwork {
             // because detach was applied while this task was awaiting its turn.
             let result = match result {
                 Ok(()) => Ok(()),
+                Err(NetworkTaskFailure::Unsubmitted) => return Ok(()),
                 Err(NetworkTaskFailure::Operation(error)) => Err(error),
                 Err(NetworkTaskFailure::Command(failure)) => {
                     if failure.local_capacity() {
@@ -1974,8 +2056,37 @@ impl ClientNetwork {
                 let _ = this.broker.quarantine();
             }
             result
-        });
+        };
+        let work: NetworkWork = Box::new(move |this| Box::pin(work(this)));
+        if at_capacity {
+            // The existing interception table bounds count and this work holds
+            // the enrollment subscriber's byte lease while it waits.
+            deferred.waiting.push_back(work);
+        } else {
+            deferred.active += 1;
+            tasks.spawn(self.clone().run_network_work(work));
+        }
         Ok(())
+    }
+
+    /// Reuse an execution slot after the previous task settles. The same lock
+    /// protects queue admission and slot retirement, including the last slot.
+    async fn run_network_work(self: Arc<Self>, mut work: NetworkWork) -> Result<(), ProtocolError> {
+        loop {
+            let result = work(self.clone()).await;
+            let mut deferred = self
+                .deferred_requests
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if result.is_ok() && !self.sealed.load(Ordering::Acquire) {
+                if let Some(next) = deferred.waiting.pop_front() {
+                    work = next;
+                    continue;
+                }
+            }
+            deferred.active -= 1;
+            return result;
+        }
     }
 
     pub(crate) async fn settle_borrowed_event(
@@ -2682,6 +2793,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            DecisionAdmission::Required,
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(decision_notice(&lease)))?;
@@ -2728,6 +2840,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            DecisionAdmission::Required,
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit(
@@ -3083,6 +3196,11 @@ impl ClientNetwork {
         self.cancellation.send_replace(CancelSignal::SessionClosed);
         self.broker
             .revoke_scope_decisions(&self.scope.identity_scope)?;
+        self.deferred_requests
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .waiting
+            .clear();
         let tokens: Vec<_> = self
             .tokens
             .lock()
@@ -3281,8 +3399,8 @@ impl ClientNetwork {
     fn capture_request(
         &self,
         session: &str,
-        owner: DecisionOwner,
         timeout_ms: u64,
+        admission: DecisionAdmission,
     ) -> Result<DecisionLease, ProtocolError> {
         self.check()?;
         let current = self
@@ -3294,7 +3412,7 @@ impl ClientNetwork {
         }
         let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
-            owner,
+            DecisionOwner::Scope,
             DecisionKind::Request,
             timeout_ms,
             *current,
@@ -3302,6 +3420,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            admission,
         )?;
         let mut tokens = self
             .tokens
@@ -3321,6 +3440,7 @@ impl ClientNetwork {
         params: Value,
         mut lease: DecisionLease,
         sink: &ClientEventSink,
+        retained_request: Option<impl Fn() -> Result<bool, ProtocolError>>,
     ) -> Result<(), NetworkTaskFailure> {
         self.check()?;
         let request_id = params
@@ -3466,6 +3586,24 @@ impl ClientNetwork {
                             json!(base64::engine::general_purpose::STANDARD.encode(body.bytes()));
                     } else if let Some(body) = overrides.body_base64 {
                         command["postData"] = json!(body);
+                    }
+                    if let Some(is_current) = &retained_request {
+                        let continued = self
+                            .client
+                            .continue_paused_request(
+                                command,
+                                session,
+                                lease.deadline,
+                                self.cancellation.subscribe(),
+                                is_current,
+                            )
+                            .await
+                            .map_err(NetworkTaskFailure::Command)?;
+                        return if continued {
+                            Ok(())
+                        } else {
+                            Err(NetworkTaskFailure::Unsubmitted)
+                        };
                     }
                     return self
                         .client
@@ -4841,7 +4979,7 @@ mod bridge_tests {
             .replace_routes(7, vec!["first".into(), "second".into()])
             .unwrap();
         let pending = source
-            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .capture_request("owned", 1000, DecisionAdmission::Required)
             .unwrap();
         let registrations = pending.registrations.clone();
         let terminal = disconnect_terminal(&fixture).await;
@@ -4891,7 +5029,7 @@ mod bridge_tests {
         routes.adopt(&targets, &operation).unwrap();
         assert_eq!(*replacement.registry.lock().unwrap(), Some(7));
         let next = replacement
-            .capture_request("new-session", DecisionOwner::Scope, 1000)
+            .capture_request("new-session", 1000, DecisionAdmission::Required)
             .unwrap();
         assert!(Arc::ptr_eq(&registrations, &next.registrations));
         source.revoke().unwrap();
@@ -4909,7 +5047,7 @@ mod bridge_tests {
             .unwrap()
             .is_empty());
         assert!(source
-            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .capture_request("owned", 1000, DecisionAdmission::Required)
             .is_err());
         replacement.close().await.unwrap();
         assert_eq!(
@@ -5090,7 +5228,7 @@ mod bridge_tests {
         let source = fixture.source.clone();
         source.replace_routes(1, vec!["route".into()]).unwrap();
         let pending = source
-            .capture_request("owned", DecisionOwner::Scope, 30_000)
+            .capture_request("owned", 30_000, DecisionAdmission::Required)
             .unwrap();
         source
             .retirement_sink
@@ -5253,7 +5391,7 @@ mod bridge_tests {
         let mut transfer = source.capture_route_transfer(&operation).unwrap();
         assert_eq!(
             source
-                .capture_request("owned", DecisionOwner::Scope, 1000)
+                .capture_request("owned", 1000, DecisionAdmission::Required)
                 .err()
                 .unwrap(),
             ProtocolError::StaleScope
@@ -5282,7 +5420,7 @@ mod bridge_tests {
             .is_empty());
         transfer.adopt(&operation).unwrap();
         let request = replacement
-            .capture_request("replacement-page", DecisionOwner::Scope, 1000)
+            .capture_request("replacement-page", 1000, DecisionAdmission::Required)
             .unwrap();
         assert_eq!(request.registry_version, Some(7));
         assert_eq!(

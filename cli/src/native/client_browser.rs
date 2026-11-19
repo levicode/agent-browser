@@ -4483,7 +4483,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             action_tasks.check_input_dispatch(journal.key())?;
                             observation.check_publication_fence(publication_fence)
                         }).await?;
-                        let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(&page.client, &page.page_session_id, &frames, &opaque_frames, &lease).await.map_err(|error| {
+                        let geometry = super::client_geometry::GeometrySnapshot::capture_for_action(&page.client, &page.page_session_id, &frames, &opaque_frames, &lease).await.map_err(|error| {
                             use super::client_geometry::GeometryError;
                             match error {
                                 GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,

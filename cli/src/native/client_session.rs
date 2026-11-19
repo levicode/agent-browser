@@ -187,6 +187,12 @@ pub enum DecisionOwner {
     Scope,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionAdmission {
+    Required,
+    WaitingRequest,
+}
+
 struct PendingDecision {
     eval_window: Option<super::client_debt::EvalWindowHandle>,
     resource_scope: Option<String>,
@@ -1733,6 +1739,7 @@ impl ClientSession {
             registry,
             resource_scope,
             None,
+            DecisionAdmission::Required,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -1746,6 +1753,7 @@ impl ClientSession {
         registry: Option<u64>,
         resource_scope: Option<String>,
         eval_window: Option<super::client_debt::EvalWindowHandle>,
+        admission: DecisionAdmission,
     ) -> Result<DecisionLease, ProtocolError> {
         if resource_scope.as_ref().is_some_and(String::is_empty) {
             return Err(ProtocolError::InvalidArguments);
@@ -1757,6 +1765,13 @@ impl ClientSession {
         }
         if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
             return Err(ProtocolError::InvalidTimeout);
+        }
+        // Waiting requests have not started. Leave room for callbacks and
+        // operations that already own a slot, regardless of scope overlap.
+        if admission == DecisionAdmission::WaitingRequest
+            && inner.decisions.len() >= MAX_DECISIONS / 2
+        {
+            return Err(ProtocolError::CapacityExceeded);
         }
         if inner.decisions.len() >= MAX_DECISIONS {
             Self::seal(&mut inner, ScopeState::Quarantined);
@@ -2728,6 +2743,7 @@ mod tests {
                 None,
                 Some("scope".into()),
                 Some(window.clone()),
+                DecisionAdmission::Required,
             )
             .unwrap()
     }

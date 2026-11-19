@@ -879,6 +879,133 @@ async fn pre_submit_capacity_refusal_keeps_the_scope_usable() {
     close_peer(peer).await;
 }
 
+#[tokio::test]
+async fn paused_request_burst_drains_without_discarding_continuations() {
+    paused_request_burst(80, 80).await;
+}
+
+#[tokio::test]
+async fn paused_request_burst_preserves_broker_capacity() {
+    paused_request_burst(257, 128).await;
+}
+
+/// Hold the original route decisions and Security reservations across admission.
+async fn paused_request_burst(received: usize, admitted: usize) {
+    let mut peer = peer().await;
+    let broker = Arc::new(ClientSession::new());
+    let (sink, mut emitted) = ClientEventSink::test_channel(broker.clone());
+    let scope = BlobScope {
+        generation: 1,
+        identity_scope: SCOPE.into(),
+    };
+    let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+    blobs.activate_scope(scope.clone()).unwrap();
+    let network = Arc::new(ClientNetwork::new(
+        peer.client.clone(),
+        broker.clone(),
+        sink,
+        scope,
+        blobs,
+        Arc::new(super::super::client_ui::UiGate::default()),
+        NetworkPolicy::default(),
+    ));
+    enroll(&network, ROOT_SESSION, ROOT_SESSION, true);
+    let _operation = broker.admit(1, 1, 5_000).unwrap();
+    assert!(broker.start(1, 1).unwrap());
+    let mut events = peer
+        .client
+        .subscribe_bounded_methods(&["Fetch.requestPaused"], MAX_ACTIVE_NETWORK_TASKS, 1024)
+        .unwrap();
+    for index in 0..received {
+        peer.emit
+            .send(
+                json!({"method":"Fetch.requestPaused","sessionId":ROOT_SESSION,
+                "params":{"requestId":format!("request-{index}"),
+                  "request":{"url":"https://fixture.invalid/resource","method":"GET","headers":{}}}}),
+            )
+            .unwrap();
+        let event = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        network
+            .event_with_budget(&event, event.budget_lease())
+            .unwrap();
+    }
+    {
+        let deferred = network.deferred_requests.lock().unwrap();
+        assert_eq!(deferred.active, MAX_ACTIVE_NETWORK_TASKS);
+        assert_eq!(deferred.waiting.len(), admitted - MAX_ACTIVE_NETWORK_TASKS);
+    }
+    assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+    let decisions = tokio::spawn(async move {
+        for _ in 0..admitted {
+            let Some(ServerMessage::Event {
+                decision: Some(token),
+                ..
+            }) = emitted.recv().await
+            else {
+                panic!("expected the original route decision");
+            };
+            broker
+                .resolve(
+                    1,
+                    &token.token,
+                    Decision::Continue {
+                        overrides: Default::default(),
+                    },
+                )
+                .unwrap();
+        }
+    });
+    let mut in_flight = VecDeque::new();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..32 {
+        let command = next_command(&mut peer, "Fetch.continueRequest", ROOT_SESSION).await;
+        assert!(seen.insert(command["params"]["requestId"].as_str().unwrap().to_owned()));
+        in_flight.push_back(command);
+    }
+    assert_eq!(peer.ledger.snapshot().outstanding_commands, 32);
+    assert!(peer.commands.try_recv().is_err());
+    for _ in 32..admitted {
+        let command = in_flight.pop_front().unwrap();
+        peer.emit
+            .send(json!({"id":command["id"],"sessionId":ROOT_SESSION,"result":{}}))
+            .unwrap();
+        let command = next_command(&mut peer, "Fetch.continueRequest", ROOT_SESSION).await;
+        assert!(seen.insert(command["params"]["requestId"].as_str().unwrap().to_owned()));
+        in_flight.push_back(command);
+    }
+    for command in in_flight {
+        peer.emit
+            .send(json!({"id":command["id"],"sessionId":ROOT_SESSION,"result":{}}))
+            .unwrap();
+    }
+    tokio::time::timeout(WAIT, decisions)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+    while let Some(result) = tokio::time::timeout(WAIT, tasks.join_next()).await.unwrap() {
+        assert_eq!(result.unwrap(), Ok(()));
+    }
+    assert_eq!(seen.len(), admitted);
+    assert_eq!(network.pending_callbacks().unwrap(), 0);
+    {
+        let pending = network.pending_interceptions.lock().unwrap();
+        assert_eq!(pending.len(), received - admitted);
+        for index in admitted..received {
+            assert!(pending.contains_key(&(
+                ROOT_SESSION.to_owned(),
+                "Fetch.requestPaused".to_owned(),
+                format!("request-{index}"),
+            )));
+        }
+    }
+    assert_eq!(peer.ledger.snapshot().outstanding_commands, 0);
+    close_peer(peer).await;
+}
+
 #[derive(Clone, Copy, Debug)]
 enum LocalFailureCase {
     ForeignSessionThenDetach,
