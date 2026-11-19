@@ -1859,7 +1859,36 @@ impl CdpClient {
                 request_gone: false,
             });
         }
-        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        let reservation = match self.reserve_tracked_command_observed_typed(
+            method,
+            Some(&params),
+            Some(session),
+            &mut AdmissionObservation::default(),
+        ) {
+            Ok(reservation) => reservation,
+            Err(failure) => {
+                let (reservation, ledger_error) = match &failure {
+                    TrackedReservationFailure::OwnerChanged => (
+                        super::super::client_settlement_trace::NetworkReservation::OwnerChanged,
+                        None,
+                    ),
+                    TrackedReservationFailure::OwnerRequired => (
+                        super::super::client_settlement_trace::NetworkReservation::OwnerRequired,
+                        None,
+                    ),
+                    TrackedReservationFailure::Ledger(error) => (
+                        super::super::client_settlement_trace::NetworkReservation::Ledger,
+                        Some(error.clone()),
+                    ),
+                };
+                super::super::client_settlement_trace::network_reservation_failure(
+                    super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
+                    reservation,
+                    ledger_error,
+                );
+                return Err(failure.legacy_message().to_owned().into());
+            }
+        };
         self.send_reserved_network_task_command(method, params, session, reservation)
             .await
     }
@@ -1940,7 +1969,9 @@ impl CdpClient {
         // terminal command failed and at which stage, never the CDP prose.
         let command =
             super::super::client_settlement_trace::NetworkTaskCommand::from_method(method);
+        let recorded = std::sync::atomic::AtomicBool::new(false);
         let failure = |class| {
+            recorded.store(true, std::sync::atomic::Ordering::Relaxed);
             super::super::client_settlement_trace::network_callback_failure(command, class);
         };
         let result = within_initialization(budget, async {
@@ -2000,6 +2031,17 @@ impl CdpClient {
             }
         })
         .await;
+        if result.is_err() && !recorded.load(std::sync::atomic::Ordering::Relaxed) {
+            // The outer initialization was cancelled or expired before the
+            // inner body produced a classified command failure.
+            let class = match result.as_ref().err().map(String::as_str) {
+                Some(message) if message.contains("cancelled") => {
+                    super::super::client_settlement_trace::NetworkFailureClass::Canceled
+                }
+                _ => super::super::client_settlement_trace::NetworkFailureClass::Deadline,
+            };
+            super::super::client_settlement_trace::network_callback_failure(command, class);
+        }
         result.map_err(|_| NetworkCommandFailure {
             retirement: capture.and_then(|capture| capture.retirement),
             request_gone,

@@ -375,6 +375,10 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_failure: Option<NetworkFailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_reservation: Option<NetworkReservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_ledger_error: Option<ProtocolError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted: Option<bool>,
@@ -1083,7 +1087,13 @@ diagnostic_enum!(NetworkFailureClass {
     InterceptionGone,
     LocalFailure,
     ChannelClosed,
-    Deadline
+    Deadline,
+    Canceled
+});
+diagnostic_enum!(NetworkReservation {
+    OwnerChanged,
+    OwnerRequired,
+    Ledger
 });
 impl NetworkTaskCommand {
     pub(crate) fn from_method(method: &str) -> Self {
@@ -1095,6 +1105,26 @@ impl NetworkTaskCommand {
             "Page.handleJavaScriptDialog" => Self::HandleDialog,
             _ => Self::Other,
         }
+    }
+}
+pub(crate) fn network_reservation_failure(
+    command: NetworkTaskCommand,
+    reservation: NetworkReservation,
+    ledger_error: Option<ProtocolError>,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            0,
+            Phase::NetworkCallbackFailure,
+            Facts {
+                network_command: Some(command),
+                network_failure: Some(NetworkFailureClass::ReservationRejected),
+                network_reservation: Some(reservation),
+                network_ledger_error: ledger_error,
+                ..Facts::default()
+            },
+        );
     }
 }
 pub(crate) fn network_callback_failure(command: NetworkTaskCommand, failure: NetworkFailureClass) {
@@ -4296,6 +4326,11 @@ mod isolation_tests {
             NetworkTaskCommand::ContinueRequest,
             NetworkFailureClass::InterceptionGone,
         );
+        network_reservation_failure(
+            NetworkTaskCommand::FulfillRequest,
+            NetworkReservation::Ledger,
+            Some(ProtocolError::StaleScope),
+        );
         let records = rows(&file);
         // The caller is this test, which is exactly what `#[track_caller]` must
         // report: the transition function must not claim its own line. The
@@ -4326,6 +4361,16 @@ mod isolation_tests {
             .expect("network callback failure wrote no record");
         assert_eq!(callback["operationSeq"], 0);
         assert_eq!(callback["networkFailure"], "interception-gone");
+        let reservation = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure"
+                    && record["networkReservation"] == "ledger"
+            })
+            .expect("network reservation failure wrote no record");
+        assert_eq!(reservation["networkCommand"], "fulfill-request");
+        assert_eq!(reservation["networkFailure"], "reservation-rejected");
+        assert_eq!(reservation["networkLedgerError"], "stale-scope");
     }
 }
 
