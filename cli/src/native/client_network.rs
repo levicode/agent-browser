@@ -26,9 +26,9 @@ use super::client_protocol::{
     Decision, DecisionNotice, ProtocolError, RequestOverrides, MAX_TIMEOUT_MS,
 };
 use super::client_session::{
-    CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
-    ObservedOperationFailure, OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
-    DEFAULT_DECISION_TIMEOUT_MS,
+    CancelSignal, ClientSession, DecisionAdmission, DecisionKind, DecisionLease, DecisionOutcome,
+    DecisionOwner, ObservedOperationFailure, OperationLease, ParkedRouteRegistry,
+    RouteRegistryTransfer, DEFAULT_DECISION_TIMEOUT_MS,
 };
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
@@ -1801,10 +1801,15 @@ impl ClientNetwork {
             None
         };
         let captured = if event.method == "Fetch.requestPaused" {
+            let admission = if at_capacity {
+                DecisionAdmission::WaitingRequest
+            } else {
+                DecisionAdmission::Required
+            };
             match self.capture_request(
                 &session.session_id,
-                DecisionOwner::Scope,
                 self.callback_decision_timeout_ms(),
+                admission,
             ) {
                 Ok(captured) => Some(captured),
                 Err(ProtocolError::CapacityExceeded) if at_capacity => {
@@ -1827,6 +1832,11 @@ impl ClientNetwork {
                 network: &this,
                 token: lease.token.clone(),
             });
+            if at_capacity && std::time::Instant::now() >= deadline {
+                // The queue item never ran. The original paused occurrence is
+                // still held for scope cleanup, just as for a full queue.
+                return Ok(());
+            }
             if callback_event {
                 if let Err(error) = this
                     .wait_for_configuration(configuration_ready, deadline)
@@ -2783,6 +2793,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            DecisionAdmission::Required,
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(decision_notice(&lease)))?;
@@ -2829,6 +2840,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            DecisionAdmission::Required,
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit(
@@ -3387,8 +3399,8 @@ impl ClientNetwork {
     fn capture_request(
         &self,
         session: &str,
-        owner: DecisionOwner,
         timeout_ms: u64,
+        admission: DecisionAdmission,
     ) -> Result<DecisionLease, ProtocolError> {
         self.check()?;
         let current = self
@@ -3400,7 +3412,7 @@ impl ClientNetwork {
         }
         let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
-            owner,
+            DecisionOwner::Scope,
             DecisionKind::Request,
             timeout_ms,
             *current,
@@ -3408,6 +3420,7 @@ impl ClientNetwork {
             self.client.debt_ledger().and_then(|ledger| {
                 ledger.capturable_eval_window(&self.scope.identity_scope, session)
             }),
+            admission,
         )?;
         let mut tokens = self
             .tokens
@@ -4966,7 +4979,7 @@ mod bridge_tests {
             .replace_routes(7, vec!["first".into(), "second".into()])
             .unwrap();
         let pending = source
-            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .capture_request("owned", 1000, DecisionAdmission::Required)
             .unwrap();
         let registrations = pending.registrations.clone();
         let terminal = disconnect_terminal(&fixture).await;
@@ -5016,7 +5029,7 @@ mod bridge_tests {
         routes.adopt(&targets, &operation).unwrap();
         assert_eq!(*replacement.registry.lock().unwrap(), Some(7));
         let next = replacement
-            .capture_request("new-session", DecisionOwner::Scope, 1000)
+            .capture_request("new-session", 1000, DecisionAdmission::Required)
             .unwrap();
         assert!(Arc::ptr_eq(&registrations, &next.registrations));
         source.revoke().unwrap();
@@ -5034,7 +5047,7 @@ mod bridge_tests {
             .unwrap()
             .is_empty());
         assert!(source
-            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .capture_request("owned", 1000, DecisionAdmission::Required)
             .is_err());
         replacement.close().await.unwrap();
         assert_eq!(
@@ -5215,7 +5228,7 @@ mod bridge_tests {
         let source = fixture.source.clone();
         source.replace_routes(1, vec!["route".into()]).unwrap();
         let pending = source
-            .capture_request("owned", DecisionOwner::Scope, 30_000)
+            .capture_request("owned", 30_000, DecisionAdmission::Required)
             .unwrap();
         source
             .retirement_sink
@@ -5378,7 +5391,7 @@ mod bridge_tests {
         let mut transfer = source.capture_route_transfer(&operation).unwrap();
         assert_eq!(
             source
-                .capture_request("owned", DecisionOwner::Scope, 1000)
+                .capture_request("owned", 1000, DecisionAdmission::Required)
                 .err()
                 .unwrap(),
             ProtocolError::StaleScope
@@ -5407,7 +5420,7 @@ mod bridge_tests {
             .is_empty());
         transfer.adopt(&operation).unwrap();
         let request = replacement
-            .capture_request("replacement-page", DecisionOwner::Scope, 1000)
+            .capture_request("replacement-page", 1000, DecisionAdmission::Required)
             .unwrap();
         assert_eq!(request.registry_version, Some(7));
         assert_eq!(

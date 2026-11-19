@@ -879,11 +879,18 @@ async fn pre_submit_capacity_refusal_keeps_the_scope_usable() {
     close_peer(peer).await;
 }
 
-/// Hold all 32 Security reservations, then drain more than 64 real paused
-/// events without expanding either execution or ledger capacity.
 #[tokio::test]
 async fn paused_request_burst_drains_without_discarding_continuations() {
-    const REQUESTS: usize = 80;
+    paused_request_burst(80, 80).await;
+}
+
+#[tokio::test]
+async fn paused_request_burst_preserves_broker_capacity() {
+    paused_request_burst(257, 128).await;
+}
+
+/// Hold the original route decisions and Security reservations across admission.
+async fn paused_request_burst(received: usize, admitted: usize) {
     let mut peer = peer().await;
     let broker = Arc::new(ClientSession::new());
     let (sink, mut emitted) = ClientEventSink::test_channel(broker.clone());
@@ -907,10 +914,32 @@ async fn paused_request_burst_drains_without_discarding_continuations() {
     assert!(broker.start(1, 1).unwrap());
     let mut events = peer
         .client
-        .subscribe_bounded_methods(&["Fetch.requestPaused"], REQUESTS, 1024)
+        .subscribe_bounded_methods(&["Fetch.requestPaused"], MAX_ACTIVE_NETWORK_TASKS, 1024)
         .unwrap();
+    for index in 0..received {
+        peer.emit
+            .send(
+                json!({"method":"Fetch.requestPaused","sessionId":ROOT_SESSION,
+                "params":{"requestId":format!("request-{index}"),
+                  "request":{"url":"https://fixture.invalid/resource","method":"GET","headers":{}}}}),
+            )
+            .unwrap();
+        let event = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        network
+            .event_with_budget(&event, event.budget_lease())
+            .unwrap();
+    }
+    {
+        let deferred = network.deferred_requests.lock().unwrap();
+        assert_eq!(deferred.active, MAX_ACTIVE_NETWORK_TASKS);
+        assert_eq!(deferred.waiting.len(), admitted - MAX_ACTIVE_NETWORK_TASKS);
+    }
+    assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
     let decisions = tokio::spawn(async move {
-        for _ in 0..REQUESTS {
+        for _ in 0..admitted {
             let Some(ServerMessage::Event {
                 decision: Some(token),
                 ..
@@ -929,29 +958,6 @@ async fn paused_request_burst_drains_without_discarding_continuations() {
                 .unwrap();
         }
     });
-    for index in 0..REQUESTS {
-        peer.emit
-            .send(
-                json!({"method":"Fetch.requestPaused","sessionId":ROOT_SESSION,
-            "params":{"requestId":format!("request-{index}"),
-              "request":{"url":"https://fixture.invalid/resource","method":"GET","headers":{}}}}),
-            )
-            .unwrap();
-    }
-    for _ in 0..REQUESTS {
-        let event = tokio::time::timeout(WAIT, events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        network
-            .event_with_budget(&event, event.budget_lease())
-            .unwrap();
-    }
-    {
-        let deferred = network.deferred_requests.lock().unwrap();
-        assert_eq!(deferred.active, MAX_ACTIVE_NETWORK_TASKS);
-        assert_eq!(deferred.waiting.len(), REQUESTS - MAX_ACTIVE_NETWORK_TASKS);
-    }
     let mut in_flight = VecDeque::new();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..32 {
@@ -961,7 +967,7 @@ async fn paused_request_burst_drains_without_discarding_continuations() {
     }
     assert_eq!(peer.ledger.snapshot().outstanding_commands, 32);
     assert!(peer.commands.try_recv().is_err());
-    for _ in 32..REQUESTS {
+    for _ in 32..admitted {
         let command = in_flight.pop_front().unwrap();
         peer.emit
             .send(json!({"id":command["id"],"sessionId":ROOT_SESSION,"result":{}}))
@@ -983,9 +989,19 @@ async fn paused_request_burst_drains_without_discarding_continuations() {
     while let Some(result) = tokio::time::timeout(WAIT, tasks.join_next()).await.unwrap() {
         assert_eq!(result.unwrap(), Ok(()));
     }
-    assert_eq!(seen.len(), REQUESTS);
+    assert_eq!(seen.len(), admitted);
     assert_eq!(network.pending_callbacks().unwrap(), 0);
-    assert!(network.pending_interceptions.lock().unwrap().is_empty());
+    {
+        let pending = network.pending_interceptions.lock().unwrap();
+        assert_eq!(pending.len(), received - admitted);
+        for index in admitted..received {
+            assert!(pending.contains_key(&(
+                ROOT_SESSION.to_owned(),
+                "Fetch.requestPaused".to_owned(),
+                format!("request-{index}"),
+            )));
+        }
+    }
     assert_eq!(peer.ledger.snapshot().outstanding_commands, 0);
     close_peer(peer).await;
 }
