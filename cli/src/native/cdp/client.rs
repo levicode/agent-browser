@@ -1923,7 +1923,8 @@ impl CdpClient {
         session: &str,
     ) -> Result<Option<CommandReservation>, NetworkCommandFailure> {
         self.try_reserve_network_task_command(method, params, session)
-            .map_err(|(failure, witness)| {
+            .map_err(|rejection| {
+                let (failure, witness) = *rejection;
                 super::super::client_settlement_trace::network_callback_failure(witness);
                 failure
             })
@@ -1971,7 +1972,8 @@ impl CdpClient {
                         .await
                         .map(|_| true);
                 }
-                Err((failure, witness)) => {
+                Err(rejection) => {
+                    let (failure, witness) = *rejection;
                     if !witness.capacity.is_some_and(|capacity| {
                         matches!(capacity.reason, NetworkCapacityReason::Count)
                     }) {
@@ -2007,10 +2009,10 @@ impl CdpClient {
         session: &str,
     ) -> Result<
         Option<CommandReservation>,
-        (
+        Box<(
             NetworkCommandFailure,
             super::super::client_settlement_trace::NetworkCallbackFailureObservation,
-        ),
+        )>,
     > {
         use super::super::client_debt::CapacityRefusalReason;
         use super::super::client_settlement_trace::{
@@ -2046,7 +2048,7 @@ impl CdpClient {
             } else {
                 None
             };
-            (
+            Box::new((
                 NetworkCommandFailure {
                     retirement: None,
                     request_gone: false,
@@ -2060,7 +2062,7 @@ impl CdpClient {
                     capacity,
                     ..Default::default()
                 },
-            )
+            ))
         })
     }
     /// Dialogs already own a reservation/status used by borrowed cleanup. Reuse
