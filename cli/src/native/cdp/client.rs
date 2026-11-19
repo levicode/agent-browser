@@ -1850,6 +1850,10 @@ impl CdpClient {
                 | "Fetch.continueWithAuth"
                 | "Page.handleJavaScriptDialog"
         ) {
+            super::super::client_settlement_trace::network_callback_failure(
+                super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
+                super::super::client_settlement_trace::NetworkFailureClass::ReservationRejected,
+            );
             return Err(NetworkCommandFailure {
                 retirement: None,
                 request_gone: false,
@@ -1908,6 +1912,10 @@ impl CdpClient {
             reservation.is_owner_cleanup()
                 || !reservation.matches_envelope(method, Some(&params), Some(session))
         }) {
+            super::super::client_settlement_trace::network_callback_failure(
+                super::super::client_settlement_trace::NetworkTaskCommand::from_method(method),
+                super::super::client_settlement_trace::NetworkFailureClass::EnvelopeMismatch,
+            );
             return Err(NetworkCommandFailure {
                 retirement: None,
                 request_gone: false,
@@ -1928,6 +1936,13 @@ impl CdpClient {
             .as_ref()
             .and_then(CommandReservation::initialization_budget);
         let mut request_gone = false;
+        // Closed evidence for the callback-command failure branch: which fixed
+        // terminal command failed and at which stage, never the CDP prose.
+        let command =
+            super::super::client_settlement_trace::NetworkTaskCommand::from_method(method);
+        let failure = |class| {
+            super::super::client_settlement_trace::network_callback_failure(command, class);
+        };
         let result = within_initialization(budget, async {
             let response = self
                 .submit_reserved_command_bound(
@@ -1937,7 +1952,12 @@ impl CdpClient {
                     reservation,
                     None,
                 )
-                .await?;
+                .await
+                .inspect_err(|_| {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::SubmitFailed,
+                    );
+                })?;
             let reply = self
                 .await_command_reply_observed(response, response_deadline, capture.as_mut())
                 .await;
@@ -1952,15 +1972,29 @@ impl CdpClient {
                     if error.is_interception_not_found() {
                         request_gone = true;
                     }
+                    failure(if error.is_interception_not_found() {
+                        super::super::client_settlement_trace::NetworkFailureClass::InterceptionGone
+                    } else {
+                        super::super::client_settlement_trace::NetworkFailureClass::ErrorAck
+                    });
                     Err(format!("CDP error ({}): {}", method, error))
                 }
                 // These fixed terminal methods carry no remote-object courier.
                 // An unvalidated envelope is never a success or retirement ACK.
                 Ok(CommandReply::LocalFailure(_)) => {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::LocalFailure,
+                    );
                     Err("Unvalidated network terminal reply".into())
                 }
-                Err(CommandWaitFailure::ChannelClosed) => Err("CDP response channel closed".into()),
+                Err(CommandWaitFailure::ChannelClosed) => {
+                    failure(
+                        super::super::client_settlement_trace::NetworkFailureClass::ChannelClosed,
+                    );
+                    Err("CDP response channel closed".into())
+                }
                 Err(CommandWaitFailure::Deadline) => {
+                    failure(super::super::client_settlement_trace::NetworkFailureClass::Deadline);
                     Err(format!("CDP command timed out: {}", method))
                 }
             }
