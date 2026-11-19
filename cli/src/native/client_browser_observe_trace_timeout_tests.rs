@@ -24,6 +24,7 @@ enum Case {
     OptionalRestoreFailure,
     SemanticFinalViewportHeld,
     SemanticFinalViewportForeignHeld,
+    OptionalFrameChange,
 }
 
 // verify_document_root -> semantic viewport -> geometry tree/viewport ->
@@ -88,6 +89,7 @@ async fn peer(case: Case) -> Peer {
         let target = json!({"targetId":"host-page","type":"page","browserContextId":"host-context","url":"about:blank","title":""});
         let frame = "frame-host-session";
         let mut loader = "host-loader";
+        let mut frame_url = "about:blank";
         let mut source_holder = false;
         let (mut removed, mut released, mut rate_restored) = (false, false, false);
         let mut captures = 0;
@@ -96,6 +98,7 @@ async fn peer(case: Case) -> Peer {
         let mut release_job = None;
         let mut semantic_suffix = None;
         let mut semantic_marker_seen = false;
+        let mut change_optional_frames = false;
         loop {
             tokio::select! {
                 // Test peer teardown only. EOF is not a synthetic capture ACK
@@ -109,6 +112,7 @@ async fn peer(case: Case) -> Peer {
                     let data = if source_holder { &protected } else { &unprotected };
                     let result = if raw {
                         if case == Case::OptionalMalformedHeld { json!({"data":42}) } else { json!({"data":data}) }
+
                     } else { observation_reply(&request).expect("known held readonly command") };
                     let session = if (raw && case == Case::OptionalWrongSessionHeld)
                         || (request["method"] == "Page.getLayoutMetrics" && case == Case::SemanticFinalViewportForeignHeld)
@@ -121,7 +125,12 @@ async fn peer(case: Case) -> Peer {
                     recorded.lock().unwrap().push(request.clone());
                     let method = request["method"].as_str().unwrap();
                     let session = request["sessionId"].as_str().unwrap_or("");
-                    if matches!(case, Case::SemanticFinalViewportHeld | Case::SemanticFinalViewportForeignHeld) {
+                    if change_optional_frames && method == "Page.getFrameTree" {
+                        // Simulate a same-document frame update after the semantic proof.
+                        frame_url = "about:blank#updated";
+                        change_optional_frames = false;
+                    }
+                    if matches!(case, Case::SemanticFinalViewportHeld | Case::SemanticFinalViewportForeignHeld | Case::OptionalFrameChange) {
                         // The unique document-root verification follows real
                         // semantic metadata. Match its complete finite suffix,
                         // not an unbounded count of viewport requests.
@@ -148,12 +157,19 @@ async fn peer(case: Case) -> Peer {
                                     assert_eq!(request["params"], json!({}));
                                 }
                                 if index + 1 == SEMANTIC_COMPLETION_SUFFIX.len() {
-                                    assert!(held.replace(request.clone()).is_none());
                                     semantic_suffix = None;
-                                    semantic_reached.store(true, Ordering::Release);
-                                    continue;
+                                    if case == Case::OptionalFrameChange {
+                                        // Change the first frame inventory of optional pixel capture,
+                                        // after the semantic frame and viewport fences.
+                                        change_optional_frames = true;
+                                    } else {
+                                        assert!(held.replace(request.clone()).is_none());
+                                        semantic_reached.store(true, Ordering::Release);
+                                        continue;
+                                    }
+                                } else {
+                                    semantic_suffix = Some(index + 1);
                                 }
-                                semantic_suffix = Some(index + 1);
                             }
                         }
                     }
@@ -166,7 +182,7 @@ async fn peer(case: Case) -> Peer {
                         "Target.getTargetInfo" => { assert_eq!(request["params"]["targetId"], "host-page"); json!({"targetInfo":target.clone()}) },
                         "Target.attachToTarget" => { assert_eq!(request["params"]["targetId"], "host-page"); json!({"sessionId":"host-session"}) },
                         "Page.getFrameTree" => {
-                            let mut root=json!({"frame":{"id":frame,"loaderId":loader,"url":"about:blank"}});
+                            let mut root=json!({"frame":{"id":frame,"loaderId":loader,"url":frame_url}});
                             if case == Case::SemanticFrameOwnerReleaseHeld { root["childFrames"]=json!([{"frame":{"id":"child-frame","parentId":frame,"loaderId":"child-doc","url":"about:blank"}}]); }
                             json!({"frameTree":root})
                         },
@@ -197,7 +213,12 @@ async fn peer(case: Case) -> Peer {
                             } else { assert_eq!(request["params"]["playbackRate"].as_f64(), Some(0.0)); rate_restored = false; }
                             json!({})
                         }
-                        "Runtime.evaluate" if request["params"]["expression"] == "location.href" => json!({"result":{"type":"string","value":"about:blank"}}),
+                        "Runtime.evaluate" if request["params"]["expression"] == "location.href" => json!({"result":{"type":"string","value":frame_url}}),
+                        "Runtime.evaluate" if request["params"]["returnByValue"] == true
+                            && request["params"]["expression"].as_str().is_some_and(|source| source.contains("walk(document.documentElement, [])")) => {
+                            assert_eq!(session, "host-session");
+                            json!({"result":{"value":[]}})
+                        },
                         "Runtime.evaluate" => {
                             assert_eq!(session, "host-session");
                             assert_eq!(request["params"]["contextId"], 1);
@@ -338,8 +359,8 @@ fn semantic_frame_reply(request: &Value) -> Option<Value> {
             } else if declaration.contains("const read=") {
                 let values=request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
                     if argument["objectId"].as_str().unwrap().ends_with("node-2") {
-                        json!({"attributes":{"id":"child"},"labels":[],"states":{},"rect":{"x":0,"y":0,"width":6,"height":6},"author":{"tag":"iframe","nodeType":1,"visible":true}})
-                    } else { json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}) }
+                        json!({"attributes":{"id":"child"},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":6,"height":6},"author":{"tag":"iframe","nodeType":1,"visible":true}})
+                    } else { json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}) }
                 }).collect::<Vec<_>>();
                 Some(json!({"result":{"value":values}}))
             } else if request["params"]["objectGroup"]
@@ -381,10 +402,10 @@ fn semantic_geometry_reply(request: &Value) -> Option<Value> {
                 let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
                     let object = argument["objectId"].as_str().unwrap();
                     if object.ends_with("node-2") {
-                        json!({"attributes":{},"labels":[],"states":{},"rect":{"x":1,"y":1,"width":4,"height":4},"author":{"tag":"button","nodeType":1,"visible":true,"action":true}})
+                        json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":1,"y":1,"width":4,"height":4},"author":{"tag":"button","nodeType":1,"visible":true,"action":true}})
                     } else {
                         assert!(object.ends_with("node-1"));
-                        json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
+                        json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                     }
                 }).collect::<Vec<_>>();
                 Some(json!({"result":{"value":values}}))
@@ -453,7 +474,7 @@ fn observation_reply(request: &Value) -> Option<Value> {
             } else if declaration.contains("const read=") {
                 let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
                     assert!(argument["objectId"].as_str().unwrap().ends_with("node-1"));
-                    json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
+                    json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                 }).collect::<Vec<_>>();
                 json!({"result":{"value":values}})
             } else if declaration.contains("frameOwner") {
@@ -1835,4 +1856,34 @@ async fn semantic_final_foreign_viewport_ack_never_publishes_optional_tree() {
 #[tokio::test]
 async fn semantic_final_matching_viewport_ack_preserves_optional_pixels() {
     semantic_completion_ack(false).await;
+}
+
+#[tokio::test]
+async fn optional_frame_change_refuses_before_changing_playback_rate() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalFrameChange).await;
+    optional_request(&mut fixture, &scope, "changed-frame", true, 5_000).await;
+    let refusal = optional_result(&mut fixture, "changed-frame").await;
+    let refs_published = !browser.refs.lock().unwrap().ref_ids().is_empty();
+    let started_pixel_work = peer.log.lock().unwrap().iter().any(|row| {
+        matches!(
+            row["method"].as_str(),
+            Some("Animation.enable" | "Animation.setPlaybackRate" | "Page.captureScreenshot")
+        )
+    });
+    optional_request(&mut fixture, &scope, "fresh-observe", false, 5_000).await;
+    let fresh = optional_result(&mut fixture, "fresh-observe").await;
+    let close = fixture
+        .command("scope.end", json!({"identityScope":scope}), 5)
+        .await;
+    let shutdown = optional_finish(peer, fixture).await;
+
+    assert_eq!(refusal["error"]["code"], "stale-scope", "{refusal}");
+    assert_eq!(refusal["scopeState"], "usable", "{refusal}");
+    assert_eq!(refusal["effects"], "not-dispatched", "{refusal}");
+    assert!(!refs_published);
+    assert!(!started_pixel_work);
+    assert_eq!(fresh["ok"], true, "{fresh}");
+    assert_eq!(fresh["data"]["location"], "about:blank#updated");
+    close.unwrap();
+    shutdown.unwrap();
 }
