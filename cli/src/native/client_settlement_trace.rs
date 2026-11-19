@@ -98,6 +98,8 @@ pub(crate) enum SettlementPhase {
     DetailLimit,
     /// One scope-isolation decision: which layer sealed, poisoned or quarantined a scope and why.
     ScopeIsolation,
+    /// One native callback terminal command's closed failure class.
+    NetworkCallbackFailure,
 }
 
 pub(crate) use SettlementPhase as Phase;
@@ -368,6 +370,10 @@ pub(crate) struct Facts {
     pub isolation_reason: Option<IsolationReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_kinds: Option<[u16; 12]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_command: Option<NetworkTaskCommand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_failure: Option<NetworkFailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1058,6 +1064,52 @@ pub(crate) struct IsolationObservation {
     pub target_kinds: Option<[u16; 12]>,
     pub error: Option<ProtocolError>,
     pub scope_state: Option<ScopeState>,
+}
+// Fixed native callback terminal commands and their closed failure classes.
+// Never the CDP error text or command params.
+diagnostic_enum!(NetworkTaskCommand {
+    Other,
+    ContinueRequest,
+    FulfillRequest,
+    FailRequest,
+    ContinueWithAuth,
+    HandleDialog
+});
+diagnostic_enum!(NetworkFailureClass {
+    ReservationRejected,
+    EnvelopeMismatch,
+    SubmitFailed,
+    ErrorAck,
+    InterceptionGone,
+    LocalFailure,
+    ChannelClosed,
+    Deadline
+});
+impl NetworkTaskCommand {
+    pub(crate) fn from_method(method: &str) -> Self {
+        match method {
+            "Fetch.continueRequest" => Self::ContinueRequest,
+            "Fetch.fulfillRequest" => Self::FulfillRequest,
+            "Fetch.failRequest" => Self::FailRequest,
+            "Fetch.continueWithAuth" => Self::ContinueWithAuth,
+            "Page.handleJavaScriptDialog" => Self::HandleDialog,
+            _ => Self::Other,
+        }
+    }
+}
+pub(crate) fn network_callback_failure(command: NetworkTaskCommand, failure: NetworkFailureClass) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            0,
+            Phase::NetworkCallbackFailure,
+            Facts {
+                network_command: Some(command),
+                network_failure: Some(failure),
+                ..Facts::default()
+            },
+        );
+    }
 }
 pub(crate) fn scope_isolation(observation: IsolationObservation) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
@@ -4240,6 +4292,10 @@ mod isolation_tests {
         }
         ClientTargets::new("context".into(), "scope".into()).seal();
         ClientSession::new().quarantine().unwrap();
+        network_callback_failure(
+            NetworkTaskCommand::ContinueRequest,
+            NetworkFailureClass::InterceptionGone,
+        );
         let records = rows(&file);
         // The caller is this test, which is exactly what `#[track_caller]` must
         // report: the transition function must not claim its own line. The
@@ -4261,6 +4317,15 @@ mod isolation_tests {
             })
             .expect("broker quarantine wrote no isolation record");
         assert_eq!(quarantine["scopeState"], "quarantined");
+        let callback = records
+            .iter()
+            .find(|record| {
+                record["phase"] == "NetworkCallbackFailure"
+                    && record["networkCommand"] == "continue-request"
+            })
+            .expect("network callback failure wrote no record");
+        assert_eq!(callback["operationSeq"], 0);
+        assert_eq!(callback["networkFailure"], "interception-gone");
     }
 }
 
