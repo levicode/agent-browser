@@ -1220,6 +1220,9 @@ async fn resolve(
         )
     };
     action_stage(ActionStage::FrameOwner);
+    if ctx.geometry.action_frame_has_no_area(&binding.frame) {
+        return Err(ProtocolError::NotActionable);
+    }
     ctx.bounded(async {
         Ok(element::validate_exact_binding_typed(
             &ctx.page.client,
