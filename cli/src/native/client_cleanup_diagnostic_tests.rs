@@ -711,6 +711,7 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
             read_error: None,
             read_cleanup_lost: None,
             cleanup_cause: Some(ReadCleanupCause::GroupRelease),
+            frame_refusal: None,
             stage: ScreenshotStage::Capture,
             capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
             inventory_after_failure: InventoryAfterFailure::Changed,
@@ -747,6 +748,40 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
             "suppressedBefore"
         ]
     );
+}
+
+#[test]
+fn state_capture_failure_records_its_closed_phase_without_a_cleanup_attempt() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    for (index, phase) in [
+        StateCapturePhase::PreAttestation,
+        StateCapturePhase::Export,
+        StateCapturePhase::PostAttestation,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        state_capture_failure_into(
+            &capture,
+            index as u64 + 1,
+            20 + index as u64,
+            phase,
+            ProtocolError::StaleScope,
+        );
+    }
+    let rows = records(&file);
+    assert_eq!(rows.len(), 4);
+    for (row, name) in rows[1..]
+        .iter()
+        .zip(["pre-attestation", "export", "post-attestation"])
+    {
+        assert_eq!(row["phase"], "StateCaptureFailure");
+        assert_eq!(row["stateCapturePhase"], name);
+        assert_eq!(row["error"], "stale-scope");
+        assert!(row.get("cleanupOwner").is_none());
+    }
 }
 
 #[tokio::test]
@@ -1017,6 +1052,7 @@ fn semantic_read_failure_uses_existing_sink_with_closed_typed_detail_only() {
         ScreenshotFailure {
             initial_sample: None,
             prefix: None,
+            frame_refusal: None,
             stage: ScreenshotStage::SemanticNodeGeometry,
             capture_phase: ScreenshotCapturePhase::NotEntered,
             inventory_after_failure: InventoryAfterFailure::NotSampled,

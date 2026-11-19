@@ -4562,21 +4562,33 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let (page, page_state, ui, enrollment, blobs, scope, context_kind) = match captured {
                 Ok(value) => value,
                 Err(error) => {
+                    cleanup_trace::state_capture_failure(
+                        lease.generation,
+                        lease.sequence,
+                        cleanup_trace::StateCapturePhase::PreAttestation,
+                        error.clone(),
+                    );
                     return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    })
+                    });
                 }
             };
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
+                    cleanup_trace::state_capture_failure(
+                        lease.generation,
+                        lease.sequence,
+                        cleanup_trace::StateCapturePhase::PreAttestation,
+                        error.clone(),
+                    );
                     return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    })
+                    });
                 }
             };
             let receive = self
@@ -4589,7 +4601,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     lease.cancellation.clone(),
                     async move {
                         use super::client_state_dispatch::CapturedStateContext;
-                        let admission = async {
+                        let admission: Result<_, ProtocolError> = async {
                             page.permit.check()?;
                             let permit = ui
                                 .enter(true, false, lease.deadline, lease.cancellation.clone())
@@ -4603,8 +4615,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let (ui_permit, attestation, origins) = match admission {
                             Ok(value) => value,
                             Err(error) => {
-                                #[cfg(test)]
-                                eprintln!("state.capture phase=pre-attestation error={error:?}");
+                                cleanup_trace::state_capture_failure(
+                                    lease.generation,
+                                    lease.sequence,
+                                    cleanup_trace::StateCapturePhase::PreAttestation,
+                                    error.clone(),
+                                );
                                 return (
                                     NativeOutcome {
                                         retention: None,
@@ -4630,6 +4646,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         ) {
                             Ok(context) => context,
                             Err(failure) => {
+                                cleanup_trace::state_capture_failure(
+                                    lease.generation,
+                                    lease.sequence,
+                                    cleanup_trace::StateCapturePhase::Export,
+                                    failure.error.clone(),
+                                );
                                 return (
                                     NativeOutcome {
                                         retention: None,
@@ -4637,16 +4659,20 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                         effects: Effects::NotDispatched,
                                     },
                                     failure.cleanup_integrity_lost,
-                                )
+                                );
                             }
                         };
                         let exported = super::client_state_dispatch::capture_state(
                             &context, &blobs, &scope, &lease,
                         )
                         .await;
-                        #[cfg(test)]
                         if let Err(failure) = &exported {
-                            eprintln!("state.capture phase=export error={:?}", failure.error);
+                            cleanup_trace::state_capture_failure(
+                                lease.generation,
+                                lease.sequence,
+                                cleanup_trace::StateCapturePhase::Export,
+                                failure.error.clone(),
+                            );
                         }
                         match exported {
                             Err(failure) => (
@@ -4662,12 +4688,6 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     let verified = enrollment
                                         .verify_capture_attestation(&attestation, &lease)
                                         .await;
-                                    #[cfg(test)]
-                                    if let Err(error) = &verified {
-                                        eprintln!(
-                                            "state.capture phase=post-attestation error={error:?}"
-                                        );
-                                    }
                                     verified?;
                                     if page_state.visited_origins()? != origins {
                                         return Err(ProtocolError::ScopeUnavailable);
@@ -4687,6 +4707,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                         false,
                                     ),
                                     Err(error) => {
+                                        cleanup_trace::state_capture_failure(
+                                            lease.generation,
+                                            lease.sequence,
+                                            cleanup_trace::StateCapturePhase::PostAttestation,
+                                            error.clone(),
+                                        );
                                         let cleanup_failed =
                                             blobs.release(&scope, &captured.blob.handle).is_err();
                                         (

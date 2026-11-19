@@ -102,6 +102,8 @@ pub(crate) enum SettlementPhase {
     NetworkCallbackFailure,
     /// One browser action failure: its closed kind, stage, CDP method and class.
     ActionFailure,
+    /// One `state.capture` refusal with the phase it failed in.
+    StateCaptureFailure,
 }
 
 pub(crate) use SettlementPhase as Phase;
@@ -300,6 +302,11 @@ pub(crate) struct Facts {
     pub read_cleanup_cause: Option<ReadCleanupCause>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
     pub frame_pass: Option<FrameInventoryPass>,
+    /// The closed first refusal of an initial frame inventory read.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frameRefusal")]
+    pub frame_refusal: Option<FrameInventoryRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_capture_phase: Option<StateCapturePhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sealed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1360,6 +1367,35 @@ pub(crate) struct NetworkCallbackFailureObservation {
     pub ledger_error: Option<ProtocolError>,
     pub capacity: Option<NetworkCapacityObservation>,
 }
+pub(crate) fn state_capture_failure(
+    generation: u64,
+    sequence: u64,
+    phase: StateCapturePhase,
+    error: ProtocolError,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        state_capture_failure_into(capture, generation, sequence, phase, error);
+    }
+}
+fn state_capture_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    phase: StateCapturePhase,
+    error: ProtocolError,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::StateCaptureFailure,
+        Facts {
+            generation: Some(generation),
+            state_capture_phase: Some(phase),
+            error: Some(error),
+            ..Facts::default()
+        },
+    );
+}
 pub(crate) fn network_callback_failure(observation: NetworkCallbackFailureObservation) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
         let capacity = observation.capacity;
@@ -1930,6 +1966,7 @@ pub(crate) struct ScreenshotFailure {
     pub initial_sample: Option<u8>,
     pub prefix: Option<ObserveInitialPrefix>,
     pub stage: ScreenshotStage,
+    pub frame_refusal: Option<FrameInventoryRefusal>,
     pub read_error: Option<ReadError>,
     pub read_cleanup_lost: Option<bool>,
     pub cleanup_cause: Option<ReadCleanupCause>,
@@ -1955,6 +1992,7 @@ fn screenshot_failure_into(
         Facts {
             generation: Some(generation),
             screenshot_stage: Some(failure.stage),
+            frame_refusal: failure.frame_refusal,
             read_error: failure.read_error,
             read_cleanup_lost: failure.read_cleanup_lost,
             read_cleanup_cause: failure.cleanup_cause,
@@ -3066,6 +3104,27 @@ pub(crate) enum FrameInventoryPass {
     Initial,
     Protected,
     Final,
+}
+/// The phase of a refused `state.capture`: admission and attestation before the
+/// export, the export itself, and the post-export attestation/validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum StateCapturePhase {
+    PreAttestation,
+    Export,
+    PostAttestation,
+}
+/// One closed reason an initial frame inventory read refused its sample.
+/// The class separates a frame topology that moved from a target that was still
+/// enrolling, so the first observation can wait for that enrollment to finish
+/// and re-sample instead of reporting a bare stale scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FrameInventoryRefusal {
+    FrameTopology,
+    TargetUnregistered,
+    FrameBinding,
+    Revision,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

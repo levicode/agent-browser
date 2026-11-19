@@ -1096,6 +1096,22 @@ impl Registry {
                 .values()
                 .all(|entry| entry.detached || entry.claimed_session.is_some())
     }
+    /// The strict page-read readiness: every page document target has also
+    /// acknowledged its resume. A frame target is registered (and configured)
+    /// before its resume ACK, so an initial read that stops at `configured` can
+    /// observe a half-registered frame topology. Only the first observation
+    /// waits here; ordinary reads keep their existing readiness contract.
+    fn read_enrollment_resumed_page(&self) -> bool {
+        self.page_inventory_complete()
+            && !self.page_resume_pending()
+            && self.targets.values().all(|target| {
+                !super::client_enrollment::page_read_target_kind(&target.kind) || target.resumed
+            })
+            && self
+                .auxiliary
+                .values()
+                .all(|entry| entry.detached || entry.claimed_session.is_some())
+    }
     fn lose_integrity(
         &mut self,
         reason: diagnostic::InventoryFirstLoss,
@@ -3034,6 +3050,46 @@ impl ClientTargets {
                         state.targets.values().cloned().collect(),
                         snapshot,
                     ));
+                }
+            }
+            let mut cancellation = operation.cancellation.clone();
+            tokio::select! {
+                _ = &mut changed => {}
+                _ = cancellation.changed() => {
+                    return Err((*operation.cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled));
+                }
+                _ = tokio::time::sleep_until(operation.deadline.into()) => {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+            }
+        }
+    }
+    /// Wait until every page target has acknowledged its resume. A frame target
+    /// is registered before its resume ACK; a read that observes the frame
+    /// topology in between would refuse a healthy scope. The first observation
+    /// uses this wait before re-sampling the discarded topology. It never takes
+    /// an inventory, extends the operation or grants a retry to a later read.
+    pub(crate) async fn wait_read_enrollment_resumed(
+        &self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.sealed || state.integrity_lost {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                if let Some(error) = (*operation.cancellation.borrow()).error() {
+                    return Err(error);
+                }
+                if state.read_enrollment_resumed_page() {
+                    return Ok(());
                 }
             }
             let mut cancellation = operation.cancellation.clone();

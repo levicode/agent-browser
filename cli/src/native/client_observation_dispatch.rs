@@ -124,6 +124,7 @@ struct ScreenshotFailureState {
     cleanup_cause: Option<diagnostic::ReadCleanupCause>,
     initial_sample: Option<u8>,
     prefix: Option<diagnostic::ObserveInitialPrefix>,
+    frame_refusal: Option<diagnostic::FrameInventoryRefusal>,
 }
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, _enabled: bool) -> Option<Self> {
@@ -150,6 +151,7 @@ impl ScreenshotFailureWitness {
                 cleanup_cause: None,
                 initial_sample: None,
                 prefix: None,
+                frame_refusal: None,
             }),
         })
     }
@@ -166,6 +168,13 @@ impl ScreenshotFailureWitness {
         if let Ok(mut state) = self.state.lock() {
             if state.first.is_none() && state.prefix.is_none() {
                 state.prefix = Some(prefix);
+            }
+        }
+    }
+    fn frame_refusal(&self, refusal: diagnostic::FrameInventoryRefusal) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() && state.frame_refusal.is_none() {
+                state.frame_refusal = Some(refusal);
             }
         }
     }
@@ -249,6 +258,7 @@ impl ScreenshotFailureWitness {
                     error.clone(),
                 ));
                 state.inventory_rejection = failure;
+                state.frame_refusal = Some(diagnostic::FrameInventoryRefusal::Revision);
             }
         }
     }
@@ -334,6 +344,7 @@ impl ScreenshotFailureWitness {
             cleanup_cause,
             initial_sample,
             prefix,
+            frame_refusal,
         ) = {
             let mut state = self.state.lock().ok()?;
             let (stage, phase, error) = state.first.take()?;
@@ -346,6 +357,7 @@ impl ScreenshotFailureWitness {
                 state.cleanup_cause.take(),
                 state.initial_sample,
                 state.prefix,
+                state.frame_refusal,
             )
         };
         let inventory_after_failure = match before {
@@ -360,6 +372,7 @@ impl ScreenshotFailureWitness {
             initial_sample,
             prefix,
             stage,
+            frame_refusal,
             read_error: read_failure.map(|detail| detail.0),
             read_cleanup_lost: read_failure.map(|detail| detail.1),
             cleanup_cause,
@@ -1874,7 +1887,13 @@ impl ObservationDispatch {
             }
             Err(failure) => failure,
         };
-        if !rejected.revision_only() {
+        // A topology read that moved under a target's registration, or a target
+        // that is registered but not yet resumed, is enrollment progress, not a
+        // retired scope: the first observation may wait for that enrollment and
+        // discard the stale sample. Every other refusal, and every later read,
+        // keeps its original fail-closed classification.
+        let registration = rejected.registration_race();
+        if !rejected.revision_only() && !registration {
             return Err(rejected.record(screenshot));
         }
         check_owner()?;
@@ -1896,6 +1915,22 @@ impl ObservationDispatch {
         ) {
             return Err(rejected.record(screenshot));
         }
+        if registration {
+            // Readiness under the operation's own deadline: a frame target is
+            // registered before its resume ACK, and reading its topology in
+            // between is not a scope failure. This never extends the operation,
+            // never takes an inventory of its own and grants no retry after the
+            // second sample.
+            context
+                .page
+                .targets
+                .wait_read_enrollment_resumed(operation)
+                .await?;
+            check_owner()?;
+            if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+                return Err(rejected.record(screenshot));
+            }
+        }
         // No loop: the old sample is discarded and a second raced sample fails.
         if let Some(witness) = screenshot {
             witness.initial_sample(2);
@@ -1915,7 +1950,7 @@ impl ObservationDispatch {
         )
         .await
         .map_err(|failure| {
-            if failure.revision_only()
+            if (failure.revision_only() || failure.registration_race())
                 && check_owner().is_ok()
                 && Self::initial_trace_prefix_settled(context, operation, cleanup)
             {
@@ -3903,6 +3938,14 @@ async fn verified_frame_inventory_with_diagnostic(
 }
 enum FrameInventoryFailure {
     Read(ProtocolError),
+    /// A frame inventory read whose own topology, target registry or binding
+    /// check refused the sample. The closed class is diagnostic and tells the
+    /// initial observation whether the sample moved under a target that is
+    /// still being registered and can be re-sampled.
+    Refused {
+        error: ProtocolError,
+        refusal: diagnostic::FrameInventoryRefusal,
+    },
     Fence {
         error: ProtocolError,
         revision_only: bool,
@@ -3915,6 +3958,9 @@ impl From<ProtocolError> for FrameInventoryFailure {
     }
 }
 impl FrameInventoryFailure {
+    fn refused(error: ProtocolError, refusal: diagnostic::FrameInventoryRefusal) -> Self {
+        Self::Refused { error, refusal }
+    }
     fn revision_only(&self) -> bool {
         matches!(
             self,
@@ -3924,9 +3970,29 @@ impl FrameInventoryFailure {
             }
         )
     }
+    /// A topology that moved under registration and a target that is not yet
+    /// resumed both describe enrollment progress, not a retired scope. The
+    /// initial observation may wait for that enrollment and take one fresh
+    /// sample; every later read keeps the original refusal.
+    fn registration_race(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused {
+                refusal: diagnostic::FrameInventoryRefusal::FrameTopology
+                    | diagnostic::FrameInventoryRefusal::TargetUnregistered,
+                ..
+            }
+        )
+    }
     fn record(self, witness: Option<&ScreenshotFailureWitness>) -> ProtocolError {
         match self {
             Self::Read(error) => error,
+            Self::Refused { error, refusal } => {
+                if let Some(witness) = witness {
+                    witness.frame_refusal(refusal);
+                }
+                error
+            }
             Self::Fence {
                 error, diagnostic, ..
             } => {
@@ -4456,9 +4522,17 @@ async fn frame_inventory_attempt_once(
                 && target.kind == "page"
                 && target.purpose == Some(TargetPurpose::Application)
         })
-        .ok_or(ProtocolError::StaleScope)?;
+        .ok_or_else(|| {
+            FrameInventoryFailure::refused(
+                ProtocolError::StaleScope,
+                diagnostic::FrameInventoryRefusal::FrameBinding,
+            )
+        })?;
     if !main.resumed {
-        return Err(ProtocolError::ScopeUnavailable.into());
+        return Err(FrameInventoryFailure::refused(
+            ProtocolError::ScopeUnavailable,
+            diagnostic::FrameInventoryRefusal::TargetUnregistered,
+        ));
     }
     let mut sessions = HashSet::new();
     let mut trees = Vec::new();
@@ -4475,10 +4549,16 @@ async fn frame_inventory_attempt_once(
             continue;
         }
         if !target.configured || !target.resumed {
-            return Err(ProtocolError::ScopeUnavailable.into());
+            return Err(FrameInventoryFailure::refused(
+                ProtocolError::ScopeUnavailable,
+                diagnostic::FrameInventoryRefusal::TargetUnregistered,
+            ));
         }
         if !sessions.insert(target.session_id.clone()) {
-            return Err(ProtocolError::StaleScope.into());
+            return Err(FrameInventoryFailure::refused(
+                ProtocolError::StaleScope,
+                diagnostic::FrameInventoryRefusal::FrameBinding,
+            ));
         }
         if !matches!(target.kind.as_str(), "page" | "iframe") {
             continue;
@@ -4508,7 +4588,9 @@ async fn frame_inventory_attempt_once(
         };
         trees.push((target.session_id.clone(), target.kind == "page", tree));
     }
-    let mut lineage = page_lineage(&trees, &page.page_session_id)?;
+    let mut lineage = page_lineage(&trees, &page.page_session_id).map_err(|error| {
+        FrameInventoryFailure::refused(error, diagnostic::FrameInventoryRefusal::FrameTopology)
+    })?;
     let enumerated = if readonly_disposal {
         observation::enumerate_semantic_frames(
             &page.client,
@@ -4557,7 +4639,10 @@ async fn frame_inventory_attempt_once(
     let mapping = lineage.iframe_sessions;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
-        return Err(ProtocolError::StaleScope.into());
+        return Err(FrameInventoryFailure::refused(
+            ProtocolError::StaleScope,
+            diagnostic::FrameInventoryRefusal::FrameBinding,
+        ));
     }
     let mut ids = HashSet::new();
     for frame in &frames {
@@ -4566,14 +4651,20 @@ async fn frame_inventory_attempt_once(
             || !sessions.contains(&frame.binding.session)
             || !ids.insert(frame.binding.frame.clone())
         {
-            return Err(ProtocolError::StaleScope.into());
+            return Err(FrameInventoryFailure::refused(
+                ProtocolError::StaleScope,
+                diagnostic::FrameInventoryRefusal::FrameBinding,
+            ));
         }
         if let Some(parent) = &frame.parent_frame_id {
             if !frames
                 .iter()
                 .any(|candidate| &candidate.binding.frame == parent)
             {
-                return Err(ProtocolError::StaleScope.into());
+                return Err(FrameInventoryFailure::refused(
+                    ProtocolError::StaleScope,
+                    diagnostic::FrameInventoryRefusal::FrameTopology,
+                ));
             }
         }
     }
@@ -4582,7 +4673,10 @@ async fn frame_inventory_attempt_once(
             .iter()
             .any(|frame| lineage.parents.get(&frame.binding.frame) != Some(&frame.parent_frame_id))
     {
-        return Err(ProtocolError::StaleScope.into());
+        return Err(FrameInventoryFailure::refused(
+            ProtocolError::StaleScope,
+            diagnostic::FrameInventoryRefusal::FrameTopology,
+        ));
     }
     for (frame, session) in &mapping {
         if !frames.iter().any(|candidate| {

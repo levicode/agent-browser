@@ -145,6 +145,101 @@ async fn observe_initial_reacquisition_is_bounded_and_keeps_original_refusals() 
 }
 
 #[tokio::test]
+async fn observe_initial_waits_for_an_enrolling_iframe_then_resamples() {
+    let fixture = Fixture::new_mode(Race::EnrollingIframe, true).await;
+    let (fixture, capture, fence) = prepare(fixture);
+    let cleanup = AtomicBool::new(false);
+    let witness = ScreenshotFailureWitness::new(&request(), &fixture.operation, true);
+    screenshot_stage(witness.as_ref(), ScreenshotStage::InitialFrames);
+    let acquired = acquire(&fixture, &capture, fence, &cleanup, witness.as_ref()).await;
+    let frames = acquired.unwrap();
+    assert!(Instant::now() < fixture.operation.deadline);
+    // The first sample was refused by the topology that moved under the frame
+    // target's registration. Exactly one fresh sample follows the resume ACK,
+    // and it carries the iframe session.
+    assert_eq!(fixture.samples.load(Ordering::SeqCst), 2);
+    assert_eq!(frames.len(), 2);
+    let child = frames
+        .iter()
+        .find(|frame| frame.parent_frame_id.is_some())
+        .expect("the resample must carry the registered iframe");
+    assert_eq!(child.binding.frame, "child");
+    assert_eq!(child.binding.session, "iframe-session");
+    assert!(!cleanup.load(Ordering::SeqCst));
+    if let Some(witness) = witness {
+        assert!(
+            witness.take_failure(|| None).is_none(),
+            "a discarded topology sample is not a published failure"
+        );
+    }
+    no_publication_or_semantics(&fixture);
+    fixture.context.page.client.close().await;
+    fixture.peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn observe_initial_enrolling_iframe_keeps_owner_cancel_and_cleanup_contracts() {
+    for race in [
+        Race::EnrollingIframeOwnerSwitch,
+        Race::EnrollingIframeCancel,
+        Race::EnrollingIframeCleanup,
+    ] {
+        let fixture = Fixture::new_mode(race, true).await;
+        let (fixture, capture, fence) = prepare(fixture);
+        let cleanup = AtomicBool::new(race == Race::EnrollingIframeCleanup);
+        let result = acquire(&fixture, &capture, fence, &cleanup, None).await;
+        match race {
+            Race::EnrollingIframeCancel => assert_eq!(result.err(), Some(ProtocolError::Cancelled)),
+            Race::EnrollingIframeCleanup => {
+                assert_eq!(result.err(), Some(ProtocolError::StaleScope))
+            }
+            _ => assert!(
+                matches!(
+                    result,
+                    Err(ProtocolError::StaleReference
+                        | ProtocolError::StaleScope
+                        | ProtocolError::ScopeUnavailable)
+                ),
+                "{race:?}: {result:?}"
+            ),
+        }
+        // A changed owner, a stop or lost cleanup never earns the re-sample:
+        // only the refused first sample starts.
+        assert_eq!(fixture.samples.load(Ordering::SeqCst), 1, "{race:?}");
+        no_publication_or_semantics(&fixture);
+        fixture.context.page.client.close().await;
+        fixture.peer.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn observe_initial_second_registration_race_records_frame_topology_refusal() {
+    let fixture = Fixture::new_mode(Race::EnrollingIframeSecondRace, true).await;
+    let (fixture, capture, fence) = prepare(fixture);
+    let cleanup = AtomicBool::new(false);
+    let witness = ScreenshotFailureWitness::new(&request(), &fixture.operation, true);
+    screenshot_stage(witness.as_ref(), ScreenshotStage::InitialFrames);
+    let result = acquire(&fixture, &capture, fence, &cleanup, witness.as_ref()).await;
+    let error = result.err().unwrap();
+    if let Some(witness) = &witness {
+        witness.failure(&error);
+    }
+    assert_eq!(error, ProtocolError::StaleScope);
+    assert_eq!(fixture.samples.load(Ordering::SeqCst), 2);
+    let first = witness
+        .and_then(|witness| witness.take_failure(|| None))
+        .expect("the second refused sample publishes its first failure");
+    assert_eq!(first.stage, ScreenshotStage::InitialFrames);
+    assert_eq!(
+        first.frame_refusal,
+        Some(diagnostic::FrameInventoryRefusal::FrameTopology)
+    );
+    no_publication_or_semantics(&fixture);
+    fixture.context.page.client.close().await;
+    fixture.peer.await.unwrap();
+}
+
+#[tokio::test]
 async fn observe_initial_failed_prefix_held_group_ack_cannot_reacquire() {
     let fixture = Fixture::new_mode(Race::HeldRelease, true).await;
     let (fixture, capture, fence) = prepare(fixture);

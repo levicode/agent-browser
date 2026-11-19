@@ -34,6 +34,23 @@ enum Race {
     Superseded,
     ReleaseError,
     ReleaseWrongSession,
+    EnrollingIframe,
+    EnrollingIframeSecondRace,
+    EnrollingIframeOwnerSwitch,
+    EnrollingIframeCancel,
+    EnrollingIframeCleanup,
+}
+impl Race {
+    fn enrolling_iframe(self) -> bool {
+        matches!(
+            self,
+            Race::EnrollingIframe
+                | Race::EnrollingIframeSecondRace
+                | Race::EnrollingIframeOwnerSwitch
+                | Race::EnrollingIframeCancel
+                | Race::EnrollingIframeCleanup
+        )
+    }
 }
 // Test-only rendezvous: disposal may arrive before or after the final frame
 // request, but neither reply escapes until both exact requests are captured.
@@ -170,7 +187,10 @@ impl Fixture {
                     | Race::ReleaseError
                     | Race::ReleaseWrongSession
                     | Race::CancelDuringOwner
-            );
+            ) || race.enrolling_iframe();
+            let enrolling = race.enrolling_iframe();
+            let mut iframe_page_reads = 0u8;
+            let mut iframe_session_reads = 0u8;
             loop {
                 let text = tokio::select! {
                     reply = reply_rx.recv(), if readonly => {
@@ -191,6 +211,84 @@ impl Fixture {
                 let mut flush_final_ack = false;
                 let mut wrong_session = false;
                 let result = match method {
+                    "Page.getFrameTree" if enrolling => {
+                        trees += 1;
+                        if request["sessionId"].as_str() == Some("iframe-session") {
+                            iframe_session_reads += 1;
+                            if iframe_session_reads == 1 {
+                                peer_samples.fetch_add(1, Ordering::SeqCst);
+                            }
+                            json!({"frameTree":{"frame":{"id":"child","parentId":"frame","loaderId":"child-loader","url":"about:blank"}}})
+                        } else {
+                            iframe_page_reads += 1;
+                            if iframe_page_reads == 1 {
+                                // A real registration: the frame target is
+                                // attached and configured before its resume ACK,
+                                // exactly the window the first observation must
+                                // wait out.
+                                assert!(peer_targets
+                                    .attached(
+                                        "context",
+                                        "iframe".into(),
+                                        "iframe-session".into(),
+                                        "iframe".into(),
+                                    )
+                                    .unwrap());
+                                peer_targets.configured("iframe").unwrap();
+                                // The refused first sample starts with this
+                                // registration; the accepted re-sample starts
+                                // with the first iframe-session tree read.
+                                peer_samples.fetch_add(1, Ordering::SeqCst);
+                                let registry = peer_targets.clone();
+                                let cancel = peer_cancel.clone();
+                                let variant = race;
+                                tokio::spawn(async move {
+                                    let permit = registry.resume_permit("iframe").await.unwrap();
+                                    match variant {
+                                        Race::EnrollingIframeOwnerSwitch => {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                            // The selected page owner is gone while
+                                            // the first observation waits; the
+                                            // re-sample must not be taken.
+                                            registry.detach("target").unwrap();
+                                        }
+                                        Race::EnrollingIframeCancel => {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                            cancel.send_replace(CancelSignal::Requested);
+                                        }
+                                        _ => {
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                        }
+                                    }
+                                    permit.complete().unwrap();
+                                });
+                            }
+                            // The lineage read runs before the frame tree
+                            // moves; the enumeration read is the one that sees
+                            // the registered child.
+                            // Sample one reads the page tree four times (loop,
+                            // enumeration, then one loader validation per
+                            // frame). The re-sample starts at its fifth page
+                            // read; the second-race mode adds an unregistered
+                            // sibling frame from there, so that re-sample's
+                            // topology no longer matches its lineage.
+                            let include_child = iframe_page_reads >= 2;
+                            let include_sibling =
+                                race == Race::EnrollingIframeSecondRace && iframe_page_reads >= 6;
+                            let mut children = Vec::new();
+                            if include_child {
+                                children.push(json!({"frame":{"id":"child","parentId":"frame","loaderId":"child-loader","url":"about:blank"}}));
+                            }
+                            if include_sibling {
+                                children.push(json!({"frame":{"id":"child2","parentId":"frame","loaderId":"child2-loader","url":"about:blank"}}));
+                            }
+                            let mut result = json!({"frameTree":{"frame":{"id":"frame","loaderId":"old-loader","url":"about:blank"}}});
+                            if !children.is_empty() {
+                                result["frameTree"]["childFrames"] = Value::Array(children);
+                            }
+                            result
+                        }
+                    }
                     "Page.getFrameTree" => {
                         trees += 1;
                         let completed = peer_samples.load(Ordering::SeqCst);
@@ -315,8 +413,13 @@ impl Fixture {
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                     "DOM.getFrameOwner" if child => {
-                        assert_eq!(request["params"]["frameId"], "child");
-                        json!({"backendNodeId":101})
+                        let frame = request["params"]["frameId"].as_str().unwrap();
+                        let backend = match frame {
+                            "child" => 101,
+                            "child2" => 102,
+                            other => panic!("unexpected frame owner {other}"),
+                        };
+                        json!({"backendNodeId":backend})
                     }
                     "DOM.resolveNode" if child && race == Race::CancelDuringOwner => {
                         // The caller stops while its own frame-owner read is in
@@ -481,7 +584,12 @@ impl Fixture {
                 generation: 1,
                 sequence: 1,
                 deadline: Instant::now()
-                    + if readonly {
+                    + if race.enrolling_iframe() {
+                        // The wait for a registering frame target and the fresh
+                        // sample it earns need a real scheduling budget under
+                        // the loaded native gate. The observations stay fast.
+                        Duration::from_secs(2)
+                    } else if readonly {
                         Duration::from_millis(80)
                     } else {
                         Duration::from_secs(if race == Race::Continuous { 1 } else { 5 })
