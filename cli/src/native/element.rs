@@ -1607,6 +1607,20 @@ impl From<String> for ExactResolutionError {
         Self::BackendFailure
     }
 }
+/// A closed "browser object gone" answer about the exact reference says that
+/// reference no longer exists: the node, its JS object handle, or the frame
+/// context the action addressed was destroyed. That is the existing stale
+/// reference, which is still refused here and retried only by the caller's
+/// fresh observation. Any other protocol or transport error stays an opaque
+/// backend failure (fail closed); the closed taxonomy is never inferred from
+/// arbitrary CDP prose.
+fn exact_command_error(message: &str) -> ExactResolutionError {
+    if super::cdp::types::StaleBrowserObject::from_message(message).is_some() {
+        ExactResolutionError::StaleReference
+    } else {
+        ExactResolutionError::BackendFailure
+    }
+}
 
 pub async fn resolve_exact_object(
     client: &CdpClient,
@@ -1722,7 +1736,8 @@ pub async fn create_exact_realm(
             })),
             Some(&binding.session),
         )
-        .await?;
+        .await
+        .map_err(|message| exact_command_error(&message))?;
     let context = world["executionContextId"]
         .as_i64()
         .ok_or(ExactResolutionError::BackendFailure)?;
@@ -1747,7 +1762,8 @@ async fn resolve_exact_object_in_realm_impl(
     check_capture_retirement()?;
     let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
         "backendNodeId": backend, "executionContextId": context, "objectGroup": readonly_group.unwrap_or("native-exact")
-    })), Some(&binding.session)).await?;
+    })), Some(&binding.session)).await
+        .map_err(|message| exact_command_error(&message))?;
     let object = result["object"]["objectId"]
         .as_str()
         .ok_or(ExactResolutionError::BackendFailure)?
@@ -1758,7 +1774,8 @@ async fn resolve_exact_object_in_realm_impl(
             "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
         });
         if let Some(group) = readonly_group { params["objectGroup"] = group.into(); }
-        let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationRead, false, client.send_command("Runtime.callFunctionOn", Some(params), Some(&binding.session))).await?;
+        let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationRead, false, client.send_command("Runtime.callFunctionOn", Some(params), Some(&binding.session))).await
+            .map_err(|message| exact_command_error(&message))?;
         let mut seen = std::collections::HashSet::new();
         let mut cleanup_failed = false;
         for handle in [result["result"]["objectId"].as_str(), result["exceptionDetails"]["exception"]["objectId"].as_str()].into_iter().flatten() {
@@ -1817,7 +1834,8 @@ pub async fn validate_exact_binding_typed(
     check_capture_retirement()?;
     let tree = client
         .send_command_no_params("Page.getFrameTree", Some(&binding.session))
-        .await?;
+        .await
+        .map_err(|message| exact_command_error(&message))?;
     exact_document_present(&tree, binding)
 }
 fn exact_document_present(
@@ -4268,6 +4286,42 @@ mod node_identity_negative_proof_tests {
         let mut described = valid.clone();
         described["result"]["description"] = "false".into();
         assert!(resolution_node_negative_proof(&binding, 1, &described).is_some());
+    }
+    #[test]
+    fn exact_resolution_classifies_only_closed_gone_answers_as_stale() {
+        // A closed gone answer about the exact reference is a refusal, never a
+        // backend failure: the node/object/frame/session was destroyed.
+        for message in [
+            "CDP error (DOM.resolveNode): No node with given id found",
+            "CDP error (Runtime.callFunctionOn): Could not find object with given id",
+            "CDP error (Page.createIsolatedWorld): Frame with the given id was not found",
+            "CDP error (Page.getFrameTree): Session with given id not found.",
+        ] {
+            assert!(
+                matches!(
+                    exact_command_error(message),
+                    ExactResolutionError::StaleReference
+                ),
+                "{message}"
+            );
+        }
+        // Every other answer stays opaque: no prose, transport error or
+        // exception may become a retryable stale reference.
+        for message in [
+            "CDP error (DOM.getBoxModel): Could not compute box model.",
+            "CDP error (Runtime.callFunctionOn): Execution context was destroyed.",
+            "Native CDP command admission refused",
+            "Native CDP response channel closed",
+            "CDP WebSocket connect failed: synthetic",
+        ] {
+            assert!(
+                matches!(
+                    exact_command_error(message),
+                    ExactResolutionError::BackendFailure
+                ),
+                "{message}"
+            );
+        }
     }
     #[test]
     fn resolver_receipt_never_rebinds_original_node() {

@@ -100,6 +100,8 @@ pub(crate) enum SettlementPhase {
     ScopeIsolation,
     /// One native callback terminal command's closed failure class.
     NetworkCallbackFailure,
+    /// One browser action failure: its closed kind, stage, CDP method and class.
+    ActionFailure,
 }
 
 pub(crate) use SettlementPhase as Phase;
@@ -390,6 +392,16 @@ pub(crate) struct Facts {
     pub network_capacity_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_capacity_bytes_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_kind: Option<ActionKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_stage: Option<ActionStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_cdp_method: Option<ActionCdpMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_cdp_failure: Option<ActionCdpFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_stale_object: Option<ActionStaleObject>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1146,6 +1158,189 @@ impl NetworkStaleObject {
             super::cdp::types::StaleBrowserObject::Object => Self::Object,
             super::cdp::types::StaleBrowserObject::Node => Self::Node,
         }
+    }
+}
+// The closed action vocabulary a failed `browser.perform` carried. `Unknown`
+// covers a malformed request, never a guessed verb.
+diagnostic_enum!(ActionKind {
+    Unknown,
+    Tap,
+    DoubleTap,
+    SecondaryTap,
+    LongPress,
+    Hover,
+    Swipe,
+    ScrollIntoView,
+    Focus,
+    Press,
+    Fill,
+    Clear,
+    SelectOption,
+    Check,
+    Uncheck,
+    DragTo,
+    SetInputFiles
+});
+// The last fallible step the action reached. Together with the CDP method and
+// failure class this names where a `browser-failure` was produced without
+// recording any selector, node identity, coordinate or renderer prose.
+diagnostic_enum!(ActionStage {
+    Unknown,
+    Locate,
+    FrameOwner,
+    Visibility,
+    Scroll,
+    Geometry,
+    BoxModel,
+    Reachability,
+    Input,
+    Upload,
+    Keyboard,
+    Settle
+});
+// Fixed CDP methods an action may issue. Any other method maps to `Other`.
+diagnostic_enum!(ActionCdpMethod {
+    Other,
+    PageCreateIsolatedWorld,
+    PageGetFrameTree,
+    PageGetLayoutMetrics,
+    DomResolveNode,
+    RuntimeCallFunctionOn,
+    RuntimeEvaluate,
+    RuntimeReleaseObject,
+    DomGetBoxModel,
+    DomScrollIntoViewIfNeeded,
+    InputDispatchMouseEvent,
+    InputDispatchKeyEvent,
+    InputInsertText
+});
+// The closed failure class of the last failed CDP command in the action. A
+// remote error may additionally name the browser object it says is gone.
+diagnostic_enum!(ActionCdpFailure {
+    RemoteError,
+    AdmissionRefused,
+    AdmissionRevoked,
+    OwnerChanged,
+    OwnerRequired,
+    ChannelClosed,
+    Deadline,
+    LocalFailure,
+    Other,
+    MissingReply,
+    Exception
+});
+// The same closed gone-object taxonomy as a network callback error ACK.
+diagnostic_enum!(ActionStaleObject {
+    Session,
+    Frame,
+    Object,
+    Node
+});
+impl ActionKind {
+    /// Map the wire action tag to the closed diagnostic kind.
+    pub(crate) fn from_wire(value: Option<&str>) -> Self {
+        match value {
+            Some("tap") => Self::Tap,
+            Some("doubleTap") => Self::DoubleTap,
+            Some("secondaryTap") => Self::SecondaryTap,
+            Some("longPress") => Self::LongPress,
+            Some("hover") => Self::Hover,
+            Some("swipe") => Self::Swipe,
+            Some("scrollIntoView") => Self::ScrollIntoView,
+            Some("focus") => Self::Focus,
+            Some("press") => Self::Press,
+            Some("fill") => Self::Fill,
+            Some("clear") => Self::Clear,
+            Some("selectOption") => Self::SelectOption,
+            Some("check") => Self::Check,
+            Some("uncheck") => Self::Uncheck,
+            Some("dragTo") => Self::DragTo,
+            Some("setInputFiles") => Self::SetInputFiles,
+            _ => Self::Unknown,
+        }
+    }
+}
+impl ActionStage {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Locate => "locate",
+            Self::FrameOwner => "frame-owner",
+            Self::Visibility => "visibility",
+            Self::Scroll => "scroll",
+            Self::Geometry => "geometry",
+            Self::BoxModel => "box-model",
+            Self::Reachability => "reachability",
+            Self::Input => "input",
+            Self::Upload => "upload",
+            Self::Keyboard => "keyboard",
+            Self::Settle => "settle",
+        }
+    }
+}
+impl ActionCdpMethod {
+    pub(crate) fn from_method(method: &str) -> Self {
+        match method {
+            "Page.createIsolatedWorld" => Self::PageCreateIsolatedWorld,
+            "Page.getFrameTree" => Self::PageGetFrameTree,
+            "Page.getLayoutMetrics" => Self::PageGetLayoutMetrics,
+            "DOM.resolveNode" => Self::DomResolveNode,
+            "Runtime.callFunctionOn" => Self::RuntimeCallFunctionOn,
+            "Runtime.evaluate" => Self::RuntimeEvaluate,
+            "Runtime.releaseObject" => Self::RuntimeReleaseObject,
+            "DOM.getBoxModel" => Self::DomGetBoxModel,
+            "DOM.scrollIntoViewIfNeeded" => Self::DomScrollIntoViewIfNeeded,
+            "Input.dispatchMouseEvent" => Self::InputDispatchMouseEvent,
+            "Input.dispatchKeyEvent" => Self::InputDispatchKeyEvent,
+            "Input.insertText" => Self::InputInsertText,
+            _ => Self::Other,
+        }
+    }
+}
+impl ActionStaleObject {
+    pub(crate) fn from_browser_object(value: super::cdp::types::StaleBrowserObject) -> Self {
+        match value {
+            super::cdp::types::StaleBrowserObject::Session => Self::Session,
+            super::cdp::types::StaleBrowserObject::Frame => Self::Frame,
+            super::cdp::types::StaleBrowserObject::Object => Self::Object,
+            super::cdp::types::StaleBrowserObject::Node => Self::Node,
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct ActionFailureObservation {
+    pub kind: ActionKind,
+    pub stage: ActionStage,
+    pub method: Option<ActionCdpMethod>,
+    pub failure: Option<ActionCdpFailure>,
+    pub stale_object: Option<ActionStaleObject>,
+    pub error: ProtocolError,
+    pub effects: Effects,
+}
+/// Whether the cleanup diagnostics file was opted in for this process.
+pub(crate) fn cleanup_diagnostics_enabled() -> bool {
+    CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+/// One unconditional record per failed `browser.perform`, including the
+/// pre-dispatch refusals whose receipt carries no CDP cause. Pure diagnostics:
+/// no behavior, settlement or capacity semantic changes.
+pub(crate) fn action_failure(operation_seq: u64, observation: ActionFailureObservation) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            operation_seq,
+            Phase::ActionFailure,
+            Facts {
+                action_kind: Some(observation.kind),
+                action_stage: Some(observation.stage),
+                action_cdp_method: observation.method,
+                action_cdp_failure: observation.failure,
+                action_stale_object: observation.stale_object,
+                error: Some(observation.error),
+                effects: Some(observation.effects),
+                ..Facts::default()
+            },
+        );
     }
 }
 #[derive(Clone, Copy)]
