@@ -12,6 +12,7 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
@@ -622,6 +623,24 @@ fn validate_semantic_frame_url(
     }
     Ok(())
 }
+
+/// Chromium reports a document URL and its fragment separately. Rejoin hash
+/// routes for semantic location and consistency checks. Ordinary fragments
+/// (including sign-in fragments) are outside the observation's route.
+pub(super) fn native_frame_url(frame: &Value) -> Option<Cow<'_, str>> {
+    let url = frame["url"].as_str()?;
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains('#') {
+        return Some(Cow::Borrowed(url));
+    }
+    let Some(fragment) = frame["urlFragment"]
+        .as_str()
+        .filter(|fragment| fragment.starts_with("#/"))
+    else {
+        return Some(Cow::Borrowed(url));
+    };
+    Some(Cow::Owned([url, fragment].concat()))
+}
+
 async fn validate_frame_impl(
     client: &CdpClient,
     frame: &ObservationFrame,
@@ -664,7 +683,7 @@ fn validate_frame_tree(
         // Do not let an absent/non-string native URL acquire the legacy empty
         // URL exception before semantic child content is read. Explicit reads
         // retain their existing loader-only check; this adds no CDP round trip.
-        validate_semantic_frame_url(&frame.url, native["url"].as_str())?;
+        validate_semantic_frame_url(&frame.url, native_frame_url(native).as_deref())?;
     }
     Ok(())
 }
@@ -1266,7 +1285,16 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      return (query<0?before:before.slice(0,query))+markers(query>=0&&query+1<before.length,fragment>=0&&fragment+1<value.length);
    }
  }
- const attrs={}; if(e) for(const a of e.attributes) if(!(secure&&a.name.toLowerCase()==='value')) attrs[a.name]=boundedObservation&&a.name==='href'?protectedHref(a.value):a.value;
+ const attrs={};
+ if(e) for(const a of e.attributes){
+   if(secure&&a.name.toLowerCase()==='value')continue;
+   // Bounded projection keeps its exposed attributes and the private inputs
+   // needed to project roles and names. Large author data and inline styles
+   // need not cross the renderer boundary a second time.
+   if(boundedObservation&&!a.name.startsWith('aria-')&&
+      !['type','autocomplete','href','role','placeholder','id','class','title','scope','data-placeholder'].includes(a.name))continue;
+   attrs[a.name]=boundedObservation&&a.name==='href'?protectedHref(a.value):a.value;
+ }
  const style=e?doc.defaultView.getComputedStyle(e):null;
  // Geometry and visibility are separate: a zero-area layout box is still
  // a box, and display:contents can paint descendants without having one.
@@ -2761,7 +2789,7 @@ pub async fn observe(
             witness,
             Metadata,
             frame_kind,
-            display_none_subtrees(client, frame, &dom, lease).await
+            display_none_subtrees(client, frame, &dom, realm, lease).await
         )
         .unwrap_or_default();
         // A display-none subtree is never read, so an iframe owner inside one
@@ -4745,35 +4773,27 @@ async fn display_none_subtrees(
     client: &CdpClient,
     frame: &ObservationFrame,
     dom: &Value,
+    context: i64,
     lease: &OperationLease,
 ) -> Result<HashMap<i64, (i64, String)>, ObservationError> {
     let session = &frame.binding.session;
-    let world = command(
-        client,
-        session,
-        "Page.createIsolatedWorld",
-        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-display-probe"}),
-        lease,
-    )
-    .await?;
-    let context = world["executionContextId"]
-        .as_i64()
-        .ok_or(ObservationError::BackendFailure)?;
     let expression = r#"(() => {
       const out = [];
-      const walk = (node, path) => {
+      const path = [];
+      const walk = (node) => {
         const children = node.childNodes;
         for (let i = 0; i < children.length; i++) {
           const child = children[i];
           if (child.nodeType !== 1) continue;
-          const next = path.concat(i);
+          path.push(i);
           let none = false;
           try { none = getComputedStyle(child).display === 'none'; } catch {}
-          out.push([next, String(child.localName || '').toLowerCase(), none]);
-          walk(child, next);
+          if (none) out.push([path.slice(), String(child.localName || '').toLowerCase(), true]);
+          walk(child);
+          path.pop();
         }
       };
-      walk(document.documentElement, []);
+      walk(document.documentElement);
       return out;
     })()"#;
     let result = command(
@@ -4829,41 +4849,6 @@ async fn display_none_subtrees(
             }
         }
     }
-    fn mark_path(
-        node: &Value,
-        path: &mut Vec<usize>,
-        target: &[usize],
-        local: &str,
-        out: &mut HashMap<i64, (i64, String)>,
-        found: &mut bool,
-    ) {
-        if *found {
-            return;
-        }
-        let Some(children) = node["children"].as_array() else {
-            return;
-        };
-        for (index, child) in children.iter().enumerate() {
-            path.push(index);
-            if path.as_slice() == target {
-                let child_local = child["localName"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if child["nodeType"].as_i64() == Some(1) && child_local == local {
-                    mark_subtree(child, out);
-                    *found = true;
-                }
-                path.pop();
-                return;
-            }
-            mark_path(child, path, target, local, out, found);
-            path.pop();
-            if *found {
-                return;
-            }
-        }
-    }
     let mut hidden: HashMap<i64, (i64, String)> = HashMap::new();
     for row in rows {
         let Some(path) = row.get(0).and_then(Value::as_array) else {
@@ -4875,18 +4860,27 @@ async fn display_none_subtrees(
         let Some(local) = row.get(1).and_then(Value::as_str) else {
             continue;
         };
-        let path: Vec<usize> = path
-            .iter()
-            .filter_map(Value::as_u64)
-            .map(|v| v as usize)
-            .collect();
         if path.is_empty() {
             continue;
         }
-        let mut found = false;
-        mark_path(html, &mut Vec::new(), &path, local, &mut hidden, &mut found);
+        if let Some(node) = element_at_child_path(html, path, local) {
+            mark_subtree(node, &mut hidden);
+        }
     }
     Ok(hidden)
+}
+
+/// Paths are native child indices. Follow them directly so a dense document
+/// does not scan every preceding sibling for each display-none root.
+fn element_at_child_path<'a>(root: &'a Value, path: &[Value], tag: &str) -> Option<&'a Value> {
+    let node = path.iter().try_fold(root, |node, index| {
+        node["children"].get(usize::try_from(index.as_u64()?).ok()?)
+    })?;
+    (node["nodeType"].as_i64() == Some(1)
+        && node["localName"]
+            .as_str()
+            .is_some_and(|local| local.eq_ignore_ascii_case(tag)))
+    .then_some(node)
 }
 fn suppressed_stub(frame: &ObservationFrame, kind: i64, tag: &str) -> SemanticNode {
     SemanticNode {
@@ -5922,7 +5916,9 @@ async fn enumerate_frames_impl(
             frame_path: Vec::new(),
             parent_frame_id: None,
             owner_backend_id: None,
-            url: frame["url"].as_str().unwrap_or("").into(),
+            url: native_frame_url(frame)
+                .map(Cow::into_owned)
+                .unwrap_or_default(),
         };
         if let Some(parent) = parent {
             let parent = &frames[parent];
@@ -9156,6 +9152,25 @@ mod tests {
         ]);
         assert_eq!(display_none_iframe_owners(&probed), HashSet::from([1]));
         assert!(display_none_iframe_owners(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn display_none_path_follows_exact_child_indices() {
+        let root = json!({"children": [
+            {"nodeType": 3, "nodeValue": " "},
+            {"nodeType": 1, "localName": "body", "children": [
+                {"nodeType": 1, "localName": "div"},
+                {"nodeType": 1, "localName": "iframe", "backendNodeId": 42}
+            ]}
+        ]});
+        let path = [json!(1), json!(1)];
+        let matched = element_at_child_path(&root, &path, "iframe").unwrap();
+        assert_eq!(matched["backendNodeId"], 42);
+        assert!(element_at_child_path(&root, &path, "div").is_none());
+        assert!(element_at_child_path(&root, &[json!(2)], "iframe").is_none());
+        assert!(
+            element_at_child_path(&root, &[json!(1), json!(null), json!(1)], "iframe").is_none()
+        );
     }
 
     #[test]

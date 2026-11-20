@@ -423,6 +423,27 @@ mod tests {
             Err(ObservationError::StaleReference)
         );
     }
+
+    #[test]
+    fn semantic_frame_proof_distinguishes_hash_routes_on_the_same_loader() {
+        let mut frame = fixtures().remove(0);
+        frame.url = "https://fixture.invalid/#/editor".into();
+        let tree = json!({"frameTree":{"frame":{
+            "id":frame.binding.frame,"loaderId":frame.binding.loader,"url":"https://fixture.invalid/",
+            "urlFragment":"#/editor"
+        }}});
+        assert!(validate_frame_tree(&tree, &frame, true).is_ok());
+        frame.url = "https://fixture.invalid/#/list".into();
+        assert_eq!(
+            validate_frame_tree(&tree, &frame, true),
+            Err(ObservationError::StaleReference)
+        );
+        let ordinary = json!({"url":"https://fixture.invalid/","urlFragment":"#private-fragment"});
+        assert_eq!(
+            native_frame_url(&ordinary).as_deref(),
+            Some("https://fixture.invalid/")
+        );
+    }
     #[test]
     fn frame_policy_is_not_an_observe_wire_override() {
         for field in [

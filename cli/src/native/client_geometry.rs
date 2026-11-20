@@ -4,7 +4,8 @@
 //! selector fallback, raw pixels, or wire-visible renderer identifiers live here.
 use super::cdp::client::CdpClient;
 use super::client_observation::{
-    ObservationError, ObservationFrame, ObservationFramePolicy, SemanticFrameProof,
+    native_frame_url, ObservationError, ObservationFrame, ObservationFramePolicy,
+    SemanticFrameProof,
 };
 use super::client_session::{CancelSignal, OperationLease};
 use super::element;
@@ -897,7 +898,7 @@ fn tree_frames(tree: &Value) -> Result<HashMap<String, TreeFrame>, GeometryError
                 id.to_owned(),
                 TreeFrame {
                     loader: loader.to_owned(),
-                    url: frame["url"].as_str().map(str::to_owned),
+                    url: native_frame_url(frame).map(|url| url.into_owned()),
                     parent,
                 },
             )
