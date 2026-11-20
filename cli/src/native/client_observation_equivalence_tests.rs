@@ -1316,7 +1316,6 @@ async fn metadata_acquisition_error_drains_started_sibling_before_group_release(
         None,
         None,
         None,
-        None,
     )
     .await;
     // a3ea20564: an unresolvable observation node is a stale reference to the

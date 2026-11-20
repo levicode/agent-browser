@@ -894,6 +894,32 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  }
  const secureElement=e||this.parentElement||this.getRootNode()?.host;
  const secure=composedSecure(secureElement);
+ function readTextLayout(node){
+   const parent=node.parentElement||node.getRootNode()?.host;
+   if(secure||!parent||doc.defaultView.getComputedStyle(parent).visibility!=='visible')return {visible:false,text:''};
+   const range=doc.createRange();range.selectNode(node);
+   const box=range.getBoundingClientRect();
+   if(!(box.width>0&&box.height>0))return {visible:false,text:''};
+   if(!boundedObservation)return {visible:true,text:''};
+   let text='',scanned=0,emitted=0,space=false;
+   // Stop before materializing an unbounded normalized string or codepoint array.
+   for(const ch of String(node.nodeValue||'')){
+     if(++scanned>16384)return null;
+     const whitespace=/\s/u.test(ch);
+     if(!whitespace||!space){text+=whitespace?' ':ch;if(++emitted===513)break;}
+     space=whitespace;
+   }
+   return {visible:true,text};
+ }
+ // Observation folds many text nodes into their parent's batch. Keep the
+ // same text and security checks, without the element-only metadata.
+ if(boundedObservation&&this.nodeType===3){
+   const layout=readTextLayout(this);
+   if(layout===null)return {__nativeStatus:'resource-limit'};
+   return {author:{nodeType:3,visible:layout.visible,text:layout.text},
+     attributes:{},labels:[],states:{secure,hidden:false,focused:false,disabled:false},
+     safePublicNameFromContent:false,redactName:secure,inputPurpose:secure?'generic-secret':'none'};
+ }
  const secureDescendants=!!e&&!!Element.prototype.querySelector.call(e,secureSelectorAll);
  const normalize=s=>String(s??'').replace(/\s+/g,' ').trim();
  function safeLabelText(node,excludeAriaHidden=false){
@@ -1490,24 +1516,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    if(p.localName==='details'&&!p.open&&Element.prototype.querySelector.call(p,':scope > summary')!==branch){inClosedDetails=true;break;}
  }}
  const suppress=!!e&&(inClosedDetails||Element.prototype.matches.call(e,'script,style,head,template,noscript,next-route-announcer')||(e.getAttribute('aria-hidden')||'').toLowerCase()==='true'||e.hasAttribute('inert')||style.getPropertyValue('interactivity')==='inert'||style.display==='none');
- let textVisible=false;
- if(this.nodeType===3&&!secure){
-   const parent=this.parentElement||this.getRootNode()?.host;
-   if(parent&&doc.defaultView.getComputedStyle(parent).visibility==='visible'){
-     const range=doc.createRange();range.selectNode(this);const box=range.getBoundingClientRect();textVisible=box.width>0&&box.height>0;
-   }
- }
- let authorText='';
- if(boundedObservation&&this.nodeType===3&&!secure&&textVisible){
-   let scanned=0,emitted=0,space=false;
-   // Stop before materializing an unbounded normalized string or codepoint array.
-   for(const ch of String(this.nodeValue||'')){
-     if(++scanned>16384)return {__nativeStatus:'resource-limit'};
-     const whitespace=/\s/u.test(ch);
-     if(!whitespace||!space){authorText+=whitespace?' ':ch;if(++emitted===513)break;}
-     space=whitespace;
-   }
- }
+ const textVisible=this.nodeType===3&&readTextLayout(this)?.visible===true;
  // Exact renderer control state, unlike AX, keeps disabled option selection and
  // ignores stale ARIA on native controls. These remain untrusted semantic facts.
  const checkable=!!e&&tag==='input'&&e instanceof HTMLInputElement&&(e.type==='checkbox'||e.type==='radio');
@@ -1521,7 +1530,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  else if(e&&e.hasAttribute('aria-checked'))controlStates.checked=e.getAttribute('aria-checked')==='true';
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
- const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,clickable,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
+ const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,clickable,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:''};
  return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,safePublicNameFromContent,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:nativeValueControl?e.value:editingHost?editorValue:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
@@ -1554,7 +1563,6 @@ async fn read_backend(
         lease,
         bounded,
         &acquisition_policy,
-        None,
         None,
         None,
         None,
@@ -2789,12 +2797,12 @@ pub async fn observe(
                     .unwrap_or_else(|| synthetic_ax(*id))
             })
             .collect();
-        // One observation-owned frame inventory supplies every metadata batch's
-        // pseudo classification. It is read lazily by the first batch that
-        // actually resolves a pseudo receiver, and every read pseudo is
-        // revalidated once after the final batch.
+        // Classify pseudo receivers from the author DOM already read above.
+        // Build its index on demand and revalidate every read pseudo against a
+        // fresh inventory after the final batch.
         let pseudos = PseudoObservation {
-            origins: std::sync::Mutex::new(None),
+            dom_root: &dom["root"],
+            origins: std::sync::OnceLock::new(),
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let mut nodes = HashMap::new();
@@ -4077,7 +4085,7 @@ async fn evaluate_query_diagnostic_inner(
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None,None).await?.0);
+            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None).await?.0);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
     witness.stage(Stage::QueryWorld);
@@ -4122,7 +4130,7 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::MetadataConfirm);
             let mut confirmed = Vec::new();
             for chunk in ax_nodes.chunks(64) {
-                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None,None,None).await?.0);
+                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security,None,None,None).await?.0);
             }
             for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
             if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
@@ -4897,12 +4905,23 @@ fn suppressed_stub(frame: &ObservationFrame, kind: i64, tag: &str) -> SemanticNo
 /// Observation-lifetime pseudo evidence. One frame inventory supplies every
 /// batch's receiver classification, and every read pseudo is revalidated once
 /// after the final batch rather than once per batch.
-struct PseudoObservation {
-    // Lazy: the frame inventory is read once, on the first batch that actually
-    // classified a pseudo receiver; a page without pseudos reads nothing extra.
-    origins: std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>,
+struct PseudoObservation<'a> {
+    dom_root: &'a Value,
+    origins: std::sync::OnceLock<Result<HashMap<i64, PseudoOrigin>, ObservationError>>,
     deferred: std::sync::Mutex<Vec<(i64, i64)>>,
 }
+
+impl PseudoObservation<'_> {
+    /// Classifies against the same native tree that supplied the candidates.
+    /// Only the final revalidation reads a new inventory.
+    fn origins(&self) -> Result<&HashMap<i64, PseudoOrigin>, ObservationError> {
+        self.origins
+            .get_or_init(|| pseudo_origins(self.dom_root))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
 /// The exact parent and its folded text children share one renderer call.
 /// Changed children still use the existing exact-backend fallback.
 fn observation_metadata_reader() -> &'static str {
@@ -4959,7 +4978,7 @@ async fn read_batch(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
-    pseudos: &PseudoObservation,
+    pseudos: &PseudoObservation<'_>,
     execution_context: Option<i64>,
     text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
 ) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
@@ -4973,8 +4992,7 @@ async fn read_batch(
         lease,
         bounded,
         acquisition_policy,
-        Some(&pseudos.origins),
-        Some(&pseudos.deferred),
+        Some(pseudos),
         execution_context,
         text_folds,
     )
@@ -4991,8 +5009,7 @@ async fn read_batch_with_refs(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
-    pseudo_inventory: Option<&std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>>,
-    deferred_pseudos: Option<&std::sync::Mutex<Vec<(i64, i64)>>>,
+    pseudos: Option<&PseudoObservation<'_>>,
     execution_context: Option<i64>,
     text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
 ) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
@@ -5037,11 +5054,18 @@ async fn read_batch_with_refs(
         let resolved=collect_hint_results(resolved)?;
         metadata_stage!(PseudoInventory);
         let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
-        // The observation owns the frame inventory. It is acquired lazily on the
-        // first read pseudo so a page without pseudos reads nothing extra, and
-        // every later batch reuses it instead of re-reading the whole DOM.
-        let cached=if has_pseudo{pseudo_inventory.and_then(|inventory|inventory.lock().ok().and_then(|origins|origins.clone()))}else{None};
-        let origins=if has_pseudo{match cached{Some(origins)=>origins,None=>{let fresh=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;if let Some(inventory)=pseudo_inventory{*inventory.lock().map_err(|_|ObservationError::BackendFailure)?=Some(fresh.clone());}fresh}}}else{HashMap::new()};
+        let owned_origins;
+        let origins = match (has_pseudo, pseudos) {
+            (true, Some(pseudos)) => pseudos.origins()?,
+            (true, None) => {
+                owned_origins = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
+                &owned_origins
+            }
+            (false, _) => {
+                owned_origins = HashMap::new();
+                &owned_origins
+            }
+        };
         metadata_stage!(ReceiverIdentity);
         // Every non-node receiver is a CSS pseudo element or list marker whose
         // metadata must be read through its proven owner element. Describe and
@@ -5068,7 +5092,7 @@ async fn read_batch_with_refs(
             let backend=nodes[*index].backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
             #[cfg(test)]
             eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&nodes[*index].role).as_deref()==Some("ListMarker"));
-            proven.push(verified_pseudo_origin(remote,described,backend,&origins)?);
+            proven.push(verified_pseudo_origin(remote,described,backend,origins)?);
         }
         let mut owners=Vec::with_capacity(proven.len());
         for chunk in proven.chunks(16){
@@ -5184,7 +5208,7 @@ async fn read_batch_with_refs(
         // same tree without adding receiver identity evidence.
         let owned_policy;
         let policy: Option<&SecurityInventory> = if has_pseudo {
-            match pseudo_inventory {
+            match pseudos {
                 Some(_) => Some(acquisition_policy),
                 None => {
                     owned_policy = Some(security_inventory(client,frame,options,lease).await?);
@@ -5195,10 +5219,10 @@ async fn read_batch_with_refs(
             None
         };
         if has_pseudo {
-            if let Some(deferred) = deferred_pseudos {
+            if let Some(pseudos) = pseudos {
                 // Revalidation joins every read pseudo after the final batch;
                 // one fresh inventory then proves the whole observation.
-                let mut deferred = deferred.lock().map_err(|_| ObservationError::BackendFailure)?;
+                let mut deferred = pseudos.deferred.lock().map_err(|_| ObservationError::BackendFailure)?;
                 for ((ax,_),origin) in nodes.iter().zip(&resolved).zip(&pseudo) {
                     if let Some(origin)=origin {
                         let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
@@ -12760,7 +12784,6 @@ mod tests {
             },
             None,
             None,
-            None,
             Some(&text_folds),
         )
         .await
@@ -13613,15 +13636,13 @@ mod tests {
         ));
     }
     #[tokio::test]
-    async fn observation_pseudo_inventory_reuses_one_frame_inventory_across_batches() {
+    async fn observation_pseudo_inventory_reuses_author_dom_across_batches() {
         use futures_util::{SinkExt, StreamExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let mut documents = 0;
-            let mut frames = 0;
             let mut batches = 0;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
@@ -13630,14 +13651,6 @@ mod tests {
                 let request: Value = serde_json::from_str(text).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "Page.createIsolatedWorld" => json!({"executionContextId":17}),
-                    "Page.getFrameTree" => {
-                        frames += 1;
-                        json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
-                    }
-                    "DOM.getDocument" => {
-                        documents += 1;
-                        json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":2,"pseudoElements":[{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}]}]}})
-                    }
                     "DOM.resolveNode" => {
                         let backend = request["params"]["backendNodeId"].as_i64().unwrap();
                         if backend == 3 {
@@ -13666,18 +13679,21 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(
-                documents, 1,
-                "the frame inventory must be read once, not once per pseudo batch"
-            );
-            assert_eq!(frames, 1, "the lazy inventory acquires one frame loader");
             assert_eq!(batches, 3);
         });
         let client = CdpClient::connect(&endpoint).await.unwrap();
         let (lease, _sender) = lease();
         let mut refs = observed_refs();
+        let dom_root = json!({
+            "nodeType": 9, "backendNodeId": 1,
+            "children": [{
+                "nodeType": 1, "backendNodeId": 2,
+                "pseudoElements": [{"nodeType": 1, "backendNodeId": 3, "pseudoType": "marker"}]
+            }]
+        });
         let pseudos = PseudoObservation {
-            origins: std::sync::Mutex::new(None),
+            dom_root: &dom_root,
+            origins: std::sync::OnceLock::new(),
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let options = ObservationOptions::default();
@@ -13777,7 +13793,8 @@ mod tests {
         let (lease, _sender) = lease();
         let mut refs = observed_refs();
         let pseudos = PseudoObservation {
-            origins: std::sync::Mutex::new(None),
+            dom_root: &Value::Null,
+            origins: std::sync::OnceLock::new(),
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let options = ObservationOptions::default();
@@ -13957,7 +13974,6 @@ mod tests {
                 &op,
                 true,
                 &SecurityInventory::default(),
-                None,
                 None,
                 None,
                 None,
