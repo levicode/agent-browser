@@ -7694,7 +7694,7 @@ mod tests {
                         } else if declaration.starts_with("function(expression") {
                             json!({"result":{"value":{"indices":[0],"redacted":[]}}})
                         } else if declaration.contains("const read=") {
-                            json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]}})
+                            crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!([{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]))
                         } else if declaration.contains("frameOwner") {
                             json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                         } else {
@@ -7864,7 +7864,7 @@ mod tests {
                                     _ => panic!("unknown exact metadata receiver"),
                                 }
                             }).collect::<Vec<_>>();
-                            json!({"result":{"value":values}})
+                            crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
                         } else if declaration
                             .starts_with("function(testId,secureSelector,boundedObservation")
                         {

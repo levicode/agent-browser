@@ -242,7 +242,7 @@ async fn peer(case: Case) -> Peer {
                             } else if case == Case::SemanticGeometryReleaseHeld {
                                 semantic_geometry_reply(&request).unwrap_or_else(|| observation_reply(&request).expect("known semantic geometry protocol"))
                             } else if case == Case::SemanticCorruption && declaration.contains("const read=") {
-                                json!({"result":{"value":[]}})
+                                crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!([]))
                             } else { observation_reply(&request).expect("known Observe/source-mask protocol") }
                         }
                         "Runtime.releaseObjectGroup" => {
@@ -362,7 +362,7 @@ fn semantic_frame_reply(request: &Value) -> Option<Value> {
                         json!({"attributes":{"id":"child"},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":6,"height":6},"author":{"tag":"iframe","nodeType":1,"visible":true}})
                     } else { json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}) }
                 }).collect::<Vec<_>>();
-                Some(json!({"result":{"value":values}}))
+                Some(crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values)))
             } else if request["params"]["objectGroup"]
                 .as_str()
                 .is_some_and(|group| group.starts_with("native-semantic-box-"))
@@ -408,7 +408,7 @@ fn semantic_geometry_reply(request: &Value) -> Option<Value> {
                         json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                     }
                 }).collect::<Vec<_>>();
-                Some(json!({"result":{"value":values}}))
+                Some(crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values)))
             } else if declaration.starts_with("function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements)") {
                 let args = request["params"]["arguments"].as_array().unwrap();
                 assert_eq!(args.len(), 7);
@@ -476,7 +476,7 @@ fn observation_reply(request: &Value) -> Option<Value> {
                     assert!(argument["objectId"].as_str().unwrap().ends_with("node-1"));
                     json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                 }).collect::<Vec<_>>();
-                json!({"result":{"value":values}})
+                crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
             } else if declaration.contains("frameOwner") {
                 json!({"result":{"value":{"connected":true,"frameOwner":false}}})
             } else if declaration

@@ -93,6 +93,17 @@ fn metadata_group_matches(group: &str, sequence: u64) -> bool {
     group == format!("native-metadata-{sequence}")
         || group.starts_with(&format!("native-metadata-{sequence}-"))
 }
+fn metadata_response_has_rows(value: &Value) -> bool {
+    if value.get("exceptionDetails").is_some() {
+        return false;
+    }
+    let rows = &value["result"]["value"];
+    rows.is_array()
+        || rows
+            .as_str()
+            .is_some_and(|encoded| serde_json::from_str::<Vec<Value>>(encoded).is_ok())
+}
+
 pub(super) fn after_group_release(lease: &OperationLease, group: &str) {
     if metadata_group_matches(group, lease.sequence) {
         if let Some(hold) = metadata_hold(lease) {
@@ -119,7 +130,7 @@ async fn metadata_checkpoint(
     if site != "metadata-batch" || !exact_metadata {
         return Ok(());
     }
-    if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {
+    if !metadata_response_has_rows(value) {
         return Err(ObservationError::BackendFailure);
     }
     hold.calls.fetch_add(1, Ordering::SeqCst);
@@ -231,7 +242,16 @@ pub(super) fn instrument(method: &str, mut args: Value, lease: &OperationLease) 
                 .as_str()
                 .is_some_and(|s| s.starts_with("function(testId,secureSelector,...nodes)"))
         {
-            args["functionDeclaration"]=json!(format!("function(testId,secureSelector,...nodes){{const read={METADATA};const result=nodes.map(node=>read.call(node,testId,secureSelector));(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(result));return result;}}"));
+            let original = args["functionDeclaration"].as_str().unwrap();
+            let instrumented = if original.contains("return JSON.stringify(rows);") {
+                original.replace(
+                    "return JSON.stringify(rows);",
+                    "(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(rows));return JSON.stringify(rows);",
+                )
+            } else {
+                format!("function(testId,secureSelector,...nodes){{const read={METADATA};const result=nodes.map(node=>read.call(node,testId,secureSelector));(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(result));return result;}}")
+            };
+            args["functionDeclaration"] = json!(instrumented);
         }
     }
     args
@@ -255,7 +275,7 @@ pub(super) async fn after_command(
     if site != "metadata-batch" {
         return Ok(());
     }
-    if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {
+    if !metadata_response_has_rows(value) {
         return Err(ObservationError::BackendFailure);
     }
     let call = h.calls.fetch_add(1, Ordering::SeqCst) + 1;

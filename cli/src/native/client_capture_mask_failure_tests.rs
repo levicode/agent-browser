@@ -210,7 +210,7 @@ impl MaskFailurePeer {
                                 }).collect::<Vec<_>>();
                                 assert_eq!(values.len(), 2);
                                 metadata_replied = true;
-                                json!({"result":{"value":values}})
+                                crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
                             }
                         }
                     }

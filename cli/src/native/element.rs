@@ -1682,6 +1682,7 @@ pub(crate) async fn resolve_readonly_node_with_negative_proof(
     binding: &ExactBinding,
     backend: i64,
     group: &str,
+    realm: Option<&tokio::sync::OnceCell<i64>>,
 ) -> (
     Result<String, ExactResolutionError>,
     Option<ResolvedNodeNegativeProof>,
@@ -1689,7 +1690,13 @@ pub(crate) async fn resolve_readonly_node_with_negative_proof(
 ) {
     let mut capture = NodeProofCapture::default();
     let result = async {
-        let context = create_exact_realm(client, binding).await?;
+        let context = if let Some(realm) = realm {
+            *realm
+                .get_or_try_init(|| create_exact_realm(client, binding))
+                .await?
+        } else {
+            create_exact_realm(client, binding).await?
+        };
         resolve_exact_object_in_realm_impl(
             client,
             binding,

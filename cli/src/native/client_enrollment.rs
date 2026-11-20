@@ -10527,7 +10527,7 @@ mod tests {
                                 // the node value array.
                                 if declaration.starts_with("function(selector") {json!({"result":{"objectId":"security"}})}
                                 else if declaration.starts_with("function(expression") {json!({"result":{"value":{"indices":[0],"redacted":[]}}})}
-                                else if declaration.contains("const read=") {json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Selected","rect":{"x":10,"y":20,"width":20,"height":20}}]}})}
+                                else if declaration.contains("const read=") {crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!([{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Selected","rect":{"x":10,"y":20,"width":20,"height":20}}]))}
                                 else if declaration.contains("frameOwner") {json!({"result":{"value":{"connected":true,"frameOwner":false}}})}
                                 else {json!({"result":{"value":true}})}
                             },

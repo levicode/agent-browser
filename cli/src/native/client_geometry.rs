@@ -11,6 +11,7 @@ use super::element;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A local cleanup-lane wait only stops on the operation's own cancellation,
@@ -130,6 +131,9 @@ pub(crate) enum NodeGeometryOrigin {
 pub(crate) struct SemanticNodeReadEvidence {
     pub(crate) negative: Option<NodeIdentityNegativeProof>,
     pub(crate) origin: NodeGeometryOrigin,
+    /// A frame-bound realm for this observation only. Each node still gets
+    /// its own exact binding and post-box proof.
+    pub(crate) realm: Option<Arc<tokio::sync::OnceCell<i64>>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -2127,14 +2131,21 @@ async fn read_exact_box_inner(
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
     let observe_node = evidence.is_some();
+    let realm = evidence.as_ref().and_then(|evidence| evidence.realm.clone());
     if let Some(evidence) = evidence.as_mut() {
         evidence.origin = NodeGeometryOrigin::ResolveOther;
     }
     let resolution = async {
         match readonly_group {
             Some(group) if observe_node => {
-                element::resolve_readonly_node_with_negative_proof(client, binding, backend, group)
-                    .await
+                element::resolve_readonly_node_with_negative_proof(
+                    client,
+                    binding,
+                    backend,
+                    group,
+                    realm.as_deref(),
+                )
+                .await
             }
             Some(group) => (
                 element::resolve_exact_object_in_readonly_group(client, binding, backend, group)

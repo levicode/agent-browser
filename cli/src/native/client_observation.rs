@@ -55,6 +55,9 @@ mod selector_expression_tests;
 /// evidence that a node or frame moved, so it must never surface as a stale
 /// scope, and the lane bound, not this number, enforces the pool limit.
 const SEMANTIC_GEOMETRY_FANOUT: usize = 8;
+// Amortize the renderer calls and identity checks over a bounded batch.
+// Object resolution keeps its independent 16-command concurrency bound.
+const OBSERVATION_METADATA_BATCH_SIZE: usize = 256;
 
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1246,7 +1249,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    const pending=[root];let count=0;
    while(pending.length){
      const node=pending.pop();if(++count>10000)throw new Error('visibility resource limit');
-     const computed=doc.defaultView.getComputedStyle(node);
+     const computed=node===e?style:doc.defaultView.getComputedStyle(node);
      if(computed.display==='contents'){
        // Contents has no box for checkVisibility to inspect. Its flat-tree
        // ancestors can still suppress all descendant painting.
@@ -1270,7 +1273,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      // Native rendering knows closed details and skipped flat-tree content.
      // Opacity is intentionally ignored, as in the public visibility API.
      if(!node.checkVisibility({visibilityProperty:true,opacityProperty:false,contentVisibilityAuto:false}))continue;
-     const box=node.getBoundingClientRect();if(box.width>0&&box.height>0)return true;
+     const box=node===e?r:node.getBoundingClientRect();if(box&&box.width>0&&box.height>0)return true;
    }
    return false;
  }
@@ -2795,7 +2798,7 @@ pub async fn observe(
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let mut nodes = HashMap::new();
-        for chunk in candidates.chunks(64) {
+        for chunk in candidates.chunks(OBSERVATION_METADATA_BATCH_SIZE) {
             let (batch, folded) = semantic_capture_stage!(
                 witness,
                 Metadata,
@@ -4900,6 +4903,51 @@ struct PseudoObservation {
     origins: std::sync::Mutex<Option<HashMap<i64, PseudoOrigin>>>,
     deferred: std::sync::Mutex<Vec<(i64, i64)>>,
 }
+/// The exact parent and its folded text children share one renderer call.
+/// Changed children still use the existing exact-backend fallback.
+fn observation_metadata_reader() -> &'static str {
+    static READER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    READER.get_or_init(|| {
+        [
+            "function(testId,secureSelector,...nodes) { const settings = testId; const read=",
+            METADATA,
+            r#";
+            const rows = nodes.map((node, index) => {
+                const metadata = read.call(node, settings.testIdAttribute, secureSelector,
+                    settings.bounded, settings.protectedEditors[index], settings.simpleNameInventory,
+                    settings.focusedReceivers[index], settings.localNameInventory[index]);
+                const entries = settings.folds[index];
+                if (entries.length > 0) {
+                    metadata.__nativeFolded = entries.map(([position, prefix, length]) => {
+                        const child = node.childNodes[position];
+                        if (!child || child.nodeType !== 3) return {__nativeStatus: 'fallback'};
+                        const value = String(child.nodeValue === null ? '' : child.nodeValue);
+                        if (value.length !== length || !value.startsWith(prefix)) {
+                            return {__nativeStatus: 'fallback'};
+                        }
+                        return read.call(child, settings.testIdAttribute, secureSelector,
+                            true, false, false, false, false);
+                    });
+                }
+                return metadata;
+            });
+            return JSON.stringify(rows);
+        }"#,
+        ]
+        .concat()
+    })
+}
+
+/// Mirrors both metadata encodings in the fake DevTools transports.
+#[cfg(test)]
+pub(crate) fn metadata_batch_test_reply(params: &Value, rows: Value) -> Value {
+    if params["arguments"][0]["value"].is_object() {
+        json!({"result":{"type":"string","value":rows.to_string()}})
+    } else {
+        json!({"result":{"type":"object","value":rows}})
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
 async fn read_batch(
     client: &CdpClient,
@@ -5048,15 +5096,50 @@ async fn read_batch_with_refs(
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let protected_editors = metadata_receiver_protection(nodes, &pseudo, acquisition_policy)?;
-        let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
         let focused_receivers = metadata_receiver_focus(nodes, &pseudo, acquisition_policy)?;
-        let focused_receivers = serde_json::to_string(&focused_receivers).map_err(|_| ObservationError::BackendFailure)?;
-        let simple_name_inventory=acquisition_policy.simple_name_inventory;
-        let local_name_inventory:Vec<bool>=nodes.iter().zip(&pseudo).map(|(node,origin)|origin.is_none()&&node.backend_d_o_m_node_id.is_some_and(|id|acquisition_policy.local_name_inventory.contains(&id))).collect();
-        let local_name_inventory=serde_json::to_string(&local_name_inventory).map_err(|_|ObservationError::BackendFailure)?;
-        let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; const localNameInventory={local_name_inventory}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index],localNameInventory[index])); }}");
+        let simple_name_inventory = acquisition_policy.simple_name_inventory;
+        let local_name_inventory: Vec<bool> = nodes
+            .iter()
+            .zip(&pseudo)
+            .map(|(node, origin)| {
+                origin.is_none()
+                    && node
+                        .backend_d_o_m_node_id
+                        .is_some_and(|id| acquisition_policy.local_name_inventory.contains(&id))
+            })
+            .collect();
+        let function = if let Some(folds) = text_folds {
+            let plans: Vec<Vec<Value>> = nodes
+                .iter()
+                .map(|ax| {
+                    ax.backend_d_o_m_node_id
+                        .and_then(|backend| folds.get(&backend))
+                        .map(|list| {
+                            list.iter()
+                                .map(|fold| json!([fold.index, &fold.prefix, fold.length]))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            arguments[0] = json!({"value":{
+                "testIdAttribute": options.test_id_attribute,
+                "bounded": bounded,
+                "protectedEditors": protected_editors,
+                "simpleNameInventory": simple_name_inventory,
+                "focusedReceivers": focused_receivers,
+                "localNameInventory": local_name_inventory,
+                "folds": plans,
+            }});
+            observation_metadata_reader().to_owned()
+        } else {
+            let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
+            let focused_receivers = serde_json::to_string(&focused_receivers).map_err(|_| ObservationError::BackendFailure)?;
+            let local_name_inventory = serde_json::to_string(&local_name_inventory).map_err(|_| ObservationError::BackendFailure)?;
+            format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; const localNameInventory={local_name_inventory}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index],localNameInventory[index])); }}")
+        };
         metadata_stage!(ReadCall);
-        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
+        let mut result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
             diagnostic_receivers(client,session,&objects,lease).await;
@@ -5064,7 +5147,14 @@ async fn read_batch_with_refs(
         }
         metadata_stage!(ReadResult);
         check(lease)?;
-        let mut values=result["result"]["value"].as_array().ok_or("Missing metadata batch")?.clone();
+        let mut values: Vec<Value> = match (text_folds.is_some(), result["result"]["value"].take()) {
+            // Encode in the verified isolated realm so DevTools transfers one
+            // value instead of serializing every field of every metadata row.
+            (true, Value::String(encoded)) => serde_json::from_str(&encoded)
+                .map_err(|_| ObservationError::BackendFailure)?,
+            (false, Value::Array(values)) => values,
+            _ => return Err(ObservationError::BackendFailure),
+        };
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
         // Own the bounded descriptors before entering the async stream. Nested
         // borrowed filter/zip iterators are not sufficiently general for the
@@ -5128,82 +5218,29 @@ async fn read_batch_with_refs(
         }
         // The originating element supplies security policy only. Identity stays
         // the native pseudo backend, never the origin's DOM reference.
-        metadata_stage!(FoldedTextRead);
-        // Text children are read through the parent receiver in the same
-        // batch. The plan carries childNodes positions and the snapshot value
-        // so a changed document refuses the read instead of attaching facts to
-        // the wrong text node.
-        let folded_rows = if let Some(folds) = text_folds {
-            let plans: Vec<Value> = nodes
-                .iter()
-                .map(|ax| {
-                    Value::Array(
-                        ax.backend_d_o_m_node_id
-                            .and_then(|backend| folds.get(&backend))
-                            .map(|list| {
-                                list.iter()
-                                    .map(|fold| json!([fold.index, &fold.prefix, fold.length]))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    )
-                })
-                .collect();
-            if plans.iter().any(|plan| plan.as_array().is_some_and(|entries| !entries.is_empty())) {
-                let plan = serde_json::to_string(&plans).map_err(|_| ObservationError::BackendFailure)?;
-                let function = format!(
-                    "function(testId,secureSelector,plan,...parents){{const read={METADATA};const folds=JSON.parse(plan);return parents.map((node,index)=>{{const entries=folds[index]||[];return entries.map(entry=>{{const child=node.childNodes[entry[0]];if(!child||child.nodeType!==3)return {{__nativeStatus:'fallback'}};const value=String(child.nodeValue===null?'':child.nodeValue);if(value.length!==entry[2]||!value.startsWith(entry[1]))return {{__nativeStatus:'fallback'}};return read.call(child,testId,secureSelector,true,false,false,false,false);}});}});}}"
-                );
-                let mut arguments = vec![
-                    json!({"value":options.test_id_attribute}),
-                    json!({"value":options.secure_field_selector}),
-                    json!({"value":plan}),
-                ];
-                arguments.extend(objects.iter().map(|o| json!({"objectId":o})));
-                let result = command(
-                    client,
-                    session,
-                    "Runtime.callFunctionOn",
-                    json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),
-                    lease,
-                )
-                .await?;
-                if result.get("exceptionDetails").is_some() {
-                    return Err(ObservationError::BackendFailure);
-                }
-                let rows = result["result"]["value"]
-                    .as_array()
-                    .ok_or(ObservationError::BackendFailure)?
-                    .clone();
-                if rows.len() != nodes.len() {
-                    return Err(ObservationError::BackendFailure);
-                }
-                Some(rows)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        // The originating element supplies security policy only. Identity stays
-        // the native pseudo backend, never the origin's DOM reference.
         metadata_stage!(Projection);
         let main_nodes = nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
-            let readonly=if origin.is_some(){readonly_pseudo_metadata(data,ax)}else{data.clone()};
+            let pseudo_metadata;
+            let readonly = if origin.is_some() {
+                pseudo_metadata = readonly_pseudo_metadata(data, ax);
+                &pseudo_metadata
+            } else {
+                data
+            };
             let mut node=match refs.as_deref_mut() {
-                Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded),
-                None=>project_node_with_refs(frame,ax.backend_d_o_m_node_id.unwrap(),ax,None,revision,&readonly,bounded),
+                Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,readonly,bounded),
+                None=>project_node_with_refs(frame,ax.backend_d_o_m_node_id.unwrap(),ax,None,revision,readonly,bounded),
             }?;
             if let (Some(origin),Some(policy))=(origin,policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
             Ok(node)
         }).collect::<Result<Vec<_>,ObservationError>>()?;
         let mut folded_nodes = Vec::new();
-        if let (Some(folds), Some(rows)) = (text_folds, folded_rows) {
+        if let Some(folds) = text_folds {
             for (index, ax) in nodes.iter().enumerate() {
                 let backend = ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
                 let Some(list) = folds.get(&backend) else { continue };
-                let data = rows
-                    .get(index)
+                let data = values[index]
+                    .get("__nativeFolded")
                     .and_then(Value::as_array)
                     .ok_or(ObservationError::BackendFailure)?;
                 if data.len() != list.len() {
@@ -6950,6 +6987,7 @@ pub(crate) async fn project_observe_geometry(
     let requests = (|| {
         let mut pending = nodes.iter().map(|node| (node, 0usize)).collect::<Vec<_>>();
         let mut requests = Vec::new();
+        let mut realms = HashMap::<_, std::sync::Arc<tokio::sync::OnceCell<i64>>>::new();
         let mut visited = 0usize;
         while let Some((node, depth)) = pending.pop() {
             visited += 1;
@@ -6978,12 +7016,21 @@ pub(crate) async fn project_observe_geometry(
                         && frame.binding.frame == binding.frame
                         && frame.binding.loader == binding.loader
                 })
-                .ok_or(GeometryError::StaleIdentity)?
+                .ok_or(GeometryError::StaleIdentity)?;
+            let realm = realms
+                .entry((
+                    &frame.binding.page_session,
+                    &frame.binding.session,
+                    &frame.binding.frame,
+                    &frame.binding.loader,
+                ))
+                .or_default()
                 .clone();
             requests.push((
                 node.reference.id.clone(),
-                frame,
+                frame.clone(),
                 entry.backend_node_id.ok_or(GeometryError::StaleIdentity)?,
+                realm,
             ));
         }
         Ok(requests)
@@ -6993,8 +7040,11 @@ pub(crate) async fn project_observe_geometry(
         origin: NodeGeometryOrigin::ReferenceBinding,
         negatives: vec![],
     })?;
-    let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend)| async move {
-        let mut evidence = SemanticNodeReadEvidence::default();
+    let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend, realm)| async move {
+        let mut evidence = SemanticNodeReadEvidence {
+            realm: Some(realm),
+            ..Default::default()
+        };
         let result = geometry
             .node_semantic_bounds_observed(client, &frame, backend, lease, &mut evidence)
             .await
@@ -11372,7 +11422,7 @@ mod tests {
                             json!({"result":{"objectId":"security-array"}})
                         } else {
                             metadata_read = true;
-                            json!({"result":{"type":"object","value":[metadata()]}})
+                            metadata_batch_test_reply(&request["params"], json!([metadata()]))
                         }
                     }
                     _ => json!({}),
@@ -12622,7 +12672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_batch_keeps_remote_arguments_in_native_candidate_order() {
+    async fn observation_metadata_keeps_candidate_order_and_reads_folded_text_in_one_call() {
         use futures_util::{SinkExt, StreamExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -12646,20 +12696,24 @@ mod tests {
                         assert_eq!(
                             request["params"]["arguments"],
                             json!([
-                                {"value":"data-testid"},{"value":"input[type=\"password\" i]"},
+                                {"value":{
+                                    "testIdAttribute":"data-testid",
+                                    "bounded":true,
+                                    "protectedEditors":[true,false],
+                                    "simpleNameInventory":false,
+                                    "focusedReceivers":[false,true],
+                                    "localNameInventory":[false,false],
+                                    "folds":[[],[[1,"folded",6]]],
+                                }},
+                                {"value":"input[type=\"password\" i]"},
                                 {"objectId":"native-42"},{"objectId":"native-43"}
                             ])
                         );
                         assert_eq!(diagnostic_site(&request["params"]), "metadata-batch");
-                        assert!(request["params"]["functionDeclaration"]
-                            .as_str()
-                            .unwrap()
-                            .contains("const protectedEditors=[true,false]"));
-                        assert!(request["params"]["functionDeclaration"]
-                            .as_str()
-                            .unwrap()
-                            .contains("const focusedReceivers=[false,true]"));
-                        json!({"result":{"type":"object","value":[metadata(),metadata()]}})
+                        let mut second = metadata();
+                        second["__nativeFolded"] = json!([metadata()]);
+                        let encoded = serde_json::to_string(&[metadata(), second]).unwrap();
+                        json!({"result":{"type":"string","value":encoded}})
                     }
                     "Runtime.releaseObjectGroup" => json!({}),
                     _ => panic!("unexpected metadata command"),
@@ -12680,7 +12734,17 @@ mod tests {
         let mut refs = observed_refs();
         let one = ax("first", 42, &[]);
         let two = ax("second", 43, &[]);
-        let nodes = read_batch_with_refs(
+        let text_folds = HashMap::from([(
+            43,
+            vec![FoldedText {
+                backend: 44,
+                index: 1,
+                prefix: "folded".into(),
+                length: 6,
+                ax: ax("folded", 44, &[]),
+            }],
+        )]);
+        let (nodes, folded) = read_batch_with_refs(
             &client,
             &frame(),
             &[&one, &two],
@@ -12697,13 +12761,14 @@ mod tests {
             None,
             None,
             None,
-            None,
+            Some(&text_folds),
         )
         .await
-        .unwrap()
-        .0;
+        .unwrap();
         assert_eq!(nodes.len(), 2);
         assert_ne!(nodes[0].reference.id, nodes[1].reference.id);
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].0, 44);
         server.await.unwrap();
     }
     #[test]
@@ -13948,6 +14013,7 @@ mod node_identity_resample_merge_tests {
             SemanticNodeReadEvidence {
                 negative: Some(proof),
                 origin: NodeGeometryOrigin::BoxNodeNegative,
+                ..Default::default()
             },
         )
     }
