@@ -23,6 +23,8 @@ mod frame_dom_validation_tests;
 mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
 mod fresh_query;
+#[path = "client_observation/css_field_sample.rs"]
+mod css_field_sample;
 #[path = "client_observation/query_diagnostic.rs"]
 pub(crate) mod query_diagnostic;
 #[path = "client_observation/role_candidates.rs"]
@@ -58,7 +60,7 @@ mod selector_expression_tests;
 const SEMANTIC_GEOMETRY_FANOUT: usize = 8;
 // Amortize the renderer calls and identity checks over a bounded batch.
 // Object resolution keeps its independent 16-command concurrency bound.
-const OBSERVATION_METADATA_BATCH_SIZE: usize = 256;
+const OBSERVATION_METADATA_BATCH_SIZE: usize = 512;
 
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3287,7 +3289,7 @@ async fn query_fields_ax(
 ) -> Result<Vec<Value>, ObservationError> {
     use super::client_settlement_trace::QueryReadStage as Stage;
     let evaluated =
-        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, witness).await?;
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, witness, true).await?;
     witness.stage(Stage::Projection);
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
@@ -3472,6 +3474,8 @@ const MATCH_QUERY: &str = concat!(
  const norm=s=>String(s??'').replace(/[\u200b\u200c\u200d\ufeff]/g,'').replace(/\s+/g,' ').trim();
  function match(p,s,testId=false) { if(p.kind==='regexp') return new RegExp(p.source,p.flags).test(String(s??'')); if(testId)return String(s??'')===p.value; const a=norm(s),b=norm(p.value); return p.exact?a===b:a.toLowerCase().includes(b.toLowerCase()); }
  if(elements.some(e=>!e.isConnected||e.ownerDocument!==document))return {error:'stale-reference'};
+ const structuralCss=data===null;
+ if(structuralCss){const empty={states:{secure:false}};data=elements.map(()=>empty);}
  const all=elements.map((_,i)=>i);
  // Selection/filter text is private matching data, not SemanticNode.text.
  // Read authored text nodes in light DOM/open roots, never editable values,
@@ -3538,7 +3542,8 @@ const MATCH_QUERY: &str = concat!(
  }
  const contains=(a,b)=>{if(a===b)return false;let node=elements[b];const seen=new Set();while(node&&!seen.has(node)){seen.add(node);node=node.parentNode||(node.getRootNode&&node.getRootNode().host);if(node===elements[a])return true;}return false;};
  const redacted=[];
- for(let i=0;i<data.length;i++)if(data.some((n,j)=>n.states.secure&&contains(i,j))){redacted.push(i);if(safeNames[i]!==null)data[i].name=safeNames[i];else delete data[i].name;delete data[i].text;delete data[i].selection;delete data[i].value;labels[i]=[];}
+ const secureIndices=all.filter(i=>data[i].states.secure);
+ for(let i=0;secureIndices.length&&i<data.length;i++)if(secureIndices.some(j=>contains(i,j))){redacted.push(i);if(safeNames[i]!==null)data[i].name=safeNames[i];else delete data[i].name;delete data[i].text;delete data[i].selection;delete data[i].value;labels[i]=[];}
  function semantic(q,i) {
   const n=data[i],e=elements[i]; if(q.visible&&n.states.hidden)return false;
   if(q.kind==='role') {
@@ -3592,6 +3597,10 @@ const MATCH_QUERY: &str = concat!(
   }
  }
  try {
+  if(structuralCss){
+    const parts=rawSelectorEntryParts(expression);
+    if(parts.length!==1||parts[0].engine!=='css'||rawCssProgram(parts[0]).extended)return {requiresMetadata:true};
+  }
   const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);
   return {indices,redacted};
  } catch(error) { return {error:(error===rawInternalSelectorUnsupported||error===rawCssUnavailable)?"unsupported-capability":(error===rawTextSelectorError||error===rawInternalSelectorError||error===rawCssSelectorError||error===rawXPathSelectorError)?"raw-selector-error":error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
@@ -4032,9 +4041,45 @@ async fn evaluate_query(
     // not emit another first-failure record for the same operation.
     let witness = query_diagnostic::QueryReadWitness::disabled(lease);
     let result =
-        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness).await;
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness, false).await;
     witness.observe(&result);
     result
+}
+
+/// Preserve matcher failures even when only a few matching fields are sampled.
+fn check_query_match_reply(value: &Value) -> Result<(), ObservationError> {
+    match value.get("error") {
+        None => Ok(()),
+        Some(error) => Err(match error.as_str() {
+            Some("stale-reference") => ObservationError::StaleReference,
+            Some("invalid-arguments") => ObservationError::InvalidArguments,
+            Some("invalid-locator") => ObservationError::InvalidLocator,
+            Some("resource-limit") => ObservationError::ResourceLimit,
+            Some("unsupported-capability") => ObservationError::UnsupportedCapability,
+            _ => ObservationError::BackendFailure,
+        }),
+    }
+}
+
+/// Read the complete candidate projection for an ordinary query.
+async fn query_metadata(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    candidates: &[AXNode],
+    options: &ObservationOptions,
+    security: &SecurityInventory,
+    lease: &OperationLease,
+) -> Result<Vec<SemanticNode>, ObservationError> {
+    let mut nodes = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(64) {
+        let rows = chunk.iter().collect::<Vec<_>>();
+        nodes.extend(read_batch_with_refs(client, frame, &rows, None, 0, options, lease,
+            false, security, None, None, None).await?.0);
+    }
+    for (ax, node) in candidates.iter().zip(&mut nodes) {
+        apply_security(node, ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?, security);
+    }
+    Ok(nodes)
 }
 
 async fn evaluate_query_diagnostic_inner(
@@ -4044,6 +4089,7 @@ async fn evaluate_query_diagnostic_inner(
     options: &QueryOptions,
     lease: &OperationLease,
     witness: &query_diagnostic::QueryReadWitness,
+    field_read: bool,
 ) -> Result<QueryEvaluation, ObservationError> {
     use super::client_settlement_trace::QueryReadStage as Stage;
     let session = &frame.binding.session;
@@ -4112,10 +4158,10 @@ async fn evaluate_query_diagnostic_inner(
     let result=capture.scope(async {
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
-        for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security,None,None,None).await?.0);
+        let sample_css = field_read && css_field_sample::eligible(expression, &security, ids.len());
+        if !sample_css {
+            nodes = query_metadata(client, frame, &ax_nodes, &metadata_options, &security, lease).await?;
         }
-        for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
     witness.stage(Stage::QueryWorld);
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing query realm")?;
@@ -4129,6 +4175,27 @@ async fn evaluate_query_diagnostic_inner(
             }
         })).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
+        if sample_css {
+            if let Some(sample) = css_field_sample::read(client, frame, &ax_nodes, &objects, expression, &metadata_options, &security, &group, lease).await? {
+                // A closed author root attached during the sample is invisible
+                // to light-tree JavaScript. Reconfirm its native domain before
+                // publishing even an empty match.
+                witness.stage(Stage::CandidateConfirm);
+                let current = validated_frame_dom(client, frame, lease).await?;
+                if author_query_ids(&current["root"])? != ids {
+                    return Err(ObservationError::StaleReference);
+                }
+                witness.stage(Stage::SecurityConfirm);
+                let policy = security_inventory_from_dom(client, frame, &metadata_options, lease, &current, context).await?;
+                if !role_candidates::same_security(&security, &policy, &ids) {
+                    return Err(ObservationError::StaleReference);
+                }
+                return Ok(sample);
+            }
+            // The live renderer found a protected domain or a broad result.
+            // Reacquire the ordinary metadata before invoking the full matcher.
+            nodes = query_metadata(client, frame, &ax_nodes, &metadata_options, &security, lease).await?;
+        }
     witness.stage(Stage::QueryMatch);
         let (indices,redacted) = if objects.is_empty() { (Vec::<usize>::new(),Vec::<usize>::new()) } else {
         let mut arguments=vec![json!({"value":compile_selector_expression(expression)?}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
@@ -4136,7 +4203,7 @@ async fn evaluate_query_diagnostic_inner(
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
-        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some("unsupported-capability")=>return Err(ObservationError::UnsupportedCapability),Some("deprecated-selector")=>return Err(ObservationError::BackendFailure),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
+        check_query_match_reply(value)?;
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         (indices,redacted)
@@ -4394,7 +4461,22 @@ fn metadata_receiver_focus(
 // the same exact-receiver, side-effect-restricted reads to one candidate set in
 // one native call instead of seven renderer round trips per candidate.
 const MAIN_ONCLICK_HINT_BATCH: &str = "function(...nodes) { return nodes.map(function(node) { return typeof node.onclick === 'function'; }); }";
-const EXACT_HINT_RECEIVER_BATCH: &str = "function(...nodes) { const p=Node.prototype; const connected=Object.getOwnPropertyDescriptor(p,'isConnected').get; const owner=Object.getOwnPropertyDescriptor(p,'ownerDocument').get; return nodes.map(function(node) { try { return connected.call(node) === true && (node === document || owner.call(node) === document); } catch (_) { return false; } }); }";
+// A Document contains its light-tree descendants only. A positive intrinsic
+// contains check proves both connection and ownership in one native call.
+// Shadow descendants take the original composed-connection and owner proof.
+const EXACT_HINT_RECEIVER_BATCH: &str = r#"function(...nodes) {
+    const proto = Node.prototype;
+    try {
+        const inDocument = nodes.map(proto.contains, document);
+        if (inDocument.every(Boolean)) return inDocument;
+    } catch (_) {}
+    const connected = Object.getOwnPropertyDescriptor(proto, 'isConnected').get;
+    const owner = Object.getOwnPropertyDescriptor(proto, 'ownerDocument').get;
+    return nodes.map(node => {
+        try { return connected.call(node) === true && (node === document || owner.call(node) === document); }
+        catch (_) { return false; }
+    });
+}"#;
 
 fn hint_batch_arguments(objects: &[String]) -> Value {
     Value::Array(
@@ -10879,13 +10961,16 @@ mod tests {
     async fn fixture_fields_keep_frame_cancellation_and_cleanup_guards_without_publication() {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::{Arc, Mutex};
-        for mode in [
+        let modes = [
             "success",
             "changed-loader",
             "cleanup-failed",
             "cancelled",
             "cancelled-before-publication",
-        ] {
+        ];
+        for (mode, selector) in modes.into_iter().flat_map(|mode| {
+            ["button", "css=button >> nth=0"].map(|selector| (mode, selector))
+        }) {
             let (operation, cancel) = lease();
             let cancel_after_match = cancel.clone();
             let query_releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -10928,6 +11013,10 @@ mod tests {
                         "DOM.getDocument" => {
                             json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42}]}})
                         }
+                        "DOM.describeNode" => {
+                            assert_eq!(request["params"]["backendNodeId"], 99);
+                            json!({"node":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42}]}})
+                        }
                         "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                         "DOM.resolveNode" => {
                             json!({"object":{"objectId":"owned","subtype":"node"}})
@@ -10938,7 +11027,10 @@ mod tests {
                         "Runtime.callFunctionOn" => {
                             let declaration =
                                 request["params"]["functionDeclaration"].as_str().unwrap();
-                            if declaration.contains("Array.from(result)") {
+                            if declaration.starts_with("function(expression,fields,testId,secureSelector,authorRoots,domains,") {
+                                queried = true;
+                                json!({"result":{"value":{"values":[metadata()]}}})
+                            } else if declaration.contains("Array.from(result)") {
                                 json!({"result":{"objectId":"security"}})
                             } else if declaration == MATCH_QUERY {
                                 queried = true;
@@ -10977,7 +11069,7 @@ mod tests {
                 cancel.send_replace(CancelSignal::Requested);
             }
             let options: QueryOptions = serde_json::from_value(
-                json!({"expression":{"kind":"selector","selector":"button"}}),
+                json!({"expression":{"kind":"selector","selector":selector}}),
             )
             .unwrap();
             let result = query_fields(
@@ -10990,10 +11082,10 @@ mod tests {
             )
             .await;
             match mode {
-                "success" => assert_eq!(
-                    result.unwrap(),
-                    vec![json!({"text":"Save","states":{"secure":false}})]
-                ),
+                "success" => {
+                    assert_eq!(result.unwrap(), vec![json!({"text":"Save","states":{"secure":false}})]);
+                    assert_eq!(methods.lock().unwrap().iter().any(|m| m == "Accessibility.getFullAXTree"), selector != "button");
+                }
                 "changed-loader" => {
                     assert_eq!(result.unwrap_err(), ObservationError::StaleReference)
                 }
@@ -11635,6 +11727,58 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a real installed Chromium"]
+    async fn chromium_sparse_fixture_fields_match_the_full_projection() {
+        use super::super::actions::{execute_command, DaemonState};
+        let mut state = DaemonState::new();
+        let launch = execute_command(&json!({"id":"sparse-launch","action":"launch","headless":true}), &mut state).await;
+        assert_eq!(launch["success"], true);
+        let run = async {
+            let mgr = state.browser.as_ref().ok_or("Missing browser")?;
+            let session = mgr.active_session_id()?;
+            let (mut operation, _sender) = lease();
+            operation.deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            let frames = enumerate_frames(&mgr.client, session, &HashMap::new(), &operation).await?;
+            let frame = query_root(&frames)?;
+            let fields = [ReadField::Role, ReadField::Name, ReadField::Text, ReadField::Value, ReadField::States];
+            for (setup, selectors) in [
+                (r#"document.body.innerHTML='<main><input class="target" value="ready" aria-label="Amount"><div class="target" hidden>hidden</div><label>Ready</label></main>'; for(let i=0;i<70;i++)document.body.append(document.createElement('span')); true"#, vec![".target", ".absent", "span", "main:has(input) label", ".target:not([hidden])", "label:has-text('Ready')"]),
+                (r#"document.querySelector('input').type='password'; true"#, vec![".target"]),
+                (r#"document.querySelector('input').type='text'; document.body.appendChild(document.createElement('aside')).attachShadow({mode:'closed'}).innerHTML='<button class="target">Other</button>'; true"#, vec![".target"]),
+            ] {
+                mgr.client.send_command("Runtime.evaluate", Some(json!({"expression":setup,"returnByValue":true})), Some(session)).await.map_err(|_| "fixture setup failed")?;
+                for selector in selectors {
+                    let options: QueryOptions = serde_json::from_value(json!({"expression":{"kind":"selector","selector":selector}})).unwrap();
+                    let mut views = Vec::new();
+                    for sparse in [false, true] {
+                        let witness = query_diagnostic::QueryReadWitness::new(&operation);
+                        let evaluated = evaluate_query_diagnostic_inner(&mgr.client, frame, &options.expression, &options, &operation, &witness, sparse).await?;
+                        if !sparse {
+                            for field in [ReadField::Text, ReadField::Value] {
+                                let requested = [field];
+                                let expected = evaluated.matches.iter()
+                                    .map(|m| project_fixture_fields(m.node.clone(), &requested))
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                let actual = query_fields(&mgr.client, &frames, &options, &requested, &operation, None).await?;
+                                assert_eq!(actual, expected, "{selector} {requested:?}");
+                            }
+                        }
+                        let fields = evaluated.matches.into_iter().map(|m| Ok((m.backend_node_id, project_fixture_fields(m.node, &fields)?))).collect::<Result<Vec<_>, ObservationError>>()?;
+                        views.push(fields);
+                    }
+                    assert_eq!(views[0], views[1], "selector {selector}");
+                    if selector == ".absent" { assert!(views[1].is_empty()); }
+                    if selector == "span" { assert_eq!(views[1].len(), 70); }
+                }
+            }
+            Ok::<(), String>(())
+        }.await;
+        let close = execute_command(&json!({"id":"sparse-close","action":"close"}), &mut state).await;
+        assert_eq!(close["success"], true);
+        run.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires a real installed Chromium; run in browser CI"]
     async fn chromium_native_observation_query_exact_and_secure_contract() {
         use super::super::actions::{execute_command, DaemonState};
@@ -11747,6 +11891,7 @@ mod tests {
                 if observed_id==Some(&node.reference.id){return Err("Strict endpoint query reused observed authority ID".into());}
                 if included!=wanted{return Err(format!("Inline endpoint ordinal={ordinal} included={included} expected={wanted}"));}
             }
+            assert_hint_document_ownership(&mgr.client, query_root(&frames)?, &lease).await?;
             Ok::<(),String>(())
         }.await;
         let close = execute_command(
@@ -11756,6 +11901,50 @@ mod tests {
         .await;
         assert_eq!(close["success"], true, "{close}");
         run.unwrap();
+    }
+
+    /// Exercise the very same side-effect-checked predicate used before and
+    /// after a main-world hint, on real receivers rather than serialized nodes.
+    async fn assert_hint_document_ownership(
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        lease: &OperationLease,
+    ) -> Result<(), ObservationError> {
+        let session = &frame.binding.session;
+        let world = command(client, session, "Page.createIsolatedWorld",
+            json!({"frameId":frame.binding.frame,"worldName":"hint-ownership-test"}), lease).await?;
+        let group = "hint-ownership-test";
+        let array = command(client, session, "Runtime.evaluate", json!({
+            "contextId":world["executionContextId"], "objectGroup":group,
+            "expression":r#"(() => {
+                const add = tag => document.body.appendChild(document.createElement(tag));
+                const light = add('span');
+                const shadow = mode => add('div').attachShadow({mode}).appendChild(document.createElement('span'));
+                const foreign = add('iframe').contentDocument;
+                const adopted = foreign.body.appendChild(add('span'));
+                const removed = add('span'); removed.remove();
+                return [light, shadow('open'), shadow('closed'), foreign.body, adopted, removed, document.createElement('span'), document];
+            })()"#
+        }), lease).await?;
+        let properties = command(client, session, "Runtime.getProperties", json!({
+            "objectId":array["result"]["objectId"],"ownProperties":true
+        }), lease).await?;
+        let descriptors = properties["result"].as_array().unwrap();
+        let objects: Vec<String> = (0..8).map(|i| {
+            let d = descriptors.iter().find(|property| property["name"] == i.to_string()).unwrap();
+            d["value"]["objectId"].as_str().unwrap().to_owned()
+        }).collect();
+        let expected = [true, true, true, false, false, false, false, true];
+        for count in [1, objects.len()] {
+            let reply = command(client, session, "Runtime.callFunctionOn", json!({
+                "objectId":objects[0], "arguments":hint_batch_arguments(&objects[..count]),
+                "functionDeclaration":EXACT_HINT_RECEIVER_BATCH, "throwOnSideEffect":true,
+                "returnByValue":true, "objectGroup":group
+            }), lease).await?;
+            assert_eq!(reply["result"]["value"], json!(&expected[..count]));
+        }
+        command(client, session, "Runtime.releaseObjectGroup", json!({"objectGroup":group}), lease).await?;
+        Ok(())
     }
     #[tokio::test]
     #[ignore = "requires real installed Chromium; historical public names versus ARIA selection"]
