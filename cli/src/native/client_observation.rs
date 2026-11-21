@@ -253,7 +253,7 @@ pub struct ObservationFrame {
     pub offset_y: f64,
     pub frame_path: Vec<String>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationOptions {
     /// Frozen scope policy, never accepted from an observe/query wire payload.
@@ -3055,6 +3055,21 @@ pub(super) async fn observe_with_barrier(
                 light_index: std::sync::Arc::clone(&structure.light_index),
                 deferred: std::sync::Mutex::new(Vec::new()),
             };
+            // The in-page observer cannot see author shadow trees. A deeply bound
+            // frontend Document also covers roots attached during the sample.
+            let sample_inventory = pseudos.inventory.as_ref().filter(|inventory| {
+                options.sample_replay_form
+                    && frame.parent_frame_id.is_none()
+                    && security.simple_name_inventory
+                    && inventory.matches(client, frame, identity_scope, lease)
+            });
+            let ordinary;
+            let read_options = if options.sample_replay_form && sample_inventory.is_none() {
+                ordinary = ObservationOptions { sample_replay_form: false, ..options.clone() };
+                &ordinary
+            } else {
+                options
+            };
             let mut nodes = HashMap::new();
             let batch_limit = if frame.parent_frame_id.is_none()
                 && security.simple_name_inventory
@@ -3076,7 +3091,7 @@ pub(super) async fn observe_with_barrier(
                         &chunk.iter().collect::<Vec<_>>(),
                         &mut staged,
                         revision,
-                        options,
+                        read_options,
                         lease,
                         true,
                         &security,
@@ -3164,6 +3179,11 @@ pub(super) async fn observe_with_barrier(
             };
             let (validated, compacted) = tokio::join!(validate, compact);
             validated?;
+            // The final frame response fences queued DOM notifications before
+            // any sampled control can be returned with its old candidate set.
+            if sample_inventory.is_some_and(|inventory| !inventory.matches(client, frame, identity_scope, lease)) {
+                return Err(ObservationError::StaleReference);
+            }
             let (roots, frame_truncated) =
                 semantic_capture_stage!(witness, Compact, frame_kind, compacted)?;
             Ok::<_, ObservationError>((roots, frame_truncated, hidden_owners))
