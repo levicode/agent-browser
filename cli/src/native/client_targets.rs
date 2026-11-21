@@ -1245,6 +1245,14 @@ impl ProtectedTargetBarrier {
     pub fn check(&self) -> Result<(), ProtocolError> {
         self.registry.check_revision(self.stamp.revision)
     }
+
+    /// A newer inventory can never publish under this barrier. Transient
+    /// reservations and integrity failures keep their ordinary settlement.
+    pub(super) fn advanced(&self) -> bool {
+        self.registry.state.lock().is_ok_and(|state| {
+            !state.sealed && !state.integrity_lost && state.revision != self.stamp.revision
+        })
+    }
 }
 impl Drop for ProtectedTargetBarrier {
     fn drop(&mut self) {
@@ -5770,10 +5778,12 @@ mod tests {
         assert!(registry.protected_read_barrier().is_err());
         registry.acknowledge_enrollment().unwrap();
         let barrier = registry.protected_read_barrier().unwrap();
+        assert!(!barrier.advanced());
         registry
             .attached("owned", "child".into(), "c".into(), "iframe".into())
             .unwrap();
         registry.configured("child").unwrap();
+        assert!(barrier.advanced());
         assert!(barrier.check().is_err());
         let pending = {
             let registry = registry.clone();

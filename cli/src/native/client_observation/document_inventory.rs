@@ -136,12 +136,15 @@ pub(super) async fn acquire(
     layout: &AxRead<'_>,
     layout_ready: bool,
     start_ax: &tokio::sync::Notify,
+    barrier: Option<&super::super::client_targets::ProtectedTargetBarrier>,
 ) -> Result<Arc<Snapshot>, ObservationError> {
     // Blink materializes CSS pseudo elements during style/layout. Even a valid
     // cached frontend root must see any resulting DOM events before reuse.
     // On a cold document, getDocument before this barrier can omit ::marker.
+    InventoryCheckpoint::Document.check(barrier, lease)?;
     if !layout_ready {
         layout.clone().await?;
+        InventoryCheckpoint::Document.check(barrier, lease)?;
     }
     let top = frame.parent_frame_id.is_none()
         && frame_tree["frameTree"]["frame"]["id"].as_str() == Some(frame.binding.frame.as_str());
@@ -209,7 +212,9 @@ pub(super) async fn acquire(
         None
     };
     let before = monitor.stamp();
+    InventoryCheckpoint::Document.check(barrier, lease)?;
     let document = frame_dom_from_tree(client, frame, lease, frame_tree).await?;
+    InventoryCheckpoint::Document.check(barrier, lease)?;
     if layout_root.is_some_and(|id| document["root"]["backendNodeId"].as_i64() != Some(id)) {
         return Err(ObservationError::StaleReference);
     }

@@ -79,6 +79,7 @@ pub enum ObservationError {
     FrameAmbiguous(FrameAmbiguity),
     UnsupportedCapability,
     StaleReference,
+    InventoryAdvanced(InventoryCheckpoint),
     Superseded,
     Cancelled,
     DeadlineExceeded,
@@ -88,6 +89,30 @@ pub enum ObservationError {
     CleanupFailed {
         primary: Option<Box<ObservationError>>,
     },
+}
+/// The first settled boundary that observed a newer target inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InventoryCheckpoint {
+    Frame,
+    Document,
+    Receivers,
+    Metadata,
+    Projection,
+}
+impl InventoryCheckpoint {
+    pub(super) fn check(
+        self,
+        barrier: Option<&super::client_targets::ProtectedTargetBarrier>,
+        lease: &OperationLease,
+    ) -> Result<(), ObservationError> {
+        if barrier.is_some_and(|barrier| barrier.advanced()) {
+            check(lease)?;
+            Err(ObservationError::InventoryAdvanced(self))
+        } else {
+            Ok(())
+        }
+    }
 }
 impl std::fmt::Display for ObservationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2824,6 +2849,32 @@ pub async fn observe(
     options: &ObservationOptions,
     lease: &OperationLease,
 ) -> Result<Observation, ObservationError> {
+    observe_with_barrier(
+        client,
+        frames,
+        refs,
+        identity_scope,
+        revision,
+        options,
+        lease,
+        None,
+    )
+    .await
+}
+
+/// Check the admitted inventory only between settled semantic batches. A
+/// started renderer command and every object-group release keep their owner.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn observe_with_barrier(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    refs: &mut RefMap,
+    identity_scope: &str,
+    revision: u64,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    barrier: Option<&super::client_targets::ProtectedTargetBarrier>,
+) -> Result<Observation, ObservationError> {
     if frames.is_empty() || options.max_nodes == 0 || options.max_nodes > 100000 {
         return Err(ObservationError::InvalidArguments);
     }
@@ -2838,6 +2889,7 @@ pub async fn observe(
         frame_policy::FrameTraversal::new(frames, &options.frame_policy, options.max_nodes)
     )?;
     while let Some(frame) = traversal.next()? {
+        InventoryCheckpoint::Frame.check(barrier, lease)?;
         #[cfg(test)]
         let frame_kind = SemanticCaptureFrameKind::of(frame);
         semantic_capture_stage!(witness, FrameProof, frame_kind, check(lease))?;
@@ -2869,7 +2921,11 @@ pub async fn observe(
         // Chromium can build accessibility while native prepares the author
         // tree and separately proves current protected nodes and focus.
         use futures_util::FutureExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ax_started = AtomicBool::new(false);
+        let inventory_lost = AtomicBool::new(false);
         let accessibility = async {
+            ax_started.store(true, Ordering::Relaxed);
             let capture = super::cdp::observation_ax::Capture::default();
             let data = capture
                 .scope(command(
@@ -2911,6 +2967,7 @@ pub async fn observe(
                     &accessibility,
                     layout_ready,
                     &start_ax,
+                    barrier,
                 ),
                 async { match layout_realm {
                     Some(realm) => Ok(realm), None => observation_realm(client, frame, lease).await,
@@ -2918,6 +2975,7 @@ pub async fn observe(
             );
             let dom = semantic_capture_stage!(witness, AuthorDom, frame_kind, inventory)?;
             let realm = semantic_capture_stage!(witness, FrameProof, frame_kind, realm)?;
+            InventoryCheckpoint::Receivers.check(barrier, lease)?;
             let structure =
                 semantic_capture_stage!(witness, AuthorGraph, frame_kind, dom.structure())?;
             let graph = &structure.graph;
@@ -2987,6 +3045,7 @@ pub async fn observe(
             // Build its index on demand and revalidate every read pseudo against a
             // fresh inventory after the final batch.
             let pseudos = PseudoObservation {
+                barrier,
                 ax: Some(accessibility.clone()),
                 start_ax: layout_ready.then_some(&start_ax),
                 graph: Some(graph),
@@ -3006,6 +3065,7 @@ pub async fn observe(
                 OBSERVATION_METADATA_BATCH_SIZE
             };
             for chunk in candidates.chunks(batch_limit) {
+                InventoryCheckpoint::Receivers.check(barrier, lease)?;
                 let (batch, folded) = semantic_capture_stage!(
                     witness,
                     Metadata,
@@ -3054,6 +3114,7 @@ pub async fn observe(
             }
             // A single fresh inventory proves every pseudo read in this document
             // after the final batch, instead of re-reading the same tree per batch.
+            InventoryCheckpoint::Projection.check(barrier, lease)?;
             let deferred = pseudos
                 .deferred
                 .lock()
@@ -3109,6 +3170,9 @@ pub async fn observe(
         };
         let document = async {
             let result = read_document.await;
+            if matches!(result, Err(ObservationError::InventoryAdvanced(_))) {
+                inventory_lost.store(true, Ordering::Relaxed);
+            }
             start_ax.notify_one();
             result
         };
@@ -3116,7 +3180,10 @@ pub async fn observe(
             // Stable topology issues AX with the metadata batch. Cold topology
             // issues it alongside the deep DOM read after its layout fence.
             if layout_ready { start_ax.notified().await; }
-            accessibility.clone().await
+            if inventory_lost.load(Ordering::Relaxed) && !ax_started.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            accessibility.clone().await.map(|_| ())
         };
         let (document, ax) = tokio::join!(document, ax);
         if let Err(ObservationError::CleanupFailed { .. }) = &document {
@@ -5247,6 +5314,7 @@ type AxRead<'a> = futures_util::future::Shared<futures_util::future::BoxFuture<'
     Result<std::sync::Arc<HashMap<i64, AXNode>>, ObservationError>>>;
 
 struct PseudoObservation<'a, 'operation> {
+    barrier: Option<&'a super::client_targets::ProtectedTargetBarrier>,
     ax: Option<AxRead<'operation>>,
     start_ax: Option<&'a tokio::sync::Notify>,
     graph: Option<&'a author_projection::Graph>,
@@ -5482,6 +5550,8 @@ async fn read_batch_with_refs(
                 world["executionContextId"].as_i64().ok_or("Missing isolated realm")?
             }
         };
+        let barrier = pseudos.and_then(|source| source.barrier);
+        InventoryCheckpoint::Receivers.check(barrier, lease)?;
         metadata_stage!(Resolve);
         let backend_ids = nodes.iter().map(|ax| ax.backend_d_o_m_node_id.ok_or(ObservationError::StaleReference))
             .collect::<Result<Vec<_>, _>>()?;
@@ -5519,6 +5589,7 @@ async fn read_batch_with_refs(
                 // Every candidate carries the backend id its tree listed. A
                 // missing one is the same lost node as an unresolvable id.
                 if known { return Ok(None); }
+                InventoryCheckpoint::Receivers.check(barrier, lease)?;
                 resolve_page_object(client,session,backend,Some(context),group,lease).await.map(Some)
             }
         })).buffered(16).collect().await;
@@ -5591,6 +5662,7 @@ async fn read_batch_with_refs(
             let (origin,owner)=by_index.remove(&index).ok_or(ObservationError::BackendFailure)?;
             objects.push(Some(owner));pseudo.push(Some(origin));
         }
+        InventoryCheckpoint::Metadata.check(barrier, lease)?;
         metadata_stage!(ReceiverPolicy);
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
         arguments.extend(objects.iter().flatten().map(|o|json!({"objectId":o})));
@@ -5649,6 +5721,7 @@ async fn read_batch_with_refs(
             let local_name_inventory = serde_json::to_string(&local_name_inventory).map_err(|_| ObservationError::BackendFailure)?;
             format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; const localNameInventory={local_name_inventory}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index],localNameInventory[index])); }}")
         };
+        InventoryCheckpoint::Metadata.check(barrier, lease)?;
         metadata_stage!(ReadCall);
         let receiver = light.as_ref().map(|l| &l.handle).or_else(||objects.first()?.as_ref())
             .ok_or(ObservationError::BackendFailure)?;
@@ -5685,6 +5758,7 @@ async fn read_batch_with_refs(
         // Own the bounded descriptors before entering the async stream. Nested
         // borrowed filter/zip iterators are not sufficiently general for the
         // Send future required by the spawned operation dispatcher.
+        InventoryCheckpoint::Projection.check(barrier, lease)?;
         metadata_stage!(HandlerHints);
         let mut hint_candidates = Vec::new();
         let mut light_candidates = Vec::new();
@@ -14472,6 +14546,7 @@ mod tests {
             }]
         });
         let pseudos = PseudoObservation {
+            barrier: None,
             ax: None,
             start_ax: None,
             graph: None,
@@ -14578,6 +14653,7 @@ mod tests {
         let (lease, _sender) = lease();
         let mut refs = observed_refs();
         let pseudos = PseudoObservation {
+            barrier: None,
             ax: None,
             start_ax: None,
             graph: None,

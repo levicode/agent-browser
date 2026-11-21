@@ -1219,7 +1219,8 @@ fn session_transform(
 }
 pub(super) fn hidden_proof_error(error: ObservationError) -> GeometryError {
     match error {
-        ObservationError::StaleReference
+        ObservationError::InventoryAdvanced(_)
+        | ObservationError::StaleReference
         | ObservationError::FrameNotFound(_)
         | ObservationError::FrameAmbiguous(_) => GeometryError::StaleIdentity,
         ObservationError::Cancelled => GeometryError::Cancelled,

@@ -1863,6 +1863,11 @@ pub(crate) enum ReadError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ObservationReadError {
+    InventoryFrame,
+    InventoryDocument,
+    InventoryReceivers,
+    InventoryMetadata,
+    InventoryProjection,
     InvalidArguments,
     InvalidLocator,
     FrameNotFound,
@@ -1876,6 +1881,18 @@ pub(crate) enum ObservationReadError {
     PolicyDenied,
     ResourceLimit,
     CleanupFailed,
+}
+impl From<super::client_observation::InventoryCheckpoint> for ObservationReadError {
+    fn from(stage: super::client_observation::InventoryCheckpoint) -> Self {
+        use super::client_observation::InventoryCheckpoint as Stage;
+        match stage {
+            Stage::Frame => Self::InventoryFrame,
+            Stage::Document => Self::InventoryDocument,
+            Stage::Receivers => Self::InventoryReceivers,
+            Stage::Metadata => Self::InventoryMetadata,
+            Stage::Projection => Self::InventoryProjection,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

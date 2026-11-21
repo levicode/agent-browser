@@ -2938,7 +2938,8 @@ impl ObservationDispatch {
                         context.faults.checkpoint(&identity, super::client_test_faults::Phase::SemanticAcquire, vec![], &semantic).await.map_err(fault_observation_error)?;
                         #[cfg(feature = "acceptance-faults")]
                         let prior_next_ref = staged.next_ref_num();
-                        let tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await?;
+                        let barrier = journal.as_ref().and_then(ProtectedReadJournal::global_barrier);
+                        let tree = observation::observe_with_barrier(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic, barrier).await?;
                         #[cfg(feature = "acceptance-faults")]
                         {
                             let mut allocated = staged.ref_ids().into_iter().filter(|id| id.strip_prefix('e').and_then(|number| number.parse::<usize>().ok()).is_some_and(|number| number >= prior_next_ref)).map(|id| format!("@{id}")).collect::<Vec<_>>();
@@ -2949,6 +2950,9 @@ impl ObservationDispatch {
                     }.await;
                     let (mut value, fallback) = match tree {
                         Ok(mut tree) => {
+                            observation::InventoryCheckpoint::Projection
+                                .check(journal.as_ref().and_then(ProtectedReadJournal::global_barrier), &operation)
+                                .map_err(map_observation)?;
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
@@ -2965,6 +2969,9 @@ impl ObservationDispatch {
                                 if let Some(witness) = screenshot { witness.read_failure(detail, &error); }
                                 return Err(error);
                             }
+                            observation::InventoryCheckpoint::Projection
+                                .check(journal.as_ref().and_then(ProtectedReadJournal::global_barrier), &operation)
+                                .map_err(map_observation)?;
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::DocumentRoot);
                             screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
@@ -5081,6 +5088,7 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
         ObservationError::FrameNotFound(index) => ProtocolError::FrameNotFound(index),
         ObservationError::FrameAmbiguous(facts) => ProtocolError::FrameAmbiguous(facts),
+        ObservationError::InventoryAdvanced(_) => ProtocolError::StaleScope,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference | ObservationError::Superseded => {
             ProtocolError::StaleReference
@@ -5110,6 +5118,7 @@ fn observation_read_failure(error: &ObservationError) -> (diagnostic::ReadError,
         ObservationError::FrameNotFound(_) => Kind::FrameNotFound,
         ObservationError::FrameAmbiguous(_) => Kind::FrameAmbiguous,
         ObservationError::UnsupportedCapability => Kind::UnsupportedCapability,
+        ObservationError::InventoryAdvanced(stage) => Kind::from(*stage),
         ObservationError::StaleReference => Kind::StaleReference,
         ObservationError::Superseded => Kind::Superseded,
         ObservationError::Cancelled => Kind::Cancelled,
@@ -5801,6 +5810,10 @@ mod tests {
             GeometryReadError as G, ObservationReadError as O, ReadError as R,
         };
         for (error, kind) in [
+            (
+                ObservationError::InventoryAdvanced(observation::InventoryCheckpoint::Metadata),
+                O::InventoryMetadata,
+            ),
             (ObservationError::StaleReference, O::StaleReference),
             (ObservationError::Superseded, O::Superseded),
             (ObservationError::Cancelled, O::Cancelled),
