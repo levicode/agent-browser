@@ -156,7 +156,10 @@ fn observation_reply(request: &Value) -> Option<Value> {
                     assert_eq!(argument["objectId"], "node-1");
                     json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                 }).collect::<Vec<_>>();
-                crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
+                crate::native::client_observation::metadata_batch_test_reply(
+                    &request["params"],
+                    json!(values),
+                )
             } else if declaration.contains("frameOwner") {
                 json!({"result":{"value":{"connected":true,"frameOwner":false}}})
             } else if declaration

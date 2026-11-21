@@ -99,15 +99,15 @@ fn metadata_response_has_rows(value: &Value) -> bool {
     }
     let rows = &value["result"]["value"];
     rows.is_array()
-        || rows
-            .as_str()
-            .is_some_and(|encoded| {
-                serde_json::from_str::<Value>(encoded).ok().is_some_and(|packet| {
+        || rows.as_str().is_some_and(|encoded| {
+            serde_json::from_str::<Value>(encoded)
+                .ok()
+                .is_some_and(|packet| {
                     packet["rows"].as_array().is_some_and(|rows| {
                         super::metadata_packet::decode(encoded, rows.len()).is_ok()
                     })
                 })
-            })
+        })
 }
 
 pub(super) fn after_group_release(lease: &OperationLease, group: &str) {
@@ -634,9 +634,15 @@ async fn chromium_dense_inline_handlers_survive_refresh_and_reorder() {
         let mut refs = RefMap::new();
         let (first, _) =
             read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 512).await?;
-        assert!(flatten(&first.roots).iter().any(|n| n.text.as_deref()==Some("named control")
-            && n.attributes.get("class").is_some_and(|s|s=="marked-text")));
-        assert!(flatten(&first.roots).iter().any(|n| n.text.as_deref()==Some("nested control")));
+        assert!(flatten(&first.roots)
+            .iter()
+            .any(|n| n.text.as_deref() == Some("named control")
+                && n.attributes
+                    .get("class")
+                    .is_some_and(|s| s == "marked-text")));
+        assert!(flatten(&first.roots)
+            .iter()
+            .any(|n| n.text.as_deref() == Some("nested control")));
         let first_clickable: Vec<_> = flatten(&first.roots)
             .into_iter()
             .filter(|n| n.states.get("clickable") == Some(&true))

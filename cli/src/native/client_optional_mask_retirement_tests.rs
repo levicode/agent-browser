@@ -140,7 +140,10 @@ async fn optional_mask_retirement(case: Case) {
                                 json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":100,"height":80},"author":{"nodeType":1,"tag":"button","visible":true}})
                             }
                         }).collect::<Vec<_>>();
-                        crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
+                        crate::native::client_observation::metadata_batch_test_reply(
+                            &request["params"],
+                            json!(values),
+                        )
                     } else if declaration == crate::native::client_geometry::BOX_PROOF {
                         json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                     } else if declaration

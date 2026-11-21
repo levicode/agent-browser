@@ -197,7 +197,8 @@ pub(crate) const MAX_RETAINED_QUERY_ORIGIN_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RefMap {
-    pub(super) observed_dom: Option<super::client_observation::document_inventory::DocumentInventory>,
+    pub(super) observed_dom:
+        Option<super::client_observation::document_inventory::DocumentInventory>,
     map: Arc<HashMap<String, RefEntry>>,
     exact_ref_limit: usize,
     query_origin_byte_limit: usize,
@@ -385,23 +386,46 @@ impl RefMap {
             kind,
         )?;
         let document_key = (binding.page_session.clone(), Some(binding.frame.clone()));
-        if self.documents.get(&document_key).is_none_or(|doc|
-            doc.session != binding.session || doc.loader != binding.loader) {
-            self.observe_document(&binding.page_session, Some(&binding.frame),
-                &binding.session, Some(&binding.loader));
+        if self
+            .documents
+            .get(&document_key)
+            .is_none_or(|doc| doc.session != binding.session || doc.loader != binding.loader)
+        {
+            self.observe_document(
+                &binding.page_session,
+                Some(&binding.frame),
+                &binding.session,
+                Some(&binding.loader),
+            );
         }
         let key = (backend_node_id, live_query.clone());
         let publication = self.observed_publication.as_ref();
-        let retained = self.documents.get(&document_key).and_then(|doc| doc.refs.get_key_value(&key))
+        let retained = self
+            .documents
+            .get(&document_key)
+            .and_then(|doc| doc.refs.get_key_value(&key))
             .filter(|(_, prior)| prior.compatible(kind, publication));
         let (id, observed_issuance, live_query) = match retained {
-            Some(((_, origin), identity)) => (identity.id.clone(), identity.issuance.clone(), origin.clone()),
+            Some(((_, origin), identity)) => (
+                identity.id.clone(),
+                identity.issuance.clone(),
+                origin.clone(),
+            ),
             None => {
                 let id = self.try_allocate_ref()?;
                 let issuance = publication.cloned();
-                let document = self.documents.get_mut(&document_key).expect("observed document");
+                let document = self
+                    .documents
+                    .get_mut(&document_key)
+                    .expect("observed document");
                 Arc::make_mut(&mut document.refs).insert(
-                    key, DurableRef {id: id.clone(), issuance: issuance.clone(), kind});
+                    key,
+                    DurableRef {
+                        id: id.clone(),
+                        issuance: issuance.clone(),
+                        kind,
+                    },
+                );
                 (id, issuance, live_query)
             }
         };

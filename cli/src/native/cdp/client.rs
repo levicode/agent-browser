@@ -1220,64 +1220,70 @@ impl CdpClient {
                 // successful unowned-data reply goes through the normal ACK
                 // ledger and waiter before the typed rows can be consumed.
                 let typed = if msg.len() >= 4096 {
-                    if let Some(id)=super::observation_ax::leading_id(&msg) {
-                        let target=pending_clone.lock().await.get(&id).and_then(|waiter|
-                            Some((waiter.observation_ax.clone()?,waiter.session.clone()?)));
-                        target.and_then(|(capture,session)|capture.decode(&msg,id,&session))
-                    } else {None}
-                } else {None};
-                let parsed: CdpMessage = match typed.map(Ok).unwrap_or_else(||serde_json::from_str(&msg)) {
-                    Ok(parsed) => parsed,
-                    Err(_) => {
-                        let repaired = sanitize_lone_surrogates(&msg);
-                        let candidate = repaired.as_deref().unwrap_or(&msg);
-                        match serde_json::from_str(candidate) {
-                            Ok(parsed) => parsed,
-                            Err(error) => {
-                                reader_dom_epoch.stop();
-                                // Even an uncorrelated malformed frame damages
-                                // the stream. A missing/unknown ID is no pardon.
-                                if let Some(ledger) = debt_reader
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .as_ref()
-                                {
-                                    ledger.connection_lost();
-                                }
-                                if let Some(id) = extract_command_id(candidate) {
-                                    if let Some(tracked) = tracked_reader
+                    if let Some(id) = super::observation_ax::leading_id(&msg) {
+                        let target = pending_clone.lock().await.get(&id).and_then(|waiter| {
+                            Some((waiter.observation_ax.clone()?, waiter.session.clone()?))
+                        });
+                        target.and_then(|(capture, session)| capture.decode(&msg, id, &session))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let parsed: CdpMessage =
+                    match typed.map(Ok).unwrap_or_else(|| serde_json::from_str(&msg)) {
+                        Ok(parsed) => parsed,
+                        Err(_) => {
+                            let repaired = sanitize_lone_surrogates(&msg);
+                            let candidate = repaired.as_deref().unwrap_or(&msg);
+                            match serde_json::from_str(candidate) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    reader_dom_epoch.stop();
+                                    // Even an uncorrelated malformed frame damages
+                                    // the stream. A missing/unknown ID is no pardon.
+                                    if let Some(ledger) = debt_reader
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner())
-                                        .remove(&id)
+                                        .as_ref()
                                     {
-                                        tracked.malformed_response();
+                                        ledger.connection_lost();
                                     }
-                                    let waiter = pending_clone.lock().await.remove(&id);
-                                    if let Some(tx) = waiter {
-                                        let _ = tx.sender.send(CommandReply::LocalFailure(
-                                            CdpMessage {
-                                                id: Some(id),
-                                                result: None,
-                                                error: Some(CdpError {
-                                                    code: None,
-                                                    message: format!(
-                                                        "Malformed CDP response: {}",
-                                                        error
-                                                    ),
-                                                    data: None,
-                                                }),
-                                                method: None,
-                                                params: None,
-                                                session_id: None,
-                                            },
-                                        ));
+                                    if let Some(id) = extract_command_id(candidate) {
+                                        if let Some(tracked) = tracked_reader
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .remove(&id)
+                                        {
+                                            tracked.malformed_response();
+                                        }
+                                        let waiter = pending_clone.lock().await.remove(&id);
+                                        if let Some(tx) = waiter {
+                                            let _ = tx.sender.send(CommandReply::LocalFailure(
+                                                CdpMessage {
+                                                    id: Some(id),
+                                                    result: None,
+                                                    error: Some(CdpError {
+                                                        code: None,
+                                                        message: format!(
+                                                            "Malformed CDP response: {}",
+                                                            error
+                                                        ),
+                                                        data: None,
+                                                    }),
+                                                    method: None,
+                                                    params: None,
+                                                    session_id: None,
+                                                },
+                                            ));
+                                        }
                                     }
+                                    continue;
                                 }
-                                continue;
                             }
                         }
-                    }
-                };
+                    };
 
                 let valid_envelope = if parsed.id.is_some() {
                     parsed.method.is_none()

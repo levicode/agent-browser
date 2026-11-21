@@ -1795,19 +1795,37 @@ impl GeometrySnapshot {
     /// Native box for an exact backend whose root-document membership is
     /// fenced by the observation caller. This result grants no action authority.
     pub(super) async fn light_semantic_bounds(
-        &self, client: &CdpClient, frame: &ObservationFrame, backend: i64, operation: &OperationLease,
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        backend: i64,
+        operation: &OperationLease,
     ) -> Result<SemanticBounds, GeometryError> {
         self.check_node_binding(frame)?;
-        let model = command(client, &frame.binding.session, "DOM.getBoxModel",
-            json!({"backendNodeId":backend}), operation).await?;
-        self.project_semantic_quad(&frame.binding.frame, quad_points(&model["model"]["border"])?)
+        let model = command(
+            client,
+            &frame.binding.session,
+            "DOM.getBoxModel",
+            json!({"backendNodeId":backend}),
+            operation,
+        )
+        .await?;
+        self.project_semantic_quad(
+            &frame.binding.frame,
+            quad_points(&model["model"]["border"])?,
+        )
     }
 
     fn check_node_binding(&self, frame: &ObservationFrame) -> Result<(), GeometryError> {
         self.require_included(&frame.binding.frame)?;
-        let proof = self.frames.get(&frame.binding.frame).ok_or(GeometryError::IncompleteInventory)?;
-        if proof.session != frame.binding.session || proof.loader != frame.binding.loader ||
-            frame.binding.page_session != self.page_session {
+        let proof = self
+            .frames
+            .get(&frame.binding.frame)
+            .ok_or(GeometryError::IncompleteInventory)?;
+        if proof.session != frame.binding.session
+            || proof.loader != frame.binding.loader
+            || frame.binding.page_session != self.page_session
+        {
             return Err(GeometryError::StaleIdentity);
         }
         Ok(())
@@ -2144,7 +2162,9 @@ async fn read_exact_box_inner(
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
     let observe_node = evidence.is_some();
-    let realm = evidence.as_ref().and_then(|evidence| evidence.realm.clone());
+    let realm = evidence
+        .as_ref()
+        .and_then(|evidence| evidence.realm.clone());
     if let Some(evidence) = evidence.as_mut() {
         evidence.origin = NodeGeometryOrigin::ResolveOther;
     }

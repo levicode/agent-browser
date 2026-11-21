@@ -14,15 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[path = "client_observation/document_inventory.rs"]
-pub(crate) mod document_inventory;
-#[path = "client_observation/metadata_packet.rs"]
-mod metadata_packet;
-pub(crate) mod replay_controls;
-#[path = "client_observation/light_document.rs"]
-mod light_document;
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
+#[path = "client_observation/css_field_sample.rs"]
+mod css_field_sample;
+#[path = "client_observation/document_inventory.rs"]
+pub(crate) mod document_inventory;
 #[cfg(test)]
 #[path = "client_observation/frame_dom_validation_tests.rs"]
 mod frame_dom_validation_tests;
@@ -30,10 +27,13 @@ mod frame_dom_validation_tests;
 mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
 mod fresh_query;
-#[path = "client_observation/css_field_sample.rs"]
-mod css_field_sample;
+#[path = "client_observation/light_document.rs"]
+mod light_document;
+#[path = "client_observation/metadata_packet.rs"]
+mod metadata_packet;
 #[path = "client_observation/query_diagnostic.rs"]
 pub(crate) mod query_diagnostic;
+pub(crate) mod replay_controls;
 #[path = "client_observation/role_candidates.rs"]
 mod role_candidates;
 #[path = "client_observation/single_root_fields.rs"]
@@ -2093,12 +2093,24 @@ fn project_node_with_refs(
         .transpose()?;
     let role = project_public_role(ax, data, &author)?;
     let reference = if let Some(refs) = refs {
-        issue_projection_ref(frame, backend, role.as_deref(), author.as_ref(), refs, data["__nativeReadonlyPseudo"] == true)?
+        issue_projection_ref(
+            frame,
+            backend,
+            role.as_deref(),
+            author.as_ref(),
+            refs,
+            data["__nativeReadonlyPseudo"] == true,
+        )?
     } else {
-        NodeReference { id: String::new(), revision: revision.to_string() }
+        NodeReference {
+            id: String::new(),
+            revision: revision.to_string(),
+        }
     };
     let mut node = SemanticNode {
-        replay_sample: data.get("replayForm").and_then(|v| serde_json::from_value(v.clone()).ok()),
+        replay_sample: data
+            .get("replayForm")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
         author,
         reference,
         role,
@@ -2913,7 +2925,11 @@ pub(super) async fn observe_with_barrier(
             validate_frame_tree(&frame_tree, frame, true)
         )?;
         let (layout_realm, layout_ready) = document_inventory::prepare_layout(
-            client, frame, identity_scope, lease, staged.observed_dom.as_ref(),
+            client,
+            frame,
+            identity_scope,
+            lease,
+            staged.observed_dom.as_ref(),
         )
         .await?;
         let start_ax = tokio::sync::Notify::new();
@@ -2969,9 +2985,12 @@ pub(super) async fn observe_with_barrier(
                     &start_ax,
                     barrier,
                 ),
-                async { match layout_realm {
-                    Some(realm) => Ok(realm), None => observation_realm(client, frame, lease).await,
-                } },
+                async {
+                    match layout_realm {
+                        Some(realm) => Ok(realm),
+                        None => observation_realm(client, frame, lease).await,
+                    }
+                },
             );
             let dom = semantic_capture_stage!(witness, AuthorDom, frame_kind, inventory)?;
             let realm = semantic_capture_stage!(witness, FrameProof, frame_kind, realm)?;
@@ -2979,7 +2998,10 @@ pub(super) async fn observe_with_barrier(
             let structure =
                 semantic_capture_stage!(witness, AuthorGraph, frame_kind, dom.structure())?;
             let graph = &structure.graph;
-            let security = semantic_capture_stage!(witness, SecurityInventory, frame_kind,
+            let security = semantic_capture_stage!(
+                witness,
+                SecurityInventory,
+                frame_kind,
                 live_security_inventory(
                     client,
                     frame,
@@ -2988,7 +3010,8 @@ pub(super) async fn observe_with_barrier(
                     &structure.roots,
                     &structure.domains,
                     Some(realm)
-                ).await
+                )
+                .await
             )?;
             if options.secure_field_selector != default_secure_selector()
                 || !security.ancestors.is_empty()
@@ -2998,9 +3021,13 @@ pub(super) async fn observe_with_barrier(
                 staged.observed_dom = None;
             }
             let mut suppressed = structure.suppressed.clone();
-            let probed = semantic_capture_stage!(witness, Metadata, frame_kind,
+            let probed = semantic_capture_stage!(
+                witness,
+                Metadata,
+                frame_kind,
                 display_none_subtrees(client, frame, &dom, realm, lease).await
-            ).unwrap_or_default();
+            )
+            .unwrap_or_default();
             let display_none_owners = display_none_iframe_owners(&probed);
             for (id, fact) in probed {
                 suppressed.entry(id).or_insert(fact);
@@ -3065,7 +3092,10 @@ pub(super) async fn observe_with_barrier(
             });
             let ordinary;
             let read_options = if options.sample_replay_form && sample_inventory.is_none() {
-                ordinary = ObservationOptions { sample_replay_form: false, ..options.clone() };
+                ordinary = ObservationOptions {
+                    sample_replay_form: false,
+                    ..options.clone()
+                };
                 &ordinary
             } else {
                 options
@@ -3181,7 +3211,9 @@ pub(super) async fn observe_with_barrier(
             validated?;
             // The final frame response fences queued DOM notifications before
             // any sampled control can be returned with its old candidate set.
-            if sample_inventory.is_some_and(|inventory| !inventory.matches(client, frame, identity_scope, lease)) {
+            if sample_inventory
+                .is_some_and(|inventory| !inventory.matches(client, frame, identity_scope, lease))
+            {
                 return Err(ObservationError::StaleReference);
             }
             let (roots, frame_truncated) =
@@ -3199,7 +3231,9 @@ pub(super) async fn observe_with_barrier(
         let ax = async {
             // Stable topology issues AX with the metadata batch. Cold topology
             // issues it alongside the deep DOM read after its layout fence.
-            if layout_ready { start_ax.notified().await; }
+            if layout_ready {
+                start_ax.notified().await;
+            }
             if inventory_lost.load(Ordering::Relaxed) && !ax_started.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -3585,7 +3619,8 @@ async fn query_fields_ax(
 ) -> Result<Vec<Value>, ObservationError> {
     use super::client_settlement_trace::QueryReadStage as Stage;
     let evaluated =
-        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, witness, true).await?;
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, witness, true)
+            .await?;
     witness.stage(Stage::Projection);
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
@@ -4349,7 +4384,8 @@ async fn evaluate_query(
     // not emit another first-failure record for the same operation.
     let witness = query_diagnostic::QueryReadWitness::disabled(lease);
     let result =
-        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness, false).await;
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness, false)
+            .await;
     witness.observe(&result);
     result
 }
@@ -4381,11 +4417,21 @@ async fn query_metadata(
     let mut nodes = Vec::with_capacity(candidates.len());
     for chunk in candidates.chunks(64) {
         let rows = chunk.iter().collect::<Vec<_>>();
-        nodes.extend(read_batch_with_refs(client, frame, &rows, None, 0, options, lease,
-            false, security, None, None, None).await?.0);
+        nodes.extend(
+            read_batch_with_refs(
+                client, frame, &rows, None, 0, options, lease, false, security, None, None, None,
+            )
+            .await?
+            .0,
+        );
     }
     for (ax, node) in candidates.iter().zip(&mut nodes) {
-        apply_security(node, ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?, security);
+        apply_security(
+            node,
+            ax.backend_d_o_m_node_id
+                .ok_or(ObservationError::BackendFailure)?,
+            security,
+        );
     }
     Ok(nodes)
 }
@@ -4444,10 +4490,13 @@ async fn evaluate_query_diagnostic_inner(
         ..Default::default()
     };
     witness.stage(Stage::Security);
-    let plain_css = field_read && candidate_plan.is_none() && css_field_sample::structural(expression);
+    let plain_css =
+        field_read && candidate_plan.is_none() && css_field_sample::structural(expression);
     let shared_realm = if plain_css {
         Some(observation_realm(client, frame, lease).await?)
-    } else { None };
+    } else {
+        None
+    };
     let security = match (&candidate_plan, shared_realm) {
         (Some(plan), _) => {
             security_inventory_for_roots(
@@ -4462,7 +4511,8 @@ async fn evaluate_query_diagnostic_inner(
             .await?
         }
         (None, Some(realm)) => {
-            security_inventory_from_dom(client, frame, &metadata_options, lease, &dom, realm).await?
+            security_inventory_from_dom(client, frame, &metadata_options, lease, &dom, realm)
+                .await?
         }
         (None, None) => security_inventory(client, frame, &metadata_options, lease).await?,
     };
@@ -4686,9 +4736,17 @@ async fn revalidate_deferred_pseudos(
     if deferred.is_empty() {
         return Ok(());
     }
-    if let Some(root) = frontend_root.filter(|id| *id > 0 && frame.parent_frame_id.is_none() && deferred.len() >= 4) {
-        let document = light_document::LightDocument::from_root(client, frame, root, inventory, lease).await?;
-        if document.confirms_pseudos(client, frame, deferred, initial, lease).await? { return Ok(()); }
+    if let Some(root) =
+        frontend_root.filter(|id| *id > 0 && frame.parent_frame_id.is_none() && deferred.len() >= 4)
+    {
+        let document =
+            light_document::LightDocument::from_root(client, frame, root, inventory, lease).await?;
+        if document
+            .confirms_pseudos(client, frame, deferred, initial, lease)
+            .await?
+        {
+            return Ok(());
+        }
     }
     let current = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
     // A pseudo the fresh inventory no longer names is refused before any read,
@@ -4729,8 +4787,11 @@ async fn revalidate_deferred_pseudos(
         if node["backendNodeId"].as_i64() != Some(*backend)
             || node["nodeType"] != 1
             || node["pseudoType"].as_str() != Some(fresh.pseudo_type.as_str())
-            || initial.and_then(|origins| origins.get(backend)).is_some_and(|source|
-                source.backend != *origin || source.pseudo_type != fresh.pseudo_type)
+            || initial
+                .and_then(|origins| origins.get(backend))
+                .is_some_and(|source| {
+                    source.backend != *origin || source.pseudo_type != fresh.pseudo_type
+                })
             || fresh.backend != *origin
         {
             return Err(ObservationError::StaleReference);
@@ -4941,7 +5002,14 @@ async fn main_onclick_hints(
         backends.push((index, backend));
         receivers.push(object);
     }
-    read_onclick_hints(client, frame, backends, HintMembership::Isolated(receivers), lease).await
+    read_onclick_hints(
+        client,
+        frame,
+        backends,
+        HintMembership::Isolated(receivers),
+        lease,
+    )
+    .await
 }
 
 enum HintMembership<'a> {
@@ -4950,13 +5018,28 @@ enum HintMembership<'a> {
 }
 
 impl HintMembership<'_> {
-    async fn confirm(&self, client: &CdpClient, frame: &ObservationFrame, group: &str,
-        lease: &OperationLease) -> Result<(), ObservationError> {
+    async fn confirm(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        group: &str,
+        lease: &OperationLease,
+    ) -> Result<(), ObservationError> {
         match self {
             Self::Light(doc, ids) => doc.confirm(client, frame, ids, lease).await,
             Self::Isolated(receivers) => {
-                if hint_booleans(client, &frame.binding.session, receivers, EXACT_HINT_RECEIVER_BATCH, group, lease)
-                    .await?.into_iter().all(|exact| exact) {
+                if hint_booleans(
+                    client,
+                    &frame.binding.session,
+                    receivers,
+                    EXACT_HINT_RECEIVER_BATCH,
+                    group,
+                    lease,
+                )
+                .await?
+                .into_iter()
+                .all(|exact| exact)
+                {
                     Ok(())
                 } else {
                     Err(ObservationError::StaleReference)
@@ -4967,8 +5050,11 @@ impl HintMembership<'_> {
 }
 
 async fn read_onclick_hints(
-    client: &CdpClient, frame: &ObservationFrame, candidates: Vec<(usize, i64)>,
-    membership: HintMembership<'_>, lease: &OperationLease,
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    candidates: Vec<(usize, i64)>,
+    membership: HintMembership<'_>,
+    lease: &OperationLease,
 ) -> Result<Vec<(usize, bool)>, ObservationError> {
     // No group has been acquired yet: expired admissions need no cleanup.
     check(lease)?;
@@ -4982,10 +5068,17 @@ async fn read_onclick_hints(
             validate_frame(client, frame, lease).await?;
             membership.confirm(client, frame, &group, lease).await?;
             if let HintMembership::Light(document, members) = &membership {
-                if let Some(hints) = document.main_click_hints(client, frame, members, &group, lease).await? {
+                if let Some(hints) = document
+                    .main_click_hints(client, frame, members, &group, lease)
+                    .await?
+                {
                     membership.confirm(client, frame, &group, lease).await?;
                     validate_frame(client, frame, lease).await?;
-                    return Ok(candidates.iter().map(|(index, _)| *index).zip(hints).collect());
+                    return Ok(candidates
+                        .iter()
+                        .map(|(index, _)| *index)
+                        .zip(hints)
+                        .collect());
                 }
             }
             // Each main-world handle is described as soon as its resolve
@@ -4997,28 +5090,54 @@ async fn read_onclick_hints(
                 HintMembership::Light(_, ids) => Some(ids.as_slice()),
                 HintMembership::Isolated(_) => None,
             };
-            let resolved = stream::iter(backends.into_iter().enumerate().map(|(index, backend)| {
-                let frontend = members.map(|ids| ids[index].1);
-                let group = &group;
-                async move {
-                    let value = resolve_page_object(client, session, backend, None, group, lease).await?;
-                    let remote = &value["object"];
-                    if remote["type"] != "object" || remote["subtype"] != "node" {
-                        return Err(ObservationError::BackendFailure);
+            let resolved =
+                stream::iter(backends.into_iter().enumerate().map(|(index, backend)| {
+                    let frontend = members.map(|ids| ids[index].1);
+                    let group = &group;
+                    async move {
+                        let value =
+                            resolve_page_object(client, session, backend, None, group, lease)
+                                .await?;
+                        let remote = &value["object"];
+                        if remote["type"] != "object" || remote["subtype"] != "node" {
+                            return Err(ObservationError::BackendFailure);
+                        }
+                        let object = remote["objectId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .ok_or(ObservationError::BackendFailure)?
+                            .to_owned();
+                        let confirmed = if let Some(frontend) = frontend {
+                            let reply = command(
+                                client,
+                                session,
+                                "DOM.requestNode",
+                                json!({"objectId":object}),
+                                lease,
+                            )
+                            .await?;
+                            reply["nodeId"].as_i64() == Some(frontend)
+                        } else {
+                            let reply = command(
+                                client,
+                                session,
+                                "DOM.describeNode",
+                                json!({"objectId":object,"depth":0}),
+                                lease,
+                            )
+                            .await?;
+                            reply["node"]["backendNodeId"].as_i64() == Some(backend)
+                                && reply["node"]["nodeType"] == 1
+                        };
+                        if !confirmed {
+                            return Err(ObservationError::StaleReference);
+                        }
+                        Ok(object)
                     }
-                    let object = remote["objectId"].as_str().filter(|id| !id.is_empty())
-                        .ok_or(ObservationError::BackendFailure)?.to_owned();
-                    let confirmed = if let Some(frontend) = frontend {
-                        let reply = command(client, session, "DOM.requestNode", json!({"objectId":object}), lease).await?;
-                        reply["nodeId"].as_i64() == Some(frontend)
-                    } else {
-                        let reply = command(client, session, "DOM.describeNode", json!({"objectId":object,"depth":0}), lease).await?;
-                        reply["node"]["backendNodeId"].as_i64() == Some(backend) && reply["node"]["nodeType"] == 1
-                    };
-                    if !confirmed {return Err(ObservationError::StaleReference);}
-                    Ok(object)
-                }
-            })).buffered(16).collect::<Vec<_>>().await;
+                }))
+                .buffered(16)
+                .collect::<Vec<_>>()
+                .await;
             let objects = collect_hint_results(resolved)?;
             let hints = hint_booleans(
                 client,
@@ -5331,8 +5450,12 @@ fn suppressed_stub(frame: &ObservationFrame, kind: i64, tag: &str) -> SemanticNo
 /// Observation-lifetime pseudo evidence. One frame inventory supplies every
 /// batch's receiver classification, and every read pseudo is revalidated once
 /// after the final batch rather than once per batch.
-type AxRead<'a> = futures_util::future::Shared<futures_util::future::BoxFuture<'a,
-    Result<std::sync::Arc<HashMap<i64, AXNode>>, ObservationError>>>;
+type AxRead<'a> = futures_util::future::Shared<
+    futures_util::future::BoxFuture<
+        'a,
+        Result<std::sync::Arc<HashMap<i64, AXNode>>, ObservationError>,
+    >,
+>;
 
 struct PseudoObservation<'a, 'operation> {
     barrier: Option<&'a super::client_targets::ProtectedTargetBarrier>,
@@ -5342,7 +5465,8 @@ struct PseudoObservation<'a, 'operation> {
     inventory: Option<document_inventory::DocumentInventory>,
     light_index: std::sync::Arc<light_document::LightIndex>,
     dom_root: &'a Value,
-    origins: std::sync::Arc<std::sync::OnceLock<Result<HashMap<i64, PseudoOrigin>, ObservationError>>>,
+    origins:
+        std::sync::Arc<std::sync::OnceLock<Result<HashMap<i64, PseudoOrigin>, ObservationError>>>,
     deferred: std::sync::Mutex<Vec<(i64, i64)>>,
 }
 
@@ -5469,7 +5593,13 @@ fn observation_metadata_reader() -> &'static str {
 #[cfg(test)]
 pub(crate) fn metadata_batch_test_reply(params: &Value, rows: Value) -> Value {
     if params["arguments"][0]["value"].is_object() {
-        let indices = rows.as_array().unwrap().iter().enumerate().map(|(i,_)| vec![i]).collect::<Vec<_>>();
+        let indices = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, _)| vec![i])
+            .collect::<Vec<_>>();
         let encoded = json!({"templates":rows,"attributes":[],"rows":indices}).to_string();
         json!({"result":{"type":"string","value":encoded}})
     } else {
@@ -5483,18 +5613,29 @@ pub(crate) fn metadata_batch_test_reply(params: &Value, rows: Value) -> Value {
 /// click-dependent public attribute. Every anonymous control still needs the
 /// real guarded main-world read.
 fn text_owns_click_projection(
-    graph: &author_projection::Graph, backend: i64, row: &metadata_packet::Row,
-    folds: Option<&HashMap<i64, Vec<FoldedText>>>, boundaries: &HashSet<i64>,
+    graph: &author_projection::Graph,
+    backend: i64,
+    row: &metadata_packet::Row,
+    folds: Option<&HashMap<i64, Vec<FoldedText>>>,
+    boundaries: &HashSet<i64>,
 ) -> bool {
     let facts = &row.facts;
-    if facts["author"]["tag"] != "span" || facts["author"]["visible"] != true
-        || facts["author"]["skipsContent"] == true || facts["states"]["secure"] != false
-        || facts["secureDescendants"] == true || facts["redactName"] == true
-        || facts["attributes"].get("id").is_some() || facts["attributes"].get("class").is_some() {
+    if facts["author"]["tag"] != "span"
+        || facts["author"]["visible"] != true
+        || facts["author"]["skipsContent"] == true
+        || facts["states"]["secure"] != false
+        || facts["secureDescendants"] == true
+        || facts["redactName"] == true
+        || facts["attributes"].get("id").is_some()
+        || facts["attributes"].get("class").is_some()
+    {
         return false;
     }
-    let Some([child]) = folds.and_then(|p| p.get(&backend)).map(Vec::as_slice) else { return false; };
-    graph.uncovered_sole_text(backend, child.backend, boundaries) && matches!(row.folded.as_deref(),
+    let Some([child]) = folds.and_then(|p| p.get(&backend)).map(Vec::as_slice) else {
+        return false;
+    };
+    graph.uncovered_sole_text(backend, child.backend, boundaries)
+        && matches!(row.folded.as_deref(),
         Some([metadata_packet::Fold::Text { visible: true, secure: false, text }]) if !text.trim().is_empty())
 }
 
@@ -6056,10 +6197,24 @@ async fn read_folded_text_fallback(
         None => {}
     }
     match refs {
-        Some(refs) => project_node(frame, fold.backend, actual_ax, refs, revision, data, bounded),
-        None => {
-            project_node_with_refs(frame, fold.backend, actual_ax, None, revision, data, bounded)
-        }
+        Some(refs) => project_node(
+            frame,
+            fold.backend,
+            actual_ax,
+            refs,
+            revision,
+            data,
+            bounded,
+        ),
+        None => project_node_with_refs(
+            frame,
+            fold.backend,
+            actual_ax,
+            None,
+            revision,
+            data,
+            bounded,
+        ),
     }
 }
 
@@ -7445,7 +7600,16 @@ async fn security_inventory_for_roots(
     execution_context: Option<i64>,
 ) -> Result<SecurityInventory, ObservationError> {
     let domains = SecurityDomains::read(&dom["root"], &ids)?;
-    live_security_inventory(client, frame, options, lease, &ids, &domains, execution_context).await
+    live_security_inventory(
+        client,
+        frame,
+        options,
+        lease,
+        &ids,
+        &domains,
+        execution_context,
+    )
+    .await
 }
 
 /// Only these facts are a function of the native structural document. Focus,
@@ -7476,9 +7640,15 @@ impl SecurityDomains {
     }
 }
 
-async fn live_security_inventory(client: &CdpClient, frame: &ObservationFrame, options: &ObservationOptions,
-    lease: &OperationLease, ids: &[i64], domains: &SecurityDomains, execution_context: Option<i64>)
-    -> Result<SecurityInventory, ObservationError> {
+async fn live_security_inventory(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    ids: &[i64],
+    domains: &SecurityDomains,
+    execution_context: Option<i64>,
+) -> Result<SecurityInventory, ObservationError> {
     use futures_util::{stream, StreamExt};
     let browser_internal = &domains.internal;
     let author_roots: Vec<bool> = ids
@@ -7784,11 +7954,18 @@ pub(crate) async fn project_observe_geometry(
     let mut batched = HashMap::new();
     let mut requests = requests;
     let main = requests.first().and_then(|(_, frame, _, _)| {
-        (requests.len() >= 16 && frame.parent_frame_id.is_none() &&
-            requests.iter().all(|(_, other, _, _)| other.binding == frame.binding)).then(|| frame.clone())
+        (requests.len() >= 16
+            && frame.parent_frame_id.is_none()
+            && requests
+                .iter()
+                .all(|(_, other, _, _)| other.binding == frame.binding))
+        .then(|| frame.clone())
     });
-    let root_backend = nodes.first().filter(|node| nodes.len() == 1 && node.role.as_deref() == Some("document"))
-        .and_then(|node| super::element::parse_ref(&node.reference.id)).and_then(|id| refs.get(&id))
+    let root_backend = nodes
+        .first()
+        .filter(|node| nodes.len() == 1 && node.role.as_deref() == Some("document"))
+        .and_then(|node| super::element::parse_ref(&node.reference.id))
+        .and_then(|id| refs.get(&id))
         .and_then(|entry| entry.backend_node_id);
     if let Some((frame, backend)) = main.zip(root_backend) {
         let failure = |error| ObserveGeometryFailure {
@@ -7796,40 +7973,39 @@ pub(crate) async fn project_observe_geometry(
             origin: NodeGeometryOrigin::FrameBinding,
             negatives: vec![],
         };
-        let document = light_document::LightDocument::for_backend(client, &frame, backend, refs.observed_dom.as_ref(), lease).await.map_err(failure)?;
+        let document = light_document::LightDocument::for_backend(
+            client,
+            &frame,
+            backend,
+            refs.observed_dom.as_ref(),
+            lease,
+        )
+        .await
+        .map_err(failure)?;
         let backends: Vec<_> = requests.iter().map(|(_, _, backend, _)| *backend).collect();
-        let frontend = document.connected_elements(client, &frame, &backends, lease).await.map_err(failure)?;
-        let light: Vec<_> = requests.iter().zip(&frontend).filter_map(|((id, _, backend, _), member)| {
-            member.map(|member| (id.clone(), *backend, member))
-        }).collect();
-        let members = light.iter().map(|(_, backend, member)| (*backend, *member)).collect::<Vec<_>>();
+        let frontend = document
+            .connected_elements(client, &frame, &backends, lease)
+            .await
+            .map_err(failure)?;
+        let light: Vec<_> = requests
+            .iter()
+            .zip(&frontend)
+            .filter_map(|((id, _, backend, _), member)| {
+                member.map(|member| (id.clone(), *backend, member))
+            })
+            .collect();
+        let members = light
+            .iter()
+            .map(|(_, backend, member)| (*backend, *member))
+            .collect::<Vec<_>>();
         let results = stream::iter(light.into_iter().map(|(id, backend, _)| {
             let frame = &frame;
             async move {
-                let b = geometry.light_semantic_bounds(client, frame, backend, lease).await?.bounds();
-                Ok::<_, GeometryError>((id, Rect { x: b.x, y: b.y, width: b.width, height: b.height }))
-            }
-        })).buffered(16).collect::<Vec<_>>().await;
-        for result in results {
-            let (id, rect) = result.map_err(|error| ObserveGeometryFailure {
-                error, origin: NodeGeometryOrigin::BoxRead, negatives: vec![],
-            })?;
-            batched.insert(id, rect);
-        }
-        document.confirm(client, &frame, &members, lease).await.map_err(failure)?;
-        requests.retain(|(id, _, _, _)| !batched.contains_key(id));
-    }
-    let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend, realm)| async move {
-        let mut evidence = SemanticNodeReadEvidence {
-            realm: Some(realm),
-            ..Default::default()
-        };
-        let result = geometry
-            .node_semantic_bounds_observed(client, &frame, backend, lease, &mut evidence)
-            .await
-            .map(|bounds| {
-                let b = bounds.bounds();
-                (
+                let b = geometry
+                    .light_semantic_bounds(client, frame, backend, lease)
+                    .await?
+                    .bounds();
+                Ok::<_, GeometryError>((
                     id,
                     Rect {
                         x: b.x,
@@ -7837,21 +8013,61 @@ pub(crate) async fn project_observe_geometry(
                         width: b.width,
                         height: b.height,
                     },
-                )
-            });
-        // A proof must belong to this exact staged node read, never another
-        // task's negative result or a freshly rebound document.
-        if evidence
-            .negative
-            .as_ref()
-            .is_some_and(|proof| !proof.matches(&frame.binding, backend))
-        {
-            evidence.negative = None;
-            evidence.origin = NodeGeometryOrigin::FrameBinding;
-            return (Err(GeometryError::StaleIdentity), evidence);
+                ))
+            }
+        }))
+        .buffered(16)
+        .collect::<Vec<_>>()
+        .await;
+        for result in results {
+            let (id, rect) = result.map_err(|error| ObserveGeometryFailure {
+                error,
+                origin: NodeGeometryOrigin::BoxRead,
+                negatives: vec![],
+            })?;
+            batched.insert(id, rect);
         }
-        (result, evidence)
-    }))
+        document
+            .confirm(client, &frame, &members, lease)
+            .await
+            .map_err(failure)?;
+        requests.retain(|(id, _, _, _)| !batched.contains_key(id));
+    }
+    let rectangles = stream::iter(requests.into_iter().map(
+        |(id, frame, backend, realm)| async move {
+            let mut evidence = SemanticNodeReadEvidence {
+                realm: Some(realm),
+                ..Default::default()
+            };
+            let result = geometry
+                .node_semantic_bounds_observed(client, &frame, backend, lease, &mut evidence)
+                .await
+                .map(|bounds| {
+                    let b = bounds.bounds();
+                    (
+                        id,
+                        Rect {
+                            x: b.x,
+                            y: b.y,
+                            width: b.width,
+                            height: b.height,
+                        },
+                    )
+                });
+            // A proof must belong to this exact staged node read, never another
+            // task's negative result or a freshly rebound document.
+            if evidence
+                .negative
+                .as_ref()
+                .is_some_and(|proof| !proof.matches(&frame.binding, backend))
+            {
+                evidence.negative = None;
+                evidence.origin = NodeGeometryOrigin::FrameBinding;
+                return (Err(GeometryError::StaleIdentity), evidence);
+            }
+            (result, evidence)
+        },
+    ))
     .buffered(SEMANTIC_GEOMETRY_FANOUT)
     .collect::<Vec<_>>()
     .await;
@@ -11646,9 +11862,10 @@ mod tests {
             "cancelled",
             "cancelled-before-publication",
         ];
-        for (mode, selector) in modes.into_iter().flat_map(|mode| {
-            ["button", "css=button >> nth=0"].map(|selector| (mode, selector))
-        }) {
+        for (mode, selector) in modes
+            .into_iter()
+            .flat_map(|mode| ["button", "css=button >> nth=0"].map(|selector| (mode, selector)))
+        {
             let (operation, cancel) = lease();
             let cancel_after_match = cancel.clone();
             let query_releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -11761,8 +11978,18 @@ mod tests {
             .await;
             match mode {
                 "success" => {
-                    assert_eq!(result.unwrap(), vec![json!({"text":"Save","states":{"secure":false}})]);
-                    assert_eq!(methods.lock().unwrap().iter().any(|m| m == "Accessibility.getFullAXTree"), selector != "button");
+                    assert_eq!(
+                        result.unwrap(),
+                        vec![json!({"text":"Save","states":{"secure":false}})]
+                    );
+                    assert_eq!(
+                        methods
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m == "Accessibility.getFullAXTree"),
+                        selector != "button"
+                    );
                 }
                 "changed-loader" => {
                     assert_eq!(result.unwrap_err(), ObservationError::StaleReference)
@@ -12409,7 +12636,11 @@ mod tests {
     async fn chromium_sparse_fixture_fields_match_the_full_projection() {
         use super::super::actions::{execute_command, DaemonState};
         let mut state = DaemonState::new();
-        let launch = execute_command(&json!({"id":"sparse-launch","action":"launch","headless":true}), &mut state).await;
+        let launch = execute_command(
+            &json!({"id":"sparse-launch","action":"launch","headless":true}),
+            &mut state,
+        )
+        .await;
         assert_eq!(launch["success"], true);
         let run = async {
             let mgr = state.browser.as_ref().ok_or("Missing browser")?;
@@ -12451,7 +12682,8 @@ mod tests {
             }
             Ok::<(), String>(())
         }.await;
-        let close = execute_command(&json!({"id":"sparse-close","action":"close"}), &mut state).await;
+        let close =
+            execute_command(&json!({"id":"sparse-close","action":"close"}), &mut state).await;
         assert_eq!(close["success"], true);
         run.unwrap();
     }
@@ -12589,8 +12821,14 @@ mod tests {
         lease: &OperationLease,
     ) -> Result<(), ObservationError> {
         let session = &frame.binding.session;
-        let world = command(client, session, "Page.createIsolatedWorld",
-            json!({"frameId":frame.binding.frame,"worldName":"hint-ownership-test"}), lease).await?;
+        let world = command(
+            client,
+            session,
+            "Page.createIsolatedWorld",
+            json!({"frameId":frame.binding.frame,"worldName":"hint-ownership-test"}),
+            lease,
+        )
+        .await?;
         let group = "hint-ownership-test";
         let array = command(client, session, "Runtime.evaluate", json!({
             "contextId":world["executionContextId"], "objectGroup":group,
@@ -12604,24 +12842,50 @@ mod tests {
                 return [light, shadow('open'), shadow('closed'), foreign.body, adopted, removed, document.createElement('span'), document];
             })()"#
         }), lease).await?;
-        let properties = command(client, session, "Runtime.getProperties", json!({
-            "objectId":array["result"]["objectId"],"ownProperties":true
-        }), lease).await?;
+        let properties = command(
+            client,
+            session,
+            "Runtime.getProperties",
+            json!({
+                "objectId":array["result"]["objectId"],"ownProperties":true
+            }),
+            lease,
+        )
+        .await?;
         let descriptors = properties["result"].as_array().unwrap();
-        let objects: Vec<String> = (0..8).map(|i| {
-            let d = descriptors.iter().find(|property| property["name"] == i.to_string()).unwrap();
-            d["value"]["objectId"].as_str().unwrap().to_owned()
-        }).collect();
+        let objects: Vec<String> = (0..8)
+            .map(|i| {
+                let d = descriptors
+                    .iter()
+                    .find(|property| property["name"] == i.to_string())
+                    .unwrap();
+                d["value"]["objectId"].as_str().unwrap().to_owned()
+            })
+            .collect();
         let expected = [true, true, true, false, false, false, false, true];
         for count in [1, objects.len()] {
-            let reply = command(client, session, "Runtime.callFunctionOn", json!({
-                "objectId":objects[0], "arguments":hint_batch_arguments(&objects[..count]),
-                "functionDeclaration":EXACT_HINT_RECEIVER_BATCH, "throwOnSideEffect":true,
-                "returnByValue":true, "objectGroup":group
-            }), lease).await?;
+            let reply = command(
+                client,
+                session,
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId":objects[0], "arguments":hint_batch_arguments(&objects[..count]),
+                    "functionDeclaration":EXACT_HINT_RECEIVER_BATCH, "throwOnSideEffect":true,
+                    "returnByValue":true, "objectGroup":group
+                }),
+                lease,
+            )
+            .await?;
             assert_eq!(reply["result"]["value"], json!(&expected[..count]));
         }
-        command(client, session, "Runtime.releaseObjectGroup", json!({"objectGroup":group}), lease).await?;
+        command(
+            client,
+            session,
+            "Runtime.releaseObjectGroup",
+            json!({"objectGroup":group}),
+            lease,
+        )
+        .await?;
         Ok(())
     }
     #[tokio::test]
@@ -14769,7 +15033,9 @@ mod tests {
             });
             let client = CdpClient::connect(&endpoint).await.unwrap();
             let (lease, _sender) = lease();
-            let result = revalidate_deferred_pseudos(&client, &frame(), &[(3, 2)], None, None, None, &lease).await;
+            let result =
+                revalidate_deferred_pseudos(&client, &frame(), &[(3, 2)], None, None, None, &lease)
+                    .await;
             assert_eq!(result, expected, "{mode}");
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server)

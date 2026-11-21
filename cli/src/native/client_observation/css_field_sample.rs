@@ -29,10 +29,17 @@ pub(super) fn single_css(expression: &LocatorExpression) -> bool {
 pub(super) fn structural(expression: &LocatorExpression) -> bool {
     match expression {
         LocatorExpression::Selector { .. } => single_css(expression),
-        LocatorExpression::Query { query, scope: Some(scope) } =>
-            matches!(query.kind, QueryKind::Text) && query.visible != Some(true) && structural(scope),
-        LocatorExpression::Filter { source, has, .. } =>
-            structural(source) && has.as_deref().is_none_or(structural),
+        LocatorExpression::Query {
+            query,
+            scope: Some(scope),
+        } => {
+            matches!(query.kind, QueryKind::Text)
+                && query.visible != Some(true)
+                && structural(scope)
+        }
+        LocatorExpression::Filter { source, has, .. } => {
+            structural(source) && has.as_deref().is_none_or(structural)
+        }
         LocatorExpression::Index { source, .. } => structural(source),
         LocatorExpression::Union { left, right } => structural(left) && structural(right),
         _ => false,
@@ -104,7 +111,10 @@ pub(super) async fn read(
         Receivers::Handles(handles) => {
             arguments.push(json!({"value":null}));
             arguments.extend(handles.iter().map(|handle| json!({"objectId":handle})));
-            handles.first().ok_or(ObservationError::BackendFailure)?.as_str()
+            handles
+                .first()
+                .ok_or(ObservationError::BackendFailure)?
+                .as_str()
         }
         Receivers::Light { table, slots } => {
             arguments.push(json!({"value":slots}));

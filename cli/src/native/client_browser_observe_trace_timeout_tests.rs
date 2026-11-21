@@ -362,7 +362,12 @@ fn semantic_frame_reply(request: &Value) -> Option<Value> {
                         json!({"attributes":{"id":"child"},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":6,"height":6},"author":{"tag":"iframe","nodeType":1,"visible":true}})
                     } else { json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}) }
                 }).collect::<Vec<_>>();
-                Some(crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values)))
+                Some(
+                    crate::native::client_observation::metadata_batch_test_reply(
+                        &request["params"],
+                        json!(values),
+                    ),
+                )
             } else if request["params"]["objectGroup"]
                 .as_str()
                 .is_some_and(|group| group.starts_with("native-semantic-box-"))
@@ -476,7 +481,10 @@ fn observation_reply(request: &Value) -> Option<Value> {
                     assert!(argument["objectId"].as_str().unwrap().ends_with("node-1"));
                     json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                 }).collect::<Vec<_>>();
-                crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
+                crate::native::client_observation::metadata_batch_test_reply(
+                    &request["params"],
+                    json!(values),
+                )
             } else if declaration.contains("frameOwner") {
                 json!({"result":{"value":{"connected":true,"frameOwner":false}}})
             } else if declaration

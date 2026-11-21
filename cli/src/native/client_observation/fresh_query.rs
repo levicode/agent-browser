@@ -17,9 +17,12 @@ pub(super) fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> 
         return false;
     }
     if css_field_sample::structural(expression) {
-        return fields
-            .iter()
-            .all(|field| matches!(field, ReadField::Text | ReadField::Value | ReadField::TestId));
+        return fields.iter().all(|field| {
+            matches!(
+                field,
+                ReadField::Text | ReadField::Value | ReadField::TestId
+            )
+        });
     }
     fn dom_query(expression: &LocatorExpression) -> bool {
         match expression {
@@ -52,7 +55,9 @@ pub(super) fn roots_from_inventory(
     roots: &[i64],
     internal: &HashSet<i64>,
 ) -> Result<Option<RootInventory>, ObservationError> {
-    let ids: Vec<i64> = roots.iter().copied()
+    let ids: Vec<i64> = roots
+        .iter()
+        .copied()
         .filter(|id| !internal.contains(id))
         .collect();
     let author = vec![true; ids.len()];
@@ -156,10 +161,10 @@ pub(super) async fn fields_impl(
         return Ok(single_root_fields::Sample::NotEligible);
     }
     witness.stage(Stage::FreshInventory);
-    let inventory=if let Some(receipt)=receipt {
-        receipt.roots(client,frame,lease).await?
-    }else{
-        roots(&validated_frame_dom(client,frame,lease).await?["root"])?
+    let inventory = if let Some(receipt) = receipt {
+        receipt.roots(client, frame, lease).await?
+    } else {
+        roots(&validated_frame_dom(client, frame, lease).await?["root"])?
     };
     let Some((ids, author, domains)) = inventory else {
         return Ok(single_root_fields::Sample::NotEligible);
@@ -256,10 +261,10 @@ pub(super) async fn fields_impl(
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     witness.stage(Stage::FreshRootsFinal);
-    let current=if let Some(receipt)=receipt {
-        receipt.roots(client,frame,lease).await?
-    }else{
-        roots(&validated_frame_dom(client,frame,lease).await?["root"])?
+    let current = if let Some(receipt) = receipt {
+        receipt.roots(client, frame, lease).await?
+    } else {
+        roots(&validated_frame_dom(client, frame, lease).await?["root"])?
     };
     if current != Some((ids, author, domains)) {
         return Err(ObservationError::StaleReference);

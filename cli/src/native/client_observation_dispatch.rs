@@ -2625,8 +2625,11 @@ impl ObservationDispatch {
             };
             let values = if let Some((frame, mut realm)) = single {
                 {
-                    let refs=self.refs.lock().map_err(|_|failure(ProtocolError::ScopeUnavailable))?;
-                    realm.use_inventory(&refs,&identity);
+                    let refs = self
+                        .refs
+                        .lock()
+                        .map_err(|_| failure(ProtocolError::ScopeUnavailable))?;
+                    realm.use_inventory(&refs, &identity);
                 }
                 let sample = observation::query_diagnostic::field_command_scope(
                     field_witness.as_ref(),
@@ -4920,13 +4923,29 @@ async fn verify_document_root(
     operation: &OperationLease,
     map_observation: impl Fn(ObservationError) -> ProtocolError,
 ) -> Result<(), ProtocolError> {
-    let entry = parse_ref(&root.reference.id).and_then(|id| refs.get(&id)).ok_or(ProtocolError::StaleReference)?;
+    let entry = parse_ref(&root.reference.id)
+        .and_then(|id| refs.get(&id))
+        .ok_or(ProtocolError::StaleReference)?;
     let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
     if let Some(binding) = entry.exact_binding.as_ref().filter(|binding| {
-        refs.observed_dom.as_ref().is_some_and(|inventory|
-            inventory.bound_root(&page.client, &page.identity_scope, operation.generation, binding, backend))
+        refs.observed_dom.as_ref().is_some_and(|inventory| {
+            inventory.bound_root(
+                &page.client,
+                &page.identity_scope,
+                operation.generation,
+                binding,
+                backend,
+            )
+        })
     }) {
-        return observation::document_inventory::verify_active_root(&page.client, binding, backend, operation).await.map_err(map_observation);
+        return observation::document_inventory::verify_active_root(
+            &page.client,
+            binding,
+            backend,
+            operation,
+        )
+        .await
+        .map_err(map_observation);
     }
     let value = command(
         page,
@@ -7735,7 +7754,10 @@ mod tests {
                         } else if declaration.starts_with("function(expression") {
                             json!({"result":{"value":{"indices":[0],"redacted":[]}}})
                         } else if declaration.contains("const read=") {
-                            crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!([{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]))
+                            crate::native::client_observation::metadata_batch_test_reply(
+                                &request["params"],
+                                json!([{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]),
+                            )
                         } else if declaration.contains("frameOwner") {
                             json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                         } else {
@@ -7905,7 +7927,10 @@ mod tests {
                                     _ => panic!("unknown exact metadata receiver"),
                                 }
                             }).collect::<Vec<_>>();
-                            crate::native::client_observation::metadata_batch_test_reply(&request["params"], json!(values))
+                            crate::native::client_observation::metadata_batch_test_reply(
+                                &request["params"],
+                                json!(values),
+                            )
                         } else if declaration
                             .starts_with("function(testId,secureSelector,boundedObservation")
                         {
