@@ -5121,15 +5121,18 @@ fn dom_attr<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
 /// `author.suppress`: the listed element names, `aria-hidden="true"`, and the
 /// `inert` attribute. Computed style (display/content-visibility/interactivity)
 /// is deliberately absent because the DOM snapshot cannot prove it.
-fn suppress_root(node: &Value) -> bool {
-    let local = node["localName"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        local.as_str(),
-        "script" | "style" | "head" | "template" | "noscript" | "next-route-announcer"
-    ) || dom_attr(node, "aria-hidden").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+fn suppress_root(node: &Value, local: &str) -> bool {
+    [
+        "script",
+        "style",
+        "head",
+        "template",
+        "noscript",
+        "next-route-announcer",
+    ]
+    .iter()
+    .any(|tag| local.eq_ignore_ascii_case(tag))
+        || dom_attr(node, "aria-hidden").is_some_and(|value| value.eq_ignore_ascii_case("true"))
         || dom_attr(node, "inert").is_some()
 }
 /// Collects every DOM node whose projected facts are unconditionally
@@ -5139,18 +5142,16 @@ fn suppress_root(node: &Value) -> bool {
 /// any child of a suppressed node, so no descendant can be emitted.
 fn collect_suppressed(node: &Value, suppressed: bool, out: &mut HashMap<i64, (i64, String)>) {
     let kind = node["nodeType"].as_i64().unwrap_or(0);
-    let local = node["localName"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let inside = suppressed || (kind == 1 && suppress_root(node));
+    let local = node["localName"].as_str().unwrap_or_default();
+    let inside = suppressed || (kind == 1 && suppress_root(node, local));
     if inside {
         if let Some(backend) = node["backendNodeId"].as_i64() {
-            out.insert(backend, (kind, local.clone()));
+            out.insert(backend, (kind, local.to_ascii_lowercase()));
         }
     }
     let children = node["children"].as_array();
-    let closed_details = kind == 1 && local == "details" && dom_attr(node, "open").is_none();
+    let closed_details =
+        kind == 1 && local.eq_ignore_ascii_case("details") && dom_attr(node, "open").is_none();
     let summary_index = closed_details
         .then(|| {
             children.and_then(|children| {
@@ -7437,7 +7438,14 @@ struct SecurityDomains {
 
 impl SecurityDomains {
     fn read(root: &Value, ids: &[i64]) -> Result<Self, ObservationError> {
-        let internal = browser_internal_ids(root)?;
+        Self::from_internal(root, ids, browser_internal_ids(root)?)
+    }
+
+    fn from_internal(
+        root: &Value,
+        ids: &[i64],
+        internal: HashSet<i64>,
+    ) -> Result<Self, ObservationError> {
         let simple = simple_name_inventory(root, ids, &internal);
         let local_names = local_name_inventory(root)?;
         Ok(Self {

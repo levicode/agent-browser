@@ -26,12 +26,12 @@ pub(super) struct Structure {
 
 impl Structure {
     fn read(root: &Value) -> Result<Self, ObservationError> {
-        let graph = author_projection::Graph::read(root)?;
+        let (graph, internal) = author_projection::Graph::read_with_internals(root)?;
         let candidates = graph.ids.iter().copied().collect();
         let mut suppressed = HashMap::new();
         collect_suppressed(root, false, &mut suppressed);
         let roots = security_root_ids(root)?;
-        let domains = SecurityDomains::read(root, &roots)?;
+        let domains = SecurityDomains::from_internal(root, &roots, internal)?;
         let field_roots = fresh_query::roots_from_inventory(root, &roots, &domains.internal)
             .ok()
             .flatten();

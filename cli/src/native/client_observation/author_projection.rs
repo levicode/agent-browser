@@ -55,8 +55,21 @@ struct Entry {
     assigned_slot: Option<i64>,
     distributed: Option<Vec<i64>>,
     children: Vec<i64>,
-    light_children: Vec<i64>,
-    rendered: Vec<i64>,
+    light_count: usize,
+    rendered_range: std::ops::Range<usize>,
+}
+
+impl Entry {
+    fn light_children(&self) -> &[i64] {
+        &self.children[..self.light_count]
+    }
+
+    fn rendered(&self) -> &[i64] {
+        self.distributed
+            .as_deref()
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| &self.children[self.rendered_range.clone()])
+    }
 }
 #[derive(Debug)]
 pub(super) struct Graph {
@@ -83,7 +96,7 @@ impl Graph {
     ) -> bool {
         self.entries
             .get(&owner)
-            .is_some_and(|entry| entry.rendered == [child])
+            .is_some_and(|entry| entry.rendered() == [child])
             && self
                 .entries
                 .get(&child)
@@ -103,13 +116,21 @@ impl Graph {
     pub(super) fn has_rendered_text_child(&self, parent: i64) -> bool {
         self.entries.get(&parent).is_none_or(|entry| {
             entry
-                .rendered
+                .rendered()
                 .iter()
                 .any(|child| self.entries.get(child).is_none_or(|e| e.kind == 3))
         })
     }
 
+    #[cfg(test)]
     pub fn read(root: &Value) -> Result<Self, ObservationError> {
+        Self::read_with_internals(root).map(|(graph, _)| graph)
+    }
+
+    /// The same complete inventory proves slot ownership and identifies UA nodes.
+    pub(super) fn read_with_internals(
+        root: &Value,
+    ) -> Result<(Self, HashSet<i64>), ObservationError> {
         let mut graph = Self {
             entries: HashMap::new(),
             ids: Vec::new(),
@@ -121,37 +142,36 @@ impl Graph {
             graph: &mut Graph,
             depth: usize,
             visited: &mut usize,
-        ) -> Result<Vec<i64>, ObservationError> {
+            siblings: &mut Vec<i64>,
+        ) -> Result<(), ObservationError> {
             *visited += 1;
             if depth > 256 || *visited > LIMIT {
                 return Err(ObservationError::ResourceLimit);
             }
             if node["shadowRootType"] == "user-agent" {
-                return Ok(Vec::new());
+                return Ok(());
             }
             let kind = node["nodeType"]
                 .as_i64()
                 .ok_or(ObservationError::BackendFailure)?;
             if ![1, 3, 9, 11].contains(&kind) {
-                return Ok(Vec::new());
+                return Ok(());
             }
             let mut children = Vec::new();
             for child in node["children"].as_array().into_iter().flatten() {
-                children.extend(visit(child, graph, depth + 1, visited)?);
+                visit(child, graph, depth + 1, visited, &mut children)?;
             }
-            let mut shadow = Vec::new();
+            let light_count = children.len();
             let mut has_author_shadow = false;
             for child in node["shadowRoots"].as_array().into_iter().flatten() {
                 has_author_shadow |= child["shadowRootType"] != "user-agent";
-                shadow.extend(visit(child, graph, depth + 1, visited)?);
+                visit(child, graph, depth + 1, visited, &mut children)?;
             }
-            let mut rendered = if has_author_shadow {
-                shadow.clone()
+            let rendered_range = if has_author_shadow {
+                light_count..children.len()
             } else {
-                children.clone()
+                0..light_count
             };
-            let light_children = children.clone();
-            children.extend(shadow);
             let distributed = node
                 .get("distributedNodes")
                 .map(|value| {
@@ -170,9 +190,6 @@ impl Graph {
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?;
-            if let Some(assigned) = distributed.as_ref().filter(|nodes| !nodes.is_empty()) {
-                rendered = assigned.clone();
-            }
             let assigned_slot = node
                 .get("assignedSlot")
                 .map(|slot| {
@@ -188,10 +205,11 @@ impl Graph {
                 }
             }
             for child in node["pseudoElements"].as_array().into_iter().flatten() {
-                children.extend(visit(child, graph, depth + 1, visited)?);
+                visit(child, graph, depth + 1, visited, &mut children)?;
             }
             if kind == 11 {
-                return Ok(children);
+                siblings.extend(children);
+                return Ok(());
             }
             let id = node["backendNodeId"]
                 .as_i64()
@@ -207,8 +225,8 @@ impl Graph {
                         assigned_slot,
                         distributed,
                         children,
-                        light_children,
-                        rendered,
+                        light_count,
+                        rendered_range,
                     },
                 )
                 .is_some()
@@ -216,13 +234,16 @@ impl Graph {
                 return Err(ObservationError::BackendFailure);
             }
             graph.ids.push(id);
-            Ok(vec![id])
+            siblings.push(id);
+            Ok(())
         }
-        graph.roots = visit(root, &mut graph, 0, &mut 0)?;
+        let mut roots = Vec::new();
+        visit(root, &mut graph, 0, &mut 0, &mut roots)?;
+        graph.roots = roots;
         let browser_internal = super::browser_internal_ids(root)?;
         for entry in graph.entries.values() {
             if entry
-                .rendered
+                .rendered()
                 .iter()
                 .any(|id| !graph.entries.contains_key(id))
             {
@@ -254,7 +275,7 @@ impl Graph {
                 }
             }
         }
-        Ok(graph)
+        Ok((graph, browser_internal))
     }
 }
 
@@ -391,7 +412,7 @@ fn parent_edges(graph: &Graph) -> Result<Parents, ObservationError> {
     // Slot assignment takes precedence over the light-DOM parent. Unassigned
     // light nodes have no rendered parent and cannot claim coverage by the host.
     for entry in graph.entries.values() {
-        for child in &entry.rendered {
+        for child in entry.rendered() {
             if rendered_parent.insert(*child, entry.id).is_some() {
                 return Err(ObservationError::BackendFailure);
             }
@@ -544,7 +565,7 @@ pub(super) fn compact(
                     text = f.text.clone();
                 }
             } else {
-                for child in &entry.rendered {
+                for child in entry.rendered() {
                     let child_entry = &graph.entries[child];
                     let child_node = nodes.get(child).ok_or(ObservationError::BackendFailure)?;
                     let child_facts = facts(child_node)?;
@@ -659,7 +680,7 @@ pub(super) fn compact(
             offered.push(id);
             return Ok(());
         }
-        for child in &entry.light_children {
+        for child in entry.light_children() {
             offered_options(*child, graph, nodes, offered, depth + 1)?;
         }
         Ok(())
@@ -673,7 +694,7 @@ pub(super) fn compact(
         )?;
         if f.tag == "select" && f.visible && !f.suppress {
             let mut offered = Vec::new();
-            for child in &entry.light_children {
+            for child in entry.light_children() {
                 offered_options(*child, graph, &nodes, &mut offered, 0)?;
             }
             select_options.insert(entry.id, offered);
@@ -1659,7 +1680,7 @@ mod tests {
             {"nodeType":3,"backendNodeId":2}],"shadowRoots":[
             {"nodeType":11,"backendNodeId":3,"shadowRootType":"closed","children":[]}]}))
         .unwrap();
-        assert!(graph.entries[&1].rendered.is_empty());
+        assert!(graph.entries[&1].rendered().is_empty());
         assert_eq!(graph.entries[&1].children, vec![2]);
     }
     #[test]

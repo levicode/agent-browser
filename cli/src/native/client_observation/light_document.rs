@@ -297,21 +297,13 @@ impl LightDocument {
         if verified["nodeId"].as_i64() != Some(self.root) {
             return Err(ObservationError::StaleReference);
         }
-        let list = command(client, session, "Runtime.callFunctionOn", json!({"objectId":doc,"objectGroup":group,
-            "throwOnSideEffect":true,"functionDeclaration":"function(){'use strict';return this.querySelectorAll('*')}"}), lease).await?;
-        let Some(list) = list["result"]["objectId"]
-            .as_str()
-            .filter(|_| list.get("exceptionDetails").is_none())
-        else {
-            return Ok(None);
-        };
         let slots = slots
             .iter()
-            .map(|i| format!("this[{i}]"))
+            .map(|i| format!("list[{i}]"))
             .collect::<Vec<_>>()
             .join(",");
-        let array = command(client, session, "Runtime.callFunctionOn", json!({"objectId":list,"objectGroup":group,
-            "throwOnSideEffect":true,"functionDeclaration":format!("function(){{'use strict';return [{slots}]}}")}), lease).await?;
+        let array = command(client, session, "Runtime.callFunctionOn", json!({"objectId":doc,"objectGroup":group,
+            "throwOnSideEffect":true,"functionDeclaration":format!("function(){{'use strict';const list=this.querySelectorAll('*');return [{slots}]}}")}), lease).await?;
         let Some(array) = array["result"]["objectId"].as_str().filter(|_| {
             array.get("exceptionDetails").is_none() && array["result"]["subtype"] == "array"
         }) else {

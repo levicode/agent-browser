@@ -1348,13 +1348,13 @@ impl CdpClient {
                             }
                         }
                     }
-                } else if let Some(ref method) = parsed.method {
-                    reader_dom_epoch.event(method);
+                } else if let Some(method) = parsed.method {
+                    reader_dom_epoch.event(&method);
                     // Event
                     let event = CdpEvent {
-                        method: method.clone(),
-                        params: parsed.params.clone().unwrap_or(Value::Null),
-                        session_id: parsed.session_id.clone(),
+                        method,
+                        params: parsed.params.unwrap_or(Value::Null),
+                        session_id: parsed.session_id,
                     };
                     let eval_publication = debt_reader
                         .lock()
