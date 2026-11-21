@@ -126,6 +126,10 @@ pub(crate) struct DocumentInventory {
     order: Arc<std::sync::OnceLock<Arc<light_document::Order>>>,
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the same frame, lease and layout evidence must be passed through the acquisition"
+)]
 pub(super) async fn acquire(
     client: &CdpClient,
     frame: &ObservationFrame,

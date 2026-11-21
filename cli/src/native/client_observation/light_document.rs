@@ -422,6 +422,10 @@ impl LightIndex {
 }
 
 impl LightReceivers {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the receiver batch is tied to the supplied frame, document and object group"
+    )]
     pub(super) async fn collect(
         client: &CdpClient,
         frame: &ObservationFrame,
