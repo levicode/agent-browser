@@ -16,10 +16,10 @@ pub(super) fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> 
     }) {
         return false;
     }
-    if css_field_sample::single_css(expression) {
+    if css_field_sample::structural(expression) {
         return fields
             .iter()
-            .all(|field| matches!(field, ReadField::Text | ReadField::Value));
+            .all(|field| matches!(field, ReadField::Text | ReadField::Value | ReadField::TestId));
     }
     fn dom_query(expression: &LocatorExpression) -> bool {
         match expression {
@@ -44,8 +44,15 @@ pub(super) type RootInventory = (Vec<i64>, Vec<bool>, Vec<usize>);
 
 pub(super) fn roots(root: &Value) -> Result<Option<RootInventory>, ObservationError> {
     let internal = browser_internal_ids(root)?;
-    let ids: Vec<i64> = security_root_ids(root)?
-        .into_iter()
+    roots_from_inventory(root, &security_root_ids(root)?, &internal)
+}
+
+pub(super) fn roots_from_inventory(
+    root: &Value,
+    roots: &[i64],
+    internal: &HashSet<i64>,
+) -> Result<Option<RootInventory>, ObservationError> {
+    let ids: Vec<i64> = roots.iter().copied()
         .filter(|id| !internal.contains(id))
         .collect();
     let author = vec![true; ids.len()];
@@ -149,13 +156,12 @@ pub(super) async fn fields_impl(
         return Ok(single_root_fields::Sample::NotEligible);
     }
     witness.stage(Stage::FreshInventory);
-    let dom = if let Some(receipt) = receipt {
-        receipt.check(client, frame, lease)?;
-        root_document_dom(client, frame, lease).await?
-    } else {
-        validated_frame_dom(client, frame, lease).await?
+    let inventory=if let Some(receipt)=receipt {
+        receipt.roots(client,frame,lease).await?
+    }else{
+        roots(&validated_frame_dom(client,frame,lease).await?["root"])?
     };
-    let Some((ids, author, domains)) = roots(&dom["root"])? else {
+    let Some((ids, author, domains)) = inventory else {
         return Ok(single_root_fields::Sample::NotEligible);
     };
     let session = &frame.binding.session;
@@ -250,13 +256,12 @@ pub(super) async fn fields_impl(
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     witness.stage(Stage::FreshRootsFinal);
-    let current = if let Some(receipt) = receipt {
-        receipt.check(client, frame, lease)?;
-        root_document_dom(client, frame, lease).await?
-    } else {
-        validated_frame_dom(client, frame, lease).await?
+    let current=if let Some(receipt)=receipt {
+        receipt.roots(client,frame,lease).await?
+    }else{
+        roots(&validated_frame_dom(client,frame,lease).await?["root"])?
     };
-    if roots(&current["root"])? != Some((ids, author, domains)) {
+    if current != Some((ids, author, domains)) {
         return Err(ObservationError::StaleReference);
     }
     check(lease)?;
@@ -274,7 +279,15 @@ const FRESH_FIELDS: &str = r#"function(expression,fields,testId,secureSelector,a
  const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
  const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
  for(const root of roots)if(!connected.call(root)||(root!==document&&owner.call(root)!==document))return {error:'stale-reference'};
- const css=expression.kind==='selector';
+ // Rust admitted only structural CSS leaves and DOM text predicates for
+ // this path. Keep every author candidate available to the shared matcher.
+ function hasSelector(x) {
+   if(x.kind==='selector') return true;
+   if(x.kind==='query') return !!x.scope && hasSelector(x.scope);
+   if(x.kind==='union') return hasSelector(x.left)||hasSelector(x.right);
+   return hasSelector(x.source)||!!x.has&&hasSelector(x.has);
+ }
+ const css=hasSelector(expression);
  if(css&&(roots.length!==1||roots[0]!==document))return {requiresAx:true};
  const kinds=new Set();
  function collect(x){if(x.kind==='selector')return;if(x.kind==='query'){kinds.add(x.query.kind);if(x.scope)collect(x.scope);}else if(x.kind==='union'){collect(x.left);collect(x.right);}else{collect(x.source);if(x.has)collect(x.has);}}

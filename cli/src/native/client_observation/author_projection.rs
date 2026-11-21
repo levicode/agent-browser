@@ -63,13 +63,58 @@ pub(super) struct Graph {
     entries: HashMap<i64, Entry>,
     pub ids: Vec<i64>,
     roots: Vec<i64>,
+    parents: std::sync::OnceLock<Result<Parents, ObservationError>>,
+}
+
+#[derive(Debug)]
+struct Parents {
+    rendered: HashMap<i64, i64>,
+    content: HashMap<i64, i64>,
+    bounded_chains: bool,
 }
 impl Graph {
+    /// A visible, nonempty sole rendered text child makes the parent a direct
+    /// text owner in compact(). A hidden or slotted substitute cannot prove it.
+    pub(super) fn uncovered_sole_text(
+        &self,
+        owner: i64,
+        child: i64,
+        boundaries: &HashSet<i64>,
+    ) -> bool {
+        self.entries
+            .get(&owner)
+            .is_some_and(|entry| entry.rendered == [child])
+            && self
+                .entries
+                .get(&child)
+                .is_some_and(|entry| entry.kind == 3)
+            && self
+                .parents
+                .get_or_init(|| parent_edges(self))
+                .as_ref()
+                .is_ok_and(|parents| {
+                    parents
+                        .rendered
+                        .get(&owner)
+                        .is_some_and(|parent| boundaries.contains(parent))
+                })
+    }
+
+    pub(super) fn has_rendered_text_child(&self, parent: i64) -> bool {
+        self.entries.get(&parent).is_none_or(|entry| {
+            entry
+                .rendered
+                .iter()
+                .any(|child| self.entries.get(child).is_none_or(|e| e.kind == 3))
+        })
+    }
+
     pub fn read(root: &Value) -> Result<Self, ObservationError> {
         let mut graph = Self {
             entries: HashMap::new(),
             ids: Vec::new(),
             roots: Vec::new(),
+            parents: Default::default(),
         };
         fn visit(
             node: &Value,
@@ -319,30 +364,29 @@ fn mark_trailing_anonymous_action_targets(
         }
     }
 }
-fn collapse(text: &str) -> String {
-    let mut out = String::new();
-    let mut space = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !space {
-                out.push(' ');
-            }
-            space = true;
-        } else {
-            out.push(ch);
-            space = false;
+/// The prefix already in the buffer was normalized and bounded when it was
+/// appended. Preserve one trailing space, including the overflow sentinel.
+fn append_line(text: &mut String, count: &mut usize, piece: &str) {
+    for ch in piece.chars() {
+        if *count > TEXT_LIMIT {
+            break;
         }
+        let ch = if ch.is_whitespace() {
+            if text.ends_with(' ') {
+                continue;
+            }
+            ' '
+        } else {
+            ch
+        };
+        text.push(ch);
+        *count += 1;
     }
-    out
 }
 
-/// The complete run is capped one character beyond the public text bound. That
-/// extra character is a proof that descendants must not be suppressed as covered.
-pub(super) fn compact(
-    graph: &Graph,
-    mut nodes: HashMap<i64, SemanticNode>,
-    limit: usize,
-) -> Result<(Vec<SemanticNode>, bool), ObservationError> {
+/// The exact rendered and pseudo ownership edges depend only on the native
+/// graph. A later layout still samples every node's content visibility.
+fn parent_edges(graph: &Graph) -> Result<Parents, ObservationError> {
     let mut rendered_parent = HashMap::new();
     // Slot assignment takes precedence over the light-DOM parent. Unassigned
     // light nodes have no rendered parent and cannot claim coverage by the host.
@@ -353,6 +397,66 @@ pub(super) fn compact(
             }
         }
     }
+    // Pseudos have native owner edges but are intentionally absent from line
+    // flow. They still inherit content skipping from that exact owner.
+    let mut content_parent = rendered_parent.clone();
+    for entry in graph.entries.values() {
+        for child in &entry.children {
+            if graph.entries.get(child).is_some_and(|node| node.pseudo)
+                && content_parent.insert(*child, entry.id).is_some()
+            {
+                return Err(ObservationError::BackendFailure);
+            }
+        }
+    }
+    // A valid checked chain needs no second walk to establish "no ancestor
+    // skips content". Keep the general traversal for malformed or deep graphs.
+    let mut depths = HashMap::<i64, usize>::new();
+    let mut path = Vec::new();
+    let bounded_chains = graph.ids.iter().all(|&id| {
+        let mut current = id;
+        path.clear();
+        while !depths.contains_key(&current) {
+            let Some(&parent) = content_parent.get(&current) else {
+                break;
+            };
+            if path.len() == 256 {
+                return false;
+            }
+            path.push(current);
+            current = parent;
+        }
+        let mut depth = depths.get(&current).copied().unwrap_or(0);
+        if depth + path.len() > 256 {
+            return false;
+        }
+        for id in path.drain(..).rev() {
+            depth += 1;
+            depths.insert(id, depth);
+        }
+        true
+    });
+    Ok(Parents {
+        rendered: rendered_parent,
+        content: content_parent,
+        bounded_chains,
+    })
+}
+
+/// The complete run is capped one character beyond the public text bound. That
+/// extra character is a proof that descendants must not be suppressed as covered.
+pub(super) fn compact(
+    graph: &Graph,
+    mut nodes: HashMap<i64, SemanticNode>,
+    limit: usize,
+) -> Result<(Vec<SemanticNode>, bool), ObservationError> {
+    let parents = graph
+        .parents
+        .get_or_init(|| parent_edges(graph))
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let rendered_parent = &parents.rendered;
+    let content_parent = &parents.content;
     // Content visibility suppresses descendants, not the owner's painted box.
     // Follow proven native rendered edges, including closed-root slot ownership,
     // rather than guessing a flat-tree parent from renderer-visible properties.
@@ -378,29 +482,23 @@ pub(super) fn compact(
         cache.insert(id, skipped);
         Ok(skipped)
     }
-    // Pseudos have native owner edges but are intentionally absent from line
-    // flow. They still inherit content skipping from that exact owner.
-    let mut content_parent = rendered_parent.clone();
-    for entry in graph.entries.values() {
-        for child in &entry.children {
-            if graph.entries.get(child).is_some_and(|node| node.pseudo)
-                && content_parent.insert(*child, entry.id).is_some()
-            {
-                return Err(ObservationError::BackendFailure);
-            }
+    if !parents.bounded_chains
+        || nodes
+            .values()
+            .any(|n| n.author.as_ref().is_some_and(|f| f.skips_content))
+    {
+        let mut skipped = HashMap::new();
+        for id in &graph.ids {
+            skipped_content(*id, &nodes, content_parent, &mut skipped, 0)?;
         }
-    }
-    let mut skipped = HashMap::new();
-    for id in &graph.ids {
-        skipped_content(*id, &nodes, &content_parent, &mut skipped, 0)?;
-    }
-    for (id, suppressed) in skipped {
-        if suppressed {
-            nodes
-                .get_mut(&id)
-                .and_then(|node| node.author.as_mut())
-                .ok_or(ObservationError::BackendFailure)?
-                .suppress = true;
+        for (id, suppressed) in skipped {
+            if suppressed {
+                nodes
+                    .get_mut(&id)
+                    .and_then(|node| node.author.as_mut())
+                    .ok_or(ObservationError::BackendFailure)?
+                    .suppress = true;
+            }
         }
     }
     // A hidden select offers no visible options. Suppress its entire native
@@ -428,9 +526,9 @@ pub(super) fn compact(
         direct: &mut HashSet<i64>,
         visiting: &mut HashSet<i64>,
         depth: usize,
-    ) -> Result<String, ObservationError> {
-        if let Some(run) = runs.get(&id) {
-            return Ok(run.clone());
+    ) -> Result<(), ObservationError> {
+        if runs.contains_key(&id) {
+            return Ok(());
         }
         if depth > 256 || !visiting.insert(id) {
             return Err(ObservationError::BackendFailure);
@@ -439,6 +537,7 @@ pub(super) fn compact(
         let node = nodes.get(&id).ok_or(ObservationError::BackendFailure)?;
         let f = facts(node)?;
         let mut text = String::new();
+        let mut count = 0;
         if !f.suppress {
             if entry.kind == 3 {
                 if f.visible {
@@ -449,38 +548,33 @@ pub(super) fn compact(
                     let child_entry = &graph.entries[child];
                     let child_node = nodes.get(child).ok_or(ObservationError::BackendFailure)?;
                     let child_facts = facts(child_node)?;
-                    let value = run(*child, graph, nodes, runs, direct, visiting, depth + 1)?;
+                    run(*child, graph, nodes, runs, direct, visiting, depth + 1)?;
                     if child_facts.suppress {
                         continue;
                     }
+                    let value = &runs[child];
                     if child_entry.kind == 3 {
                         if !value.trim().is_empty() {
                             direct.insert(id);
                         }
-                        text.push_str(&value);
+                        append_line(&mut text, &mut count, value);
                     } else if child_facts.inline
                         && child_facts.line_visible()
                         && !child_facts.breaking
                     {
-                        text.push_str(&value);
+                        append_line(&mut text, &mut count, value);
                     } else if child_facts.breaking
                         || !child_facts.inline
                         || child_facts.line_visible()
                     {
-                        text.push(' ');
+                        append_line(&mut text, &mut count, " ");
                     }
-                    // Bound intermediate concatenation too, not only the wire.
-                    text = collapse(&text).chars().take(TEXT_LIMIT + 1).collect();
                 }
             }
         }
         visiting.remove(&id);
-        // Text leaves retain their whitespace until their owner's run joins.
-        if entry.kind != 3 {
-            text = collapse(&text);
-        }
-        runs.insert(id, text.clone());
-        Ok(text)
+        runs.insert(id, text);
+        Ok(())
     }
     for id in &graph.ids {
         run(*id, graph, &nodes, &mut runs, &mut direct, &mut visiting, 0)?;
@@ -524,10 +618,18 @@ pub(super) fn compact(
         Ok(value)
     }
     for id in &graph.ids {
+        // Only a direct text owner or an authored action consumes its coverage
+        // bit. Recursion still visits every dependency of that owner.
+        if parents.bounded_chains
+            && !direct.contains(id)
+            && !facts(nodes.get(id).ok_or(ObservationError::BackendFailure)?)?.action
+        {
+            continue;
+        }
         covered(
             *id,
             &nodes,
-            &rendered_parent,
+            rendered_parent,
             &direct,
             &runs,
             &mut coverage,
@@ -586,9 +688,13 @@ pub(super) fn compact(
     for id in &graph.ids {
         let entry = &graph.entries[id];
         let node = nodes.get_mut(id).ok_or(ObservationError::BackendFailure)?;
-        let mut f = facts(node)?.clone();
-        if options.contains(id) && f.tag == "option" {
-            f.visible = true;
+        let f = node
+            .author
+            .as_ref()
+            .ok_or(ObservationError::BackendFailure)?;
+        let offered = options.contains(id) && f.tag == "option";
+        let visible = f.visible || offered;
+        if offered {
             node.states.insert("hidden".into(), false);
             node.value = None;
         }
@@ -630,8 +736,7 @@ pub(super) fn compact(
         // model that only ever receives the observation tree otherwise has no
         // id at all for controls like an icon-font add button.
         let actionable = f.clickable;
-        if options.contains(id)
-            || f.visible && !f.suppress && (independent || (owns && !coverage[id]) || actionable)
+        if options.contains(id) || visible && (independent || (owns && !coverage[id]) || actionable)
         {
             // The retained node may still have nothing the model can name it
             // by: an icon-only close control has no role, name, text or test
@@ -642,13 +747,13 @@ pub(super) fn compact(
             // control from a decorative node. Only an anonymous action target
             // needs it; a named control is already identifiable.
             let named = independent || node.text.as_deref().is_some_and(|text| !text.is_empty());
-            if actionable && f.visible && !f.suppress && !named {
+            if actionable && visible && !named {
                 node.states.insert("clickable".into(), true);
             }
             retained.insert(*id);
         }
     }
-    mark_trailing_anonymous_action_targets(graph, &mut nodes, &retained, &rendered_parent);
+    mark_trailing_anonymous_action_targets(graph, &mut nodes, &retained, rendered_parent);
     let mut count = 0usize;
     let mut truncated = false;
     #[allow(clippy::too_many_arguments)] // One staged owner map and publication budget.

@@ -1217,7 +1217,7 @@ fn session_transform(
     built.insert(session.to_owned(), matrix);
     Ok(matrix)
 }
-fn hidden_proof_error(error: ObservationError) -> GeometryError {
+pub(super) fn hidden_proof_error(error: ObservationError) -> GeometryError {
     match error {
         ObservationError::StaleReference
         | ObservationError::FrameNotFound(_)
@@ -1791,6 +1791,27 @@ impl GeometrySnapshot {
         self.node_semantic_bounds_impl(client, frame, backend, operation, None)
             .await
     }
+    /// Native box for an exact backend whose root-document membership is
+    /// fenced by the observation caller. This result grants no action authority.
+    pub(super) async fn light_semantic_bounds(
+        &self, client: &CdpClient, frame: &ObservationFrame, backend: i64, operation: &OperationLease,
+    ) -> Result<SemanticBounds, GeometryError> {
+        self.check_node_binding(frame)?;
+        let model = command(client, &frame.binding.session, "DOM.getBoxModel",
+            json!({"backendNodeId":backend}), operation).await?;
+        self.project_semantic_quad(&frame.binding.frame, quad_points(&model["model"]["border"])?)
+    }
+
+    fn check_node_binding(&self, frame: &ObservationFrame) -> Result<(), GeometryError> {
+        self.require_included(&frame.binding.frame)?;
+        let proof = self.frames.get(&frame.binding.frame).ok_or(GeometryError::IncompleteInventory)?;
+        if proof.session != frame.binding.session || proof.loader != frame.binding.loader ||
+            frame.binding.page_session != self.page_session {
+            return Err(GeometryError::StaleIdentity);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn node_semantic_bounds_observed(
         &self,
         client: &CdpClient,
@@ -1813,17 +1834,7 @@ impl GeometrySnapshot {
         if let Some(evidence) = evidence.as_mut() {
             evidence.origin = NodeGeometryOrigin::FrameBinding;
         }
-        self.require_included(&frame.binding.frame)?;
-        let proof = self
-            .frames
-            .get(&frame.binding.frame)
-            .ok_or(GeometryError::IncompleteInventory)?;
-        if proof.session != frame.binding.session
-            || proof.loader != frame.binding.loader
-            || frame.binding.page_session != self.page_session
-        {
-            return Err(GeometryError::StaleIdentity);
-        }
+        self.check_node_binding(frame)?;
         let ExactBox::Model(model, _) = read_exact_box_with_evidence(
             client,
             &frame.binding,

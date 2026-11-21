@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[path = "client_observation/document_inventory.rs"]
+pub(crate) mod document_inventory;
+#[path = "client_observation/metadata_packet.rs"]
+mod metadata_packet;
+#[path = "client_observation/light_document.rs"]
+mod light_document;
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
 #[cfg(test)]
@@ -904,27 +910,32 @@ fn ax_string(value: &Option<super::cdp::types::AXValue>) -> Option<String> {
 // Targeted metadata on an already-resolved native DOM handle. It neither walks
 // the DOM nor creates identities. Password text/value/selection/attribute values
 // are excluded in the renderer before any data is transferred to the client.
-const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false,simpleNameInventory=false,focusedReceiver=false,localNameInventory=false) {
+const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false,simpleNameInventory=false,focusedReceiver=false,localNameInventory=false,batch,packedFold=false) {
  const nodeProto=Node.prototype;
  if (!Object.getOwnPropertyDescriptor(nodeProto,'isConnected').get.call(this) || (this!==document && Object.getOwnPropertyDescriptor(nodeProto,'ownerDocument').get.call(this)!==document)) return {__nativeStatus:'stale-reference'};
  const e=this.nodeType===1?this:null, doc=this.ownerDocument||this;
- try { Element.prototype.matches.call(document.documentElement,secureSelector); } catch { return {__nativeStatus:'invalid-arguments'}; }
+ if (!batch) {try { Element.prototype.matches.call(document.documentElement,secureSelector); } catch { return {__nativeStatus:'invalid-arguments'}; } }
+ const styleOf=batch?.styleOf??((node,pseudo)=>doc.defaultView.getComputedStyle(node,pseudo));
  const secureSelectorAll='input[type="password" i],'+secureSelector;
  function composedSecure(node){
+   if(batch?.clearDocument&&node&&Node.prototype.getRootNode.call(node)===document)return false;
    const seen=new Set();for(let p=node;p&&!seen.has(p);p=p.parentElement||(p.getRootNode&&p.getRootNode().host)){seen.add(p);if(p.nodeType===1&&Element.prototype.matches.call(p,secureSelectorAll))return true;}return false;
  }
  const secureElement=e||this.parentElement||this.getRootNode()?.host;
  const secure=composedSecure(secureElement);
- function readTextLayout(node){
-   const parent=node.parentElement||node.getRootNode()?.host;
-   if(secure||!parent||doc.defaultView.getComputedStyle(parent).visibility!=='visible')return {visible:false,text:''};
-   const range=doc.createRange();range.selectNode(node);
+ function textLayout(node,parent,protectedText,bounded,knownValue){
+   if(protectedText||!parent||styleOf(parent).visibility!=='visible')return {visible:false,text:''};
+   const range=batch?.textRange??doc.createRange();range.selectNode(node);
    const box=range.getBoundingClientRect();
    if(!(box.width>0&&box.height>0))return {visible:false,text:''};
-   if(!boundedObservation)return {visible:true,text:''};
+   if(!bounded)return {visible:true,text:''};
+   const raw = knownValue ?? String(node.nodeValue || '');
+   // UTF-16 length bounds the code-point count. Short values cannot reach
+   // either cap, so normalize whitespace in one pass with the same grammar.
+   if (raw.length <= 512) return {visible:true,text:raw.replace(/\s+/gu,' ')};
    let text='',scanned=0,emitted=0,space=false;
    // Stop before materializing an unbounded normalized string or codepoint array.
-   for(const ch of String(node.nodeValue||'')){
+   for(const ch of raw){
      if(++scanned>16384)return null;
      const whitespace=/\s/u.test(ch);
      if(!whitespace||!space){text+=whitespace?' ':ch;if(++emitted===513)break;}
@@ -932,16 +943,28 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    }
    return {visible:true,text};
  }
+ function readTextLayout(node){
+   return textLayout(node,node.parentElement||node.getRootNode()?.host,secure,boundedObservation);
+ }
+ if(batch && !batch.foldedLightText) {
+   // Installed only in this synchronous isolated-world batch. A direct text
+   // child of a proven clear light-tree element shares its owner and root.
+   batch.foldedLightText=(child,parent,value)=>{
+     const layout=textLayout(child,parent,false,true,value);
+     return layout===null?{__nativeStatus:'resource-limit'}:[-(1+Number(layout.visible)),layout.text];
+   };
+ }
  // Observation folds many text nodes into their parent's batch. Keep the
  // same text and security checks, without the element-only metadata.
  if(boundedObservation&&this.nodeType===3){
    const layout=readTextLayout(this);
    if(layout===null)return {__nativeStatus:'resource-limit'};
+   if(packedFold)return [-(1+Number(layout.visible)+2*Number(secure)),layout.text];
    return {author:{nodeType:3,visible:layout.visible,text:layout.text},
      attributes:{},labels:[],states:{secure,hidden:false,focused:false,disabled:false},
      safePublicNameFromContent:false,redactName:secure,inputPurpose:secure?'generic-secret':'none'};
  }
- const secureDescendants=!!e&&!!Element.prototype.querySelector.call(e,secureSelectorAll);
+ const secureDescendants=!!e&&!(batch?.clearDocument&&Node.prototype.getRootNode.call(e)===document)&&!!Element.prototype.querySelector.call(e,secureSelectorAll);
  const normalize=s=>String(s??'').replace(/\s+/g,' ').trim();
  function safeLabelText(node,excludeAriaHidden=false){
    if(!node||composedSecure(node.nodeType===1?node:node.parentElement||node.getRootNode()?.host))return '';
@@ -957,7 +980,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
        if(composedSecure(n)||Element.prototype.matches.call(n,'input,textarea,select,script,style'))continue;
        // Text is not an adequate replacement for icon/alternative naming.
        if(n.shadowRoot||Element.prototype.matches.call(n,'img,svg,canvas,slot')||n.hasAttribute('aria-label')||n.hasAttribute('aria-labelledby'))return null;
-       const style=doc.defaultView.getComputedStyle(n);if(style.display==='none'||style.visibility==='hidden')continue;
+       const style=styleOf(n);if(style.display==='none'||style.visibility==='hidden')continue;
        if(!['inline','contents','inline-block','inline-flex','inline-grid'].includes(style.display)){parts.push(' ');pending.push(' ');}
      }
      for(let i=n.childNodes.length-1;i>=0;i--)pending.push(n.childNodes[i]);
@@ -975,7 +998,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      if(n.nodeType===3){const value=n.nodeValue||'';if(value.length>512-text.length)return null;text+=value;continue;}
      if(n.nodeType!==1)return null;
      if(composedSecure(n))return null;
-     const css=doc.defaultView.getComputedStyle(n);
+     const css=styleOf(n);
      if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden'){
        // A hidden caption root is proven empty. Hidden descendants can still
        // contribute block/BR separators in the original name computation;
@@ -986,7 +1009,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      if(n.shadowRoot||Element.prototype.matches.call(n,'input,textarea,select,button,meter,progress,output,img,svg,math,canvas,video,audio,iframe,slot,script,style')||
        ['aria-label','aria-labelledby','title','alt','role','contenteditable'].some(a=>n.hasAttribute(a)))return null;
      for(const pseudo of ['::before','::after']){
-       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       const content=styleOf(n,pseudo).content;
        if(content!=='none'&&content!=='normal'&&content!=='')return null;
      }
      if(n!==root&&(n.localName==='br'||css.display!=='inline')){text+=' ';pending.push([' ',depth]);}
@@ -1032,10 +1055,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      // Count them above, but never read their contents or treat them as text.
      if(n.nodeType===8)return '';
      if(n.nodeType!==1||composedSecure(n)||n.shadowRoot||n.isContentEditable)return null;
-     const css=doc.defaultView.getComputedStyle(n);
+     const css=styleOf(n);
      if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return '';
      for(const pseudo of ['::before','::after']){
-       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       const content=styleOf(n,pseudo).content;
        if(content!=='none'&&content!=='normal'&&content!=='')return null;
      }
      if(kind==='heading'&&n!==root&&n instanceof HTMLInputElement)return embeddedInput(n);
@@ -1058,7 +1081,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      let out='';
      for(const child of n.childNodes){
        const value=token(child,depth+1);if(value===null)return null;
-       const block=child.nodeType===1&&(child.localName==='br'||doc.defaultView.getComputedStyle(child).display!=='inline');
+       const block=child.nodeType===1&&(child.localName==='br'||styleOf(child).display!=='inline');
        if(out.length+value.length+(block?2:0)>512)return null;
        out+=block?' '+value+' ':value;
      }
@@ -1084,7 +1107,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  function completePublicButtonName(root){
    let count=0;const visited=new Set();
    const bounded=value=>typeof value==='string'&&value.length<=512?value:null;
-   const hidden=n=>{const css=doc.defaultView.getComputedStyle(n);return (n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden';};
+   const hidden=n=>{const css=styleOf(n);return (n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden';};
    function hiddenReference(n){
      // Positive CSS/ARIA exclusion reads the target whole. Otherwise require
      // an ordinary visible box; skipped/flat-tree visibility is outside this
@@ -1092,7 +1115,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      let depth=0;
      for(let p=n;p;p=p.parentElement){
        if(++depth>64||++count>512)return null;
-       const css=doc.defaultView.getComputedStyle(p);
+       const css=styleOf(p);
        if((p.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none')return true;
        if(p===n&&css.visibility==='hidden')return true;
        if(css.visibility!=='visible'||['hidden','auto'].includes(css.contentVisibility)||p.localName==='details'&&!p.open)return null;
@@ -1127,7 +1150,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
        // Comments do not contribute to a content name.
        if(child.nodeType===8)continue;
        const value=token(child,depth+1,inReference,allowHidden);if(value===null)return null;
-       const block=child.nodeType===1&&(child.localName==='br'||doc.defaultView.getComputedStyle(child).display!=='inline');
+       const block=child.nodeType===1&&(child.localName==='br'||styleOf(child).display!=='inline');
        if(out.length+value.length+(block?2:0)>512)return null;
        out+=block?' '+value+' ':value;
      }
@@ -1139,7 +1162,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      if(n.nodeType!==1||composedSecure(n)||n.shadowRoot||n.isContentEditable||n.hasAttribute('contenteditable')||n.hasAttribute('aria-owns'))return null;
      if(visited.has(n))return '';visited.add(n);
      if(!allowHidden&&hidden(n))return '';
-     for(const pseudo of ['::before','::after']){const value=doc.defaultView.getComputedStyle(n,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
+     for(const pseudo of ['::before','::after']){const value=styleOf(n,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
      const reference=references(n,depth,inReference);if(reference===null)return null;if(reference.used)return reference.name;
      const tag=n.localName,role=n.getAttribute('role');
      // A range uses authored ARIA/value attributes, never the browser's default
@@ -1169,7 +1192,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      return bounded((n.getAttribute('title')||'').trim());
    }
    if(composedSecure(root)||root.shadowRoot||root.isContentEditable||root.hasAttribute('contenteditable')||root.hasAttribute('aria-owns'))return null;
-   for(const pseudo of ['::before','::after']){const value=doc.defaultView.getComputedStyle(root,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
+   for(const pseudo of ['::before','::after']){const value=styleOf(root,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
    const reference=references(root,0,false);if(reference===null)return null;
    if(reference.used)return {source:'reference',name:reference.name};
    if(root.hasAttribute('aria-labelledby')||root.hasAttribute('aria-label')||hidden(root))return null;
@@ -1189,10 +1212,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    }
    function publicShape(node){
      if(composedSecure(node)||node.shadowRoot)return false;
-     const css=doc.defaultView.getComputedStyle(node);
+     const css=styleOf(node);
      if((node.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return false;
      for(const pseudo of ['::before','::after']){
-       const content=doc.defaultView.getComputedStyle(node,pseudo).content;
+       const content=styleOf(node,pseudo).content;
        if(content!=='none'&&content!=='normal'&&content!=='')return false;
      }
      return true;
@@ -1240,12 +1263,12 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
        return chars<=512?value.trim()==='':null;
      }
      if(n.nodeType!==1||composedSecure(n)||n.shadowRoot)return null;
-     const css=doc.defaultView.getComputedStyle(n);
+     const css=styleOf(n);
      if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return null;
      if(n!==root&&(!(n instanceof HTMLElement)||!['div','p','span','br','abbr','b','strong','em','i','small'].includes(n.localName)||
        ['contenteditable','role','aria-label','aria-labelledby','alt'].some(a=>n.hasAttribute(a))))return null;
      for(const pseudo of ['::before','::after']){
-       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       const content=styleOf(n,pseudo).content;
        if(content!=='none'&&content!=='normal'&&content!=='')return null;
      }
      const hint=n===root?'':n.getAttribute('data-placeholder')||'';
@@ -1297,7 +1320,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
       !['type','autocomplete','href','role','placeholder','id','class','title','scope','data-placeholder'].includes(a.name))continue;
    attrs[a.name]=boundedObservation&&a.name==='href'?protectedHref(a.value):a.value;
  }
- const style=e?doc.defaultView.getComputedStyle(e):null;
+ const style=e?styleOf(e):null;
  // Geometry and visibility are separate: a zero-area layout box is still
  // a box, and display:contents can paint descendants without having one.
  const r=e&&e.getClientRects().length?e.getBoundingClientRect():null;
@@ -1305,14 +1328,14 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    const pending=[root];let count=0;
    while(pending.length){
      const node=pending.pop();if(++count>10000)throw new Error('visibility resource limit');
-     const computed=node===e?style:doc.defaultView.getComputedStyle(node);
+     const computed=node===e?style:styleOf(node);
      if(computed.display==='contents'){
        // Contents has no box for checkVisibility to inspect. Its flat-tree
        // ancestors can still suppress all descendant painting.
        let suppressed=false,branch=node;
        for(let p=node.assignedSlot||node.parentElement||node.getRootNode()?.host;p;branch=p,p=p.assignedSlot||p.parentElement||p.getRootNode()?.host){
          if(++count>10000)throw new Error('visibility resource limit');
-         if(doc.defaultView.getComputedStyle(p).contentVisibility==='hidden'){suppressed=true;break;}
+         if(styleOf(p).contentVisibility==='hidden'){suppressed=true;break;}
          if(p.localName==='details'&&!p.open&&Array.from(p.children).find(child=>child.localName==='summary')!==branch){suppressed=true;break;}
        }
        if(suppressed)continue;
@@ -1377,7 +1400,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
          (target.getAttribute('aria-label')||'').trim()||target.hasAttribute('alt')||
          target.childNodes.length===0||target.childNodes.length>512){complete=false;break;}
        for(const pseudo of ['::before','::after']){
-         const content=doc.defaultView.getComputedStyle(target,pseudo).content;
+         const content=styleOf(target,pseudo).content;
          if(content!=='none'&&content!=='normal'&&content!==''){complete=false;break;}
        }
        if(!complete)break;
@@ -1530,7 +1553,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  // nothing to name it. A handler property is proved by the separate main-world
  // hint, never by reading a page getter here.
  const pointer=!!e&&style.cursor==='pointer';
- const inheritedPointer=pointer&&!!e.parentElement&&doc.defaultView.getComputedStyle(e.parentElement).cursor==='pointer';
+ const inheritedPointer=pointer&&!!e.parentElement&&styleOf(e.parentElement).cursor==='pointer';
  const selfBox=!!r&&r.width>0&&r.height>0;
  const clickable=!!e&&!hidden&&selfBox&&(
    (pointer&&!inheritedPointer)||
@@ -1640,6 +1663,124 @@ fn source_name_fact(
         return Err(ObservationError::BackendFailure);
     }
     Ok(Some(fact))
+}
+
+/// Issue an exact ref only from the current node's observed backend and binding.
+/// A reused projection never supplies authority, a revision, or coordinates.
+fn issue_projection_ref(
+    frame: &ObservationFrame,
+    backend: i64,
+    role: Option<&str>,
+    author: Option<&author_projection::Facts>,
+    refs: &mut RefMap,
+    readonly_pseudo: bool,
+) -> Result<NodeReference, ObservationError> {
+    let mut binding = frame.binding.clone();
+    binding.actionable = !matches!(role, Some("document" | "text" | "InlineTextBox"))
+        && !author.is_some_and(|facts| matches!(facts.node_type, 3 | 9));
+    let id = if readonly_pseudo {
+        refs.try_bind_readonly_pseudo(backend, role.unwrap_or(""), binding)
+    } else {
+        refs.try_bind_exact(backend, role.unwrap_or(""), "", binding)
+    }
+    .map_err(reference_allocation_error)?;
+    let issued = refs
+        .get(&id)
+        .and_then(RefEntry::issued_wire_revision)
+        .ok_or(ObservationError::StaleReference)?;
+    Ok(NodeReference {
+        id: format!("@{id}"),
+        revision: issued,
+    })
+}
+
+type ProjectionKey = (
+    metadata_packet::Shape,
+    Option<String>,
+    Option<String>,
+    bool,
+    bool,
+    Vec<(String, Option<Value>)>,
+);
+
+/// A dictionary entry identifies exact renderer facts within one reply. The
+/// AX properties below are the only ones the projector reads. Keep order and
+/// duplicates so even conflicting native states produce the same result.
+fn prepare_projection(
+    frame: &ObservationFrame,
+    ax: &AXNode,
+    row: &metadata_packet::Row,
+    origin: Option<i64>,
+    revision: u64,
+    bounded: bool,
+    projections: &mut HashMap<ProjectionKey, SemanticNode>,
+) -> Result<SemanticNode, ObservationError> {
+    let backend = ax
+        .backend_d_o_m_node_id
+        .ok_or(ObservationError::BackendFailure)?;
+    let data = &row.facts;
+    if origin.is_some() {
+        return project_node_with_refs(
+            frame,
+            backend,
+            ax,
+            None,
+            revision,
+            &readonly_pseudo_metadata(data, ax),
+            bounded,
+        );
+    }
+    let mut node = if let Some(shape) = row.shape {
+        let properties = ax
+            .properties
+            .iter()
+            .flatten()
+            .filter(|p| {
+                matches!(
+                    p.name.as_str(),
+                    "checked" | "selected" | "expanded" | "pressed" | "disabled" | "level"
+                )
+            })
+            .map(|p| (p.name.clone(), p.value.value.clone()))
+            .collect();
+        let key = (
+            shape,
+            ax_string(&ax.role),
+            ax_string(&ax.name),
+            data["author"]["action"] == true,
+            data["author"]["clickable"] == true,
+            properties,
+        );
+        match projections.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let base =
+                    project_node_with_refs(frame, backend, ax, None, revision, data, bounded)?;
+                entry.insert(base).clone()
+            }
+        }
+    } else {
+        project_node_with_refs(frame, backend, ax, None, revision, data, bounded)?
+    };
+    node.rect = row.rect.clone().map(|mut rect| {
+        rect.x += frame.offset_x;
+        rect.y += frame.offset_y;
+        rect
+    });
+    Ok(node)
+}
+
+fn projected_rect(
+    frame: &ObservationFrame,
+    data: &Value,
+) -> Result<Option<Rect>, ObservationError> {
+    let mut rect: Option<Rect> =
+        serde_json::from_value(data["rect"].clone()).map_err(|_| "Invalid rectangle")?;
+    if let Some(value) = &mut rect {
+        value.x += frame.offset_x;
+        value.y += frame.offset_y;
+    }
+    Ok(rect)
 }
 
 fn project_node(
@@ -1902,33 +2043,14 @@ fn project_node_with_refs(
         })
         .transpose()?;
     let role = project_public_role(ax, data, &author)?;
-    let mut binding = frame.binding.clone();
-    binding.actionable = !matches!(role.as_deref(), Some("document" | "text" | "InlineTextBox"))
-        && !author
-            .as_ref()
-            .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
-    let (id, wire_revision) = if let Some(refs) = refs {
-        let id = if data["__nativeReadonlyPseudo"] == true {
-            refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
-        } else {
-            refs.try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
-        }
-        .map_err(reference_allocation_error)?;
-        let issued = refs
-            .get(&id)
-            .and_then(RefEntry::issued_wire_revision)
-            .ok_or(ObservationError::StaleReference)?;
-        (format!("@{id}"), issued)
+    let reference = if let Some(refs) = refs {
+        issue_projection_ref(frame, backend, role.as_deref(), author.as_ref(), refs, data["__nativeReadonlyPseudo"] == true)?
     } else {
-        // Internal candidates never carry public reference authority.
-        (String::new(), revision.to_string())
+        NodeReference { id: String::new(), revision: revision.to_string() }
     };
     let mut node = SemanticNode {
         author,
-        reference: NodeReference {
-            id,
-            revision: wire_revision,
-        },
+        reference,
         role,
         name: ax_string(&ax.name).filter(|name| !name.is_empty()),
         frame_path: frame.frame_path.clone(),
@@ -2284,11 +2406,7 @@ fn project_node_with_refs(
     node.selection = data["selection"].as_str().map(str::to_owned);
     node.test_id = data["testId"].as_str().map(str::to_owned);
     node.input_purpose = data["inputPurpose"].as_str().map(str::to_owned);
-    node.rect = serde_json::from_value(data["rect"].clone()).map_err(|_| "Invalid rectangle")?;
-    if let Some(rect) = node.rect.as_mut() {
-        rect.x += frame.offset_x;
-        rect.y += frame.offset_y;
-    }
+    node.rect = projected_rect(frame, data)?;
     if node.states.get("secure") == Some(&true) {
         node.value = None;
         node.text = None;
@@ -2686,8 +2804,7 @@ pub async fn observe(
     }
     #[cfg(test)]
     let mut witness = SemanticCaptureWitness::default();
-    let mut staged = refs.clone();
-    staged.begin_observation(identity_scope, lease.generation, revision);
+    let mut staged = refs.stage_observation(identity_scope, lease.generation, revision);
     let mut frame_roots: HashMap<String, Vec<SemanticNode>> = HashMap::new();
     let mut traversal = semantic_capture_stage!(
         witness,
@@ -2699,222 +2816,287 @@ pub async fn observe(
         #[cfg(test)]
         let frame_kind = SemanticCaptureFrameKind::of(frame);
         semantic_capture_stage!(witness, FrameProof, frame_kind, check(lease))?;
-        semantic_capture_stage!(
+        let frame_tree = semantic_capture_stage!(
             witness,
             FrameProof,
-            frame_kind,
-            validate_semantic_frame(client, frame, lease).await
-        )?;
-        let value = semantic_capture_stage!(
-            witness,
-            Ax,
             frame_kind,
             command(
                 client,
                 &frame.binding.session,
-                "Accessibility.getFullAXTree",
-                json!({"frameId":frame.binding.frame}),
-                lease,
+                "Page.getFrameTree",
+                json!({}),
+                lease
             )
             .await
         )?;
-        let tree: GetFullAXTreeResult = semantic_capture_stage!(
-            witness,
-            Ax,
-            frame_kind,
-            serde_json::from_value(value).map_err(|_| ObservationError::BackendFailure)
-        )?;
-        // One verified frame read feeds both the security inventory and the
-        // author graph. A second full DOM read one round trip later is the same
-        // document for every proof that consumes it, and only doubles the
-        // serialization cost of a dense page.
-        let dom = semantic_capture_stage!(
-            witness,
-            AuthorDom,
-            frame_kind,
-            frame_dom(client, frame, lease).await
-        )?;
-        // One isolated realm serves this document's security proof and every
-        // metadata batch; each batch used to create its own.
-        let realm = semantic_capture_stage!(
+        semantic_capture_stage!(
             witness,
             FrameProof,
             frame_kind,
-            observation_realm(client, frame, lease).await
+            validate_frame_tree(&frame_tree, frame, true)
         )?;
-        let security = semantic_capture_stage!(
-            witness,
-            SecurityInventory,
-            frame_kind,
-            security_inventory_from_dom(client, frame, options, lease, &dom, realm).await
-        )?;
-        let graph = semantic_capture_stage!(
-            witness,
-            AuthorGraph,
-            frame_kind,
-            author_projection::Graph::read(&dom["root"])
-        )?;
-        if graph
-            .ids
-            .iter()
-            .any(|id| security.browser_internal.contains(id))
-        {
-            return semantic_capture_stage!(
+        let layout_realm = match &staged.observed_dom {
+            Some(inventory) => inventory.fresh_layout(client, frame, identity_scope, lease).await?,
+            None => None,
+        };
+        let start_ax = tokio::sync::Notify::new();
+        // Both branches read the same admitted frame and settle before use.
+        // Chromium can build accessibility while native prepares the author
+        // tree and separately proves current protected nodes and focus.
+        use futures_util::FutureExt;
+        let accessibility = async {
+            let capture = super::cdp::observation_ax::Capture::default();
+            let data = capture
+                .scope(command(
+                    client,
+                    &frame.binding.session,
+                    "Accessibility.getFullAXTree",
+                    json!({"frameId":frame.binding.frame}),
+                    lease,
+                ))
+                .await?;
+            let tree = capture
+                .finish(data)
+                .map_err(|_| ObservationError::BackendFailure)?;
+            let rows = tree
+                .nodes
+                .into_iter()
+                .filter(|ax| {
+                    ax.role
+                        .as_ref()
+                        .and_then(|role| role.value.as_ref())
+                        .and_then(Value::as_str)
+                        != Some("InlineTextBox")
+                })
+                .filter_map(|ax| Some((ax.backend_d_o_m_node_id?, ax)))
+                .collect::<HashMap<_, _>>();
+            Ok::<_, ObservationError>(std::sync::Arc::new(rows))
+        }
+        .boxed()
+        .shared();
+        let read_document = async {
+            let (inventory, realm) = tokio::join!(
+                document_inventory::acquire(
+                    client,
+                    frame,
+                    lease,
+                    &frame_tree,
+                    &mut staged.observed_dom,
+                    identity_scope,
+                    &accessibility,
+                    layout_realm.is_some(),
+                ),
+                async { match layout_realm {
+                    Some(realm) => Ok(realm), None => observation_realm(client, frame, lease).await,
+                } },
+            );
+            let dom = semantic_capture_stage!(witness, AuthorDom, frame_kind, inventory)?;
+            let realm = semantic_capture_stage!(witness, FrameProof, frame_kind, realm)?;
+            let structure =
+                semantic_capture_stage!(witness, AuthorGraph, frame_kind, dom.structure())?;
+            let graph = &structure.graph;
+            let security = semantic_capture_stage!(witness, SecurityInventory, frame_kind,
+                live_security_inventory(
+                    client,
+                    frame,
+                    options,
+                    lease,
+                    &structure.roots,
+                    &structure.domains,
+                    Some(realm)
+                ).await
+            )?;
+            if options.secure_field_selector != default_secure_selector()
+                || !security.ancestors.is_empty()
+                || !security.simple_name_inventory
+                || graph.ids.len() > 16_384
+            {
+                staged.observed_dom = None;
+            }
+            let mut suppressed = structure.suppressed.clone();
+            let probed = semantic_capture_stage!(witness, Metadata, frame_kind,
+                display_none_subtrees(client, frame, &dom, realm, lease).await
+            ).unwrap_or_default();
+            let display_none_owners = display_none_iframe_owners(&probed);
+            for (id, fact) in probed {
+                suppressed.entry(id).or_insert(fact);
+            }
+            if graph
+                .ids
+                .iter()
+                .any(|id| security.browser_internal.contains(id))
+            {
+                return semantic_capture_stage!(
+                    witness,
+                    AuthorGraph,
+                    frame_kind,
+                    Err(ObservationError::BackendFailure)
+                );
+            }
+            semantic_capture_stage!(
                 witness,
                 AuthorGraph,
                 frame_kind,
-                Err(ObservationError::BackendFailure)
-            );
-        }
-        semantic_capture_stage!(
-            witness,
-            AuthorGraph,
-            frame_kind,
-            staged
-                .check_exact_admission(&frame.binding, &graph.ids)
-                .map_err(reference_allocation_error)
-        )?;
-        let ax_by_backend: HashMap<i64, &AXNode> = tree
-            .nodes
-            .iter()
-            .filter(|ax| ax_string(&ax.role).as_deref() != Some("InlineTextBox"))
-            .filter_map(|ax| ax.backend_d_o_m_node_id.map(|id| (id, ax)))
-            .collect();
-        let candidate_ids: std::collections::HashSet<i64> = graph.ids.iter().copied().collect();
-        // Subtrees that compact is guaranteed to discard are not read: the
-        // same DOM-only suppress inputs feed both this pre-filter and the
-        // metadata reader, and compact::emit returns before visiting any child
-        // of a suppressed node.
-        let mut suppressed: HashMap<i64, (i64, String)> = HashMap::new();
-        collect_suppressed(&dom["root"], false, &mut suppressed);
-        let probed = semantic_capture_stage!(
-            witness,
-            Metadata,
-            frame_kind,
-            display_none_subtrees(client, frame, &dom, realm, lease).await
-        )
-        .unwrap_or_default();
-        // A display-none subtree is never read, so an iframe owner inside one
-        // never acquires the public hidden state that proves its frame
-        // omission. The probe's suppression is the same proof compact uses to
-        // drop the owner, and native re-reads the exact owner before honoring
-        // the omission, so carry those owners into the frame proof.
-        let display_none_owners = display_none_iframe_owners(&probed);
-        for (id, fact) in probed {
-            suppressed.entry(id).or_insert(fact);
-        }
-        let suppressed_ids: std::collections::HashSet<i64> = suppressed.keys().copied().collect();
-        let mut text_folds: HashMap<i64, Vec<FoldedText>> = HashMap::new();
-        let mut folded_text: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        collect_folded_text(
-            &dom["root"],
-            &mut text_folds,
-            &mut folded_text,
-            &candidate_ids,
-            &suppressed_ids,
-            &ax_by_backend,
-        );
-        // Text nodes read through their parent's object are not separate
-        // receivers; every other candidate keeps its own resolve.
-        let candidates: Vec<AXNode> = graph
-            .ids
-            .iter()
-            .filter(|id| !folded_text.contains(*id) && !suppressed_ids.contains(*id))
-            .map(|id| {
-                ax_by_backend
-                    .get(id)
-                    .map(|ax| (*ax).clone())
-                    .unwrap_or_else(|| synthetic_ax(*id))
-            })
-            .collect();
-        // Classify pseudo receivers from the author DOM already read above.
-        // Build its index on demand and revalidate every read pseudo against a
-        // fresh inventory after the final batch.
-        let pseudos = PseudoObservation {
-            dom_root: &dom["root"],
-            origins: std::sync::OnceLock::new(),
-            deferred: std::sync::Mutex::new(Vec::new()),
-        };
-        let mut nodes = HashMap::new();
-        for chunk in candidates.chunks(OBSERVATION_METADATA_BATCH_SIZE) {
-            let (batch, folded) = semantic_capture_stage!(
-                witness,
-                Metadata,
-                frame_kind,
-                read_batch(
-                    client,
-                    frame,
-                    &chunk.iter().collect::<Vec<_>>(),
-                    &mut staged,
-                    revision,
-                    options,
-                    lease,
-                    true,
-                    &security,
-                    &pseudos,
-                    Some(realm),
-                    Some(&text_folds),
-                )
-                .await
+                staged
+                    .check_exact_admission(&frame.binding, &graph.ids)
+                    .map_err(reference_allocation_error)
             )?;
-            for (backend, mut node) in folded {
-                apply_security(&mut node, backend, &security);
-                nodes.insert(backend, node);
-            }
-            for (ax, mut node) in chunk.iter().zip(batch) {
-                let id = semantic_capture_stage!(
+            let candidate_ids = &structure.candidates;
+            let suppressed_ids: std::collections::HashSet<i64> =
+                suppressed.keys().copied().collect();
+            // A computed display:none root is an element. Its direct text can
+            // only be suppressed together with its owner. The immutable folding
+            // plan therefore remains valid when the live hidden owners change.
+            let text_folds = &structure.folds;
+            let folded_text = &structure.folded;
+            // Text nodes read through their parent's object are not separate
+            // receivers; every other candidate keeps its own resolve.
+            let candidates: Vec<AXNode> = graph
+                .ids
+                .iter()
+                .filter(|id| !folded_text.contains(*id) && !suppressed_ids.contains(*id))
+                .map(|id| synthetic_ax(*id))
+                .collect();
+            // Classify pseudo receivers from the author DOM already read above.
+            // Build its index on demand and revalidate every read pseudo against a
+            // fresh inventory after the final batch.
+            let pseudos = PseudoObservation {
+                ax: Some(accessibility.clone()),
+                start_ax: layout_realm.map(|_| &start_ax),
+                graph: Some(graph),
+                inventory: staged.observed_dom.clone(),
+                dom_root: &dom["root"],
+                origins: std::sync::Arc::clone(&structure.origins),
+                light_index: std::sync::Arc::clone(&structure.light_index),
+                deferred: std::sync::Mutex::new(Vec::new()),
+            };
+            let mut nodes = HashMap::new();
+            let batch_limit = if frame.parent_frame_id.is_none()
+                && security.simple_name_inventory
+                && dom["root"]["nodeId"].as_i64().is_some_and(|id| id > 0)
+            {
+                OBSERVATION_METADATA_BATCH_SIZE * 8
+            } else {
+                OBSERVATION_METADATA_BATCH_SIZE
+            };
+            for chunk in candidates.chunks(batch_limit) {
+                let (batch, folded) = semantic_capture_stage!(
                     witness,
                     Metadata,
                     frame_kind,
-                    ax.backend_d_o_m_node_id
-                        .ok_or(ObservationError::BackendFailure)
+                    read_batch(
+                        client,
+                        frame,
+                        &chunk.iter().collect::<Vec<_>>(),
+                        &mut staged,
+                        revision,
+                        options,
+                        lease,
+                        true,
+                        &security,
+                        &pseudos,
+                        Some(realm),
+                        Some(text_folds),
+                    )
+                    .await
                 )?;
-                apply_security(&mut node, id, &security);
-                nodes.insert(id, node);
+                for (backend, mut node) in folded {
+                    apply_security(&mut node, backend, &security);
+                    nodes.insert(backend, node);
+                }
+                for (ax, mut node) in chunk.iter().zip(batch) {
+                    let id = semantic_capture_stage!(
+                        witness,
+                        Metadata,
+                        frame_kind,
+                        ax.backend_d_o_m_node_id
+                            .ok_or(ObservationError::BackendFailure)
+                    )?;
+                    apply_security(&mut node, id, &security);
+                    nodes.insert(id, node);
+                }
             }
-        }
-        // compact still needs every graph id in the facts map. Suppressed
-        // subtrees get a suppress-only stub with no public reference, since
-        // emit never reaches them; the duplicate assignment/shadow graph
-        // structure is unchanged.
-        for (backend, (kind, tag)) in &suppressed {
-            if candidate_ids.contains(backend) && !nodes.contains_key(backend) {
-                nodes.insert(*backend, suppressed_stub(frame, *kind, tag));
+            // compact still needs every graph id in the facts map. Suppressed
+            // subtrees get a suppress-only stub with no public reference, since
+            // emit never reaches them; the duplicate assignment/shadow graph
+            // structure is unchanged.
+            for (backend, (kind, tag)) in &suppressed {
+                if candidate_ids.contains(backend) && !nodes.contains_key(backend) {
+                    nodes.insert(*backend, suppressed_stub(frame, *kind, tag));
+                }
             }
+            // A single fresh inventory proves every pseudo read in this document
+            // after the final batch, instead of re-reading the same tree per batch.
+            let deferred = pseudos
+                .deferred
+                .lock()
+                .map_err(|_| ObservationError::BackendFailure)?
+                .clone();
+            let hidden_owners = nodes
+                .iter()
+                .filter(|(_, node)| proven_hidden_iframe(node))
+                .map(|(id, _)| *id)
+                .chain(display_none_owners)
+                .collect();
+            let limit = options.max_nodes - traversal.count;
+            let compact = async {
+                if graph.ids.len() < 128 {
+                    return author_projection::compact(graph, nodes, limit);
+                }
+                let inventory = std::sync::Arc::clone(&dom);
+                tokio::task::spawn_blocking(move || {
+                    author_projection::compact(&inventory.structure()?.graph, nodes, limit)
+                })
+                .await
+                .map_err(|_| ObservationError::BackendFailure)?
+            };
+            // The CPU task only owns private facts. Both reads must settle and
+            // the parent loader must still match before any result is published.
+            let validate = async {
+                let proof = revalidate_deferred_pseudos(
+                    client,
+                    frame,
+                    &deferred,
+                    dom["root"]["nodeId"].as_i64(),
+                    pseudos.inventory.as_ref(),
+                    pseudos
+                        .origins
+                        .get()
+                        .and_then(|result| result.as_ref().ok()),
+                    lease,
+                )
+                .await;
+                semantic_capture_stage!(witness, Metadata, frame_kind, proof)?;
+                semantic_capture_stage!(
+                    witness,
+                    FrameProof,
+                    frame_kind,
+                    validate_semantic_frame(client, frame, lease).await
+                )
+            };
+            let (validated, compacted) = tokio::join!(validate, compact);
+            validated?;
+            let (roots, frame_truncated) =
+                semantic_capture_stage!(witness, Compact, frame_kind, compacted)?;
+            Ok::<_, ObservationError>((roots, frame_truncated, hidden_owners))
+        };
+        let document = async {
+            let result = read_document.await;
+            start_ax.notify_one();
+            result
+        };
+        let ax = async {
+            // Let the renderer receive the exact metadata read first on a warm
+            // layout. Blink can build AX while native decodes that reply.
+            if layout_realm.is_some() { start_ax.notified().await; }
+            accessibility.clone().await
+        };
+        let (document, ax) = tokio::join!(document, ax);
+        if let Err(ObservationError::CleanupFailed { .. }) = &document {
+            document.as_ref().map_err(Clone::clone)?;
         }
-        // A single fresh inventory proves every pseudo read in this document
-        // after the final batch, instead of re-reading the same tree per batch.
-        let deferred = pseudos
-            .deferred
-            .lock()
-            .map_err(|_| ObservationError::BackendFailure)?
-            .clone();
-        semantic_capture_stage!(
-            witness,
-            Metadata,
-            frame_kind,
-            revalidate_deferred_pseudos(client, frame, &deferred, lease).await
-        )?;
-        // Publish this proof only after revalidating the exact parent loader.
-        // The key is the native owner backend ID, never a selector/name match.
-        semantic_capture_stage!(
-            witness,
-            FrameProof,
-            frame_kind,
-            validate_semantic_frame(client, frame, lease).await
-        )?;
-        let hidden_owners = nodes
-            .iter()
-            .filter(|(_, node)| proven_hidden_iframe(node))
-            .map(|(id, _)| *id)
-            .chain(display_none_owners)
-            .collect();
-        let (roots, frame_truncated) = semantic_capture_stage!(
-            witness,
-            Compact,
-            frame_kind,
-            author_projection::compact(&graph, nodes, options.max_nodes - traversal.count)
-        )?;
+        semantic_capture_stage!(witness, Ax, frame_kind, ax)?;
+        let (roots, frame_truncated, hidden_owners) = document?;
         // Resolve emitted boundary order through native owner identity, not
         // selectors/framePath. This walk excludes not-yet-captured documents.
         let owners: HashMap<String, i64> = frames
@@ -3598,8 +3780,20 @@ const MATCH_QUERY: &str = concat!(
  }
  try {
   if(structuralCss){
-    const parts=rawSelectorEntryParts(expression);
-    if(parts.length!==1||parts[0].engine!=='css'||rawCssProgram(parts[0]).extended)return {requiresMetadata:true};
+    function structural(x) {
+      switch(x.kind) {
+        case 'selector': {
+          const parts=rawSelectorEntryParts(x);
+          return parts.length===1&&parts[0].engine==='css'&&!rawCssProgram(parts[0]).extended;
+        }
+        case 'query': return x.query.kind==='text'&&!x.query.visible&&!!x.scope&&structural(x.scope);
+        case 'index': return structural(x.source);
+        case 'filter': return structural(x.source)&&(!x.has||structural(x.has));
+        case 'union': return structural(x.left)&&structural(x.right);
+        default: return false;
+      }
+    }
+    if(!structural(expression))return {requiresMetadata:true};
   }
   const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);
   return {indices,redacted};
@@ -4136,8 +4330,12 @@ async fn evaluate_query_diagnostic_inner(
         ..Default::default()
     };
     witness.stage(Stage::Security);
-    let security = match &candidate_plan {
-        Some(plan) => {
+    let plain_css = field_read && candidate_plan.is_none() && css_field_sample::structural(expression);
+    let shared_realm = if plain_css {
+        Some(observation_realm(client, frame, lease).await?)
+    } else { None };
+    let security = match (&candidate_plan, shared_realm) {
+        (Some(plan), _) => {
             security_inventory_for_roots(
                 client,
                 frame,
@@ -4149,7 +4347,10 @@ async fn evaluate_query_diagnostic_inner(
             )
             .await?
         }
-        None => security_inventory(client, frame, &metadata_options, lease).await?,
+        (None, Some(realm)) => {
+            security_inventory_from_dom(client, frame, &metadata_options, lease, &dom, realm).await?
+        }
+        (None, None) => security_inventory(client, frame, &metadata_options, lease).await?,
     };
     let group = client
         .readonly_group_instance(&format!("native-query-{}", lease.sequence))
@@ -4163,20 +4364,41 @@ async fn evaluate_query_diagnostic_inner(
             nodes = query_metadata(client, frame, &ax_nodes, &metadata_options, &security, lease).await?;
         }
     witness.stage(Stage::QueryWorld);
-        let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
-        let context=world["executionContextId"].as_i64().ok_or("Missing query realm")?;
+        let context = match shared_realm {
+            Some(realm) => realm,
+            None => observation_realm(client, frame, lease).await?,
+        };
         use futures_util::{stream,StreamExt};
     witness.stage(Stage::QueryResolve);
-        let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend: i64| {
+        let resolve = || async {
+            let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend: i64| {
             let group=&group;
             async move {
                 let value=resolve_page_object(client,session,backend,Some(context),group,lease).await?;
                 value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
             }
         })).buffered(16).collect().await;
-        let objects=collect_hint_results(objects)?;
+            collect_hint_results(objects)
+        };
+        let mut handles = None;
         if sample_css {
-            if let Some(sample) = css_field_sample::read(client, frame, &ax_nodes, &objects, expression, &metadata_options, &security, &group, lease).await? {
+            let held = if frame.parent_frame_id.is_none() {
+                match (dom["root"]["nodeId"].as_i64().filter(|id| *id > 0), dom["root"]["backendNodeId"].as_i64()) {
+                    (Some(root), Some(backend)) => light_document::LightReceivers::collect(client, frame, context,
+                        &dom["root"], &light_document::LightIndex::default(), None, root, backend, &ids, &group, lease).await?,
+                    _ => None,
+                }
+            } else { None };
+            let light = held.as_ref().and_then(|held| {
+                Some(css_field_sample::Receivers::Light { table: &held.handle,
+                    slots: held.slots.iter().copied().collect::<Option<Vec<_>>>()? })
+            });
+            let receivers = if let Some(receivers) = light {
+                receivers
+            } else {
+                css_field_sample::Receivers::Handles(handles.insert(resolve().await?))
+            };
+            if let Some(sample) = css_field_sample::read(client, frame, &ax_nodes, receivers, expression, &metadata_options, &security, &group, lease).await? {
                 // A closed author root attached during the sample is invisible
                 // to light-tree JavaScript. Reconfirm its native domain before
                 // publishing even an empty match.
@@ -4192,10 +4414,9 @@ async fn evaluate_query_diagnostic_inner(
                 }
                 return Ok(sample);
             }
-            // The live renderer found a protected domain or a broad result.
-            // Reacquire the ordinary metadata before invoking the full matcher.
             nodes = query_metadata(client, frame, &ax_nodes, &metadata_options, &security, lease).await?;
         }
+        let objects = match handles { Some(objects) => objects, None => resolve().await? };
     witness.stage(Stage::QueryMatch);
         let (indices,redacted) = if objects.is_empty() { (Vec::<usize>::new(),Vec::<usize>::new()) } else {
         let mut arguments=vec![json!({"value":compile_selector_expression(expression)?}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
@@ -4343,10 +4564,17 @@ async fn revalidate_deferred_pseudos(
     client: &CdpClient,
     frame: &ObservationFrame,
     deferred: &[(i64, i64)],
+    frontend_root: Option<i64>,
+    inventory: Option<&document_inventory::DocumentInventory>,
+    initial: Option<&HashMap<i64, PseudoOrigin>>,
     lease: &OperationLease,
 ) -> Result<(), ObservationError> {
     if deferred.is_empty() {
         return Ok(());
+    }
+    if let Some(root) = frontend_root.filter(|id| *id > 0 && frame.parent_frame_id.is_none() && deferred.len() >= 4) {
+        let document = light_document::LightDocument::from_root(client, frame, root, inventory, lease).await?;
+        if document.confirms_pseudos(client, frame, deferred, initial, lease).await? { return Ok(()); }
     }
     let current = pseudo_origins(&frame_dom(client, frame, lease).await?["root"])?;
     // A pseudo the fresh inventory no longer names is refused before any read,
@@ -4387,6 +4615,8 @@ async fn revalidate_deferred_pseudos(
         if node["backendNodeId"].as_i64() != Some(*backend)
             || node["nodeType"] != 1
             || node["pseudoType"].as_str() != Some(fresh.pseudo_type.as_str())
+            || initial.and_then(|origins| origins.get(backend)).is_some_and(|source|
+                source.backend != *origin || source.pseudo_type != fresh.pseudo_type)
             || fresh.backend != *origin
         {
             return Err(ObservationError::StaleReference);
@@ -4461,6 +4691,27 @@ fn metadata_receiver_focus(
 // the same exact-receiver, side-effect-restricted reads to one candidate set in
 // one native call instead of seven renderer round trips per candidate.
 const MAIN_ONCLICK_HINT_BATCH: &str = "function(...nodes) { return nodes.map(function(node) { return typeof node.onclick === 'function'; }); }";
+/// V8's side-effect checker instruments each callback to Array.map. Direct
+/// argument slots perform the same guarded property read once per exact node.
+fn indexed_click_hints(count: usize) -> String {
+    use std::fmt::Write;
+    let mut source = String::from("function(");
+    let mut reads = String::new();
+    for index in 0..count {
+        if index > 0 {
+            source.push(',');
+            reads.push(',');
+        }
+        write!(source, "n{index}").expect("writing to a String");
+        write!(reads, "typeof n{index}.onclick==='function'").expect("writing to a String");
+    }
+    // Materializing the arguments object is itself refused by Chromium's
+    // side-effect checker. Formal parameters use its ordinary local loads.
+    source.push_str("){return [");
+    source.push_str(&reads);
+    source.push_str("]}");
+    source
+}
 // A Document contains its light-tree descendants only. A positive intrinsic
 // contains check proves both connection and ownership in one native call.
 // Shadow descendants take the original composed-connection and owner proof.
@@ -4496,13 +4747,15 @@ async fn hint_booleans(
     lease: &OperationLease,
 ) -> Result<Vec<bool>, ObservationError> {
     let receiver = receivers.first().ok_or(ObservationError::BackendFailure)?;
+    let indexed = (function == MAIN_ONCLICK_HINT_BATCH && receivers.len() >= 32)
+        .then(|| indexed_click_hints(receivers.len()));
     let reply = command(
         client,
         session,
         "Runtime.callFunctionOn",
         json!({
             "objectId":receiver,
-            "functionDeclaration":function,
+            "functionDeclaration":indexed.as_deref().unwrap_or(function),
             "arguments":hint_batch_arguments(receivers),
             "throwOnSideEffect":true,
             "returnByValue":true,
@@ -4568,6 +4821,41 @@ async fn main_onclick_hints(
     candidates: Vec<(usize, i64, String)>,
     lease: &OperationLease,
 ) -> Result<Vec<(usize, bool)>, ObservationError> {
+    let mut backends = Vec::with_capacity(candidates.len());
+    let mut receivers = Vec::with_capacity(candidates.len());
+    for (index, backend, object) in candidates {
+        backends.push((index, backend));
+        receivers.push(object);
+    }
+    read_onclick_hints(client, frame, backends, HintMembership::Isolated(receivers), lease).await
+}
+
+enum HintMembership<'a> {
+    Isolated(Vec<String>),
+    Light(&'a light_document::LightDocument, Vec<(i64, i64)>),
+}
+
+impl HintMembership<'_> {
+    async fn confirm(&self, client: &CdpClient, frame: &ObservationFrame, group: &str,
+        lease: &OperationLease) -> Result<(), ObservationError> {
+        match self {
+            Self::Light(doc, ids) => doc.confirm(client, frame, ids, lease).await,
+            Self::Isolated(receivers) => {
+                if hint_booleans(client, &frame.binding.session, receivers, EXACT_HINT_RECEIVER_BATCH, group, lease)
+                    .await?.into_iter().all(|exact| exact) {
+                    Ok(())
+                } else {
+                    Err(ObservationError::StaleReference)
+                }
+            }
+        }
+    }
+}
+
+async fn read_onclick_hints(
+    client: &CdpClient, frame: &ObservationFrame, candidates: Vec<(usize, i64)>,
+    membership: HintMembership<'_>, lease: &OperationLease,
+) -> Result<Vec<(usize, bool)>, ObservationError> {
     // No group has been acquired yet: expired admissions need no cleanup.
     check(lease)?;
     let session = &frame.binding.session;
@@ -4578,86 +4866,46 @@ async fn main_onclick_hints(
     let result = capture
         .scope(async {
             validate_frame(client, frame, lease).await?;
-            let isolated = candidates
-                .iter()
-                .map(|(_, _, object)| object.clone())
-                .collect::<Vec<_>>();
-            if !hint_booleans(
-                client,
-                session,
-                &isolated,
-                EXACT_HINT_RECEIVER_BATCH,
-                &group,
-                lease,
-            )
-            .await?
-            .into_iter()
-            .all(|exact| exact)
-            {
-                return Err(ObservationError::StaleReference);
+            membership.confirm(client, frame, &group, lease).await?;
+            if let HintMembership::Light(document, members) = &membership {
+                if let Some(hints) = document.main_click_hints(client, frame, members, &group, lease).await? {
+                    membership.confirm(client, frame, &group, lease).await?;
+                    validate_frame(client, frame, lease).await?;
+                    return Ok(candidates.iter().map(|(index, _)| *index).zip(hints).collect());
+                }
             }
-            // Bounded batches keep the native command pool within its existing
-            // concurrency bound while draining every started read.
-            let mut resolved = Vec::with_capacity(candidates.len());
-            for chunk in candidates.chunks(16) {
-                let futures = chunk
-                    .iter()
-                    .map(|(_, backend, _)| {
-                        let backend = *backend;
-                        let group = group.clone();
-                        async move {
-                            let resolved =
-                                resolve_page_object(client, session, backend, None, &group, lease)
-                                    .await?;
-                            if resolved["object"]["type"] != "object"
-                                || resolved["object"]["subtype"] != "node"
-                            {
-                                return Err(ObservationError::BackendFailure);
-                            }
-                            resolved["object"]["objectId"]
-                                .as_str()
-                                .filter(|id| !id.is_empty())
-                                .map(str::to_owned)
-                                .ok_or(ObservationError::BackendFailure)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                resolved.extend(futures_util::future::join_all(futures).await);
-            }
+            // Each main-world handle is described as soon as its resolve
+            // finishes. Bounded in-flight work drains before group cleanup,
+            // including siblings of a refused binding.
+            use futures_util::{stream, StreamExt};
+            let backends = candidates.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+            let members = match &membership {
+                HintMembership::Light(_, ids) => Some(ids.as_slice()),
+                HintMembership::Isolated(_) => None,
+            };
+            let resolved = stream::iter(backends.into_iter().enumerate().map(|(index, backend)| {
+                let frontend = members.map(|ids| ids[index].1);
+                let group = &group;
+                async move {
+                    let value = resolve_page_object(client, session, backend, None, group, lease).await?;
+                    let remote = &value["object"];
+                    if remote["type"] != "object" || remote["subtype"] != "node" {
+                        return Err(ObservationError::BackendFailure);
+                    }
+                    let object = remote["objectId"].as_str().filter(|id| !id.is_empty())
+                        .ok_or(ObservationError::BackendFailure)?.to_owned();
+                    let confirmed = if let Some(frontend) = frontend {
+                        let reply = command(client, session, "DOM.requestNode", json!({"objectId":object}), lease).await?;
+                        reply["nodeId"].as_i64() == Some(frontend)
+                    } else {
+                        let reply = command(client, session, "DOM.describeNode", json!({"objectId":object,"depth":0}), lease).await?;
+                        reply["node"]["backendNodeId"].as_i64() == Some(backend) && reply["node"]["nodeType"] == 1
+                    };
+                    if !confirmed {return Err(ObservationError::StaleReference);}
+                    Ok(object)
+                }
+            })).buffered(16).collect::<Vec<_>>().await;
             let objects = collect_hint_results(resolved)?;
-            let mut described = Vec::with_capacity(candidates.len());
-            for chunk in candidates
-                .iter()
-                .zip(&objects)
-                .collect::<Vec<_>>()
-                .chunks(16)
-            {
-                let futures = chunk
-                    .iter()
-                    .map(|((_, backend, _), object)| {
-                        let backend = *backend;
-                        let object = (*object).clone();
-                        async move {
-                            let described = command(
-                                client,
-                                session,
-                                "DOM.describeNode",
-                                json!({"objectId":object,"depth":0}),
-                                lease,
-                            )
-                            .await?;
-                            if described["node"]["backendNodeId"].as_i64() != Some(backend)
-                                || described["node"]["nodeType"] != 1
-                            {
-                                return Err(ObservationError::StaleReference);
-                            }
-                            Ok(())
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                described.extend(futures_util::future::join_all(futures).await);
-            }
-            collect_hint_results(described)?;
             let hints = hint_booleans(
                 client,
                 session,
@@ -4667,24 +4915,11 @@ async fn main_onclick_hints(
                 lease,
             )
             .await?;
-            if !hint_booleans(
-                client,
-                session,
-                &isolated,
-                EXACT_HINT_RECEIVER_BATCH,
-                &group,
-                lease,
-            )
-            .await?
-            .into_iter()
-            .all(|exact| exact)
-            {
-                return Err(ObservationError::StaleReference);
-            }
+            membership.confirm(client, frame, &group, lease).await?;
             validate_frame(client, frame, lease).await?;
             Ok(candidates
                 .iter()
-                .map(|(index, _, _)| *index)
+                .map(|(index, _)| *index)
                 .zip(hints)
                 .collect())
         })
@@ -4871,7 +5106,7 @@ async fn display_none_subtrees(
           let none = false;
           try { none = getComputedStyle(child).display === 'none'; } catch {}
           if (none) out.push([path.slice(), String(child.localName || '').toLowerCase(), true]);
-          walk(child);
+          else walk(child);
           path.pop();
         }
       };
@@ -4981,13 +5216,21 @@ fn suppressed_stub(frame: &ObservationFrame, kind: i64, tag: &str) -> SemanticNo
 /// Observation-lifetime pseudo evidence. One frame inventory supplies every
 /// batch's receiver classification, and every read pseudo is revalidated once
 /// after the final batch rather than once per batch.
-struct PseudoObservation<'a> {
+type AxRead<'a> = futures_util::future::Shared<futures_util::future::BoxFuture<'a,
+    Result<std::sync::Arc<HashMap<i64, AXNode>>, ObservationError>>>;
+
+struct PseudoObservation<'a, 'operation> {
+    ax: Option<AxRead<'operation>>,
+    start_ax: Option<&'a tokio::sync::Notify>,
+    graph: Option<&'a author_projection::Graph>,
+    inventory: Option<document_inventory::DocumentInventory>,
+    light_index: std::sync::Arc<light_document::LightIndex>,
     dom_root: &'a Value,
-    origins: std::sync::OnceLock<Result<HashMap<i64, PseudoOrigin>, ObservationError>>,
+    origins: std::sync::Arc<std::sync::OnceLock<Result<HashMap<i64, PseudoOrigin>, ObservationError>>>,
     deferred: std::sync::Mutex<Vec<(i64, i64)>>,
 }
 
-impl PseudoObservation<'_> {
+impl PseudoObservation<'_, '_> {
     /// Classifies against the same native tree that supplied the candidates.
     /// Only the final revalidation reads a new inventory.
     fn origins(&self) -> Result<&HashMap<i64, PseudoOrigin>, ObservationError> {
@@ -5005,12 +5248,61 @@ fn observation_metadata_reader() -> &'static str {
     READER.get_or_init(|| {
         [
             "function(testId,secureSelector,...nodes) { const settings = testId; const read=",
-            METADATA,
-            r#";
+            METADATA, "; const plain = ", include_str!("client_observation/plain_metadata.js"),
+            "; const pack = ", include_str!("client_observation/pack_metadata.js"), r#";
+            try { Element.prototype.matches.call(document.documentElement,secureSelector); }
+            catch { return pack(settings.protectedEditors.map(() => ({__nativeStatus:'invalid-arguments'}))); }
+            // These caches are local to this one synchronous call. A light-tree
+            // password scan says nothing about shadow descendants.
+            const styles = new WeakMap(), before = new WeakMap(), after = new WeakMap();
+            const batch = {
+                hasClosedDetails: !!Document.prototype.querySelector.call(document, 'details:not([open])'),
+                plainTags: new Set(['div','span','i','b','p','a','td','tr','tbody','thead','col','colgroup','strong','small','section','main']),
+                drawingAttributes: new Set(['d','fill','fill-rule','fill-opacity','stroke','stroke-width','stroke-linecap','stroke-linejoin','stroke-opacity','clip-rule','transform']),
+                depths: new WeakMap(),
+                textRange: document.createRange(),
+                clearDocument: secureSelector === 'input[type="password" i]' &&
+                    !Document.prototype.querySelector.call(document, secureSelector),
+                styleOf(node, pseudo) {
+                    const cache = pseudo === '::before' ? before : pseudo === '::after' ? after : styles;
+                    if (!cache.has(node)) cache.set(node, getComputedStyle(node, pseudo));
+                    return cache.get(node);
+                }
+            };
+            // Omitted optional facts have the same representation as JSON null in
+            // the projector. Keep tri-state false, empty labels and required
+            // security flags explicit. Attribute and control-state maps are opaque.
+            function sparse(row) {
+                const value = {};
+                for (const [key, fact] of Object.entries(row)) {
+                    if (fact === null) continue;
+                    if (key === 'author') {
+                        const author = {};
+                        for (const [name, item] of Object.entries(fact)) {
+                            if (item !== null && item !== '' && (item !== false || name === 'lineVisible')) {
+                                author[name] = item;
+                            }
+                        }
+                        value.author = author;
+                    } else if (fact !== false || key === 'safePublicNameFromContent' ||
+                               key === 'pageLevelLandmark' || key === 'formOwnName') {
+                        value[key] = fact;
+                    }
+                }
+                return value;
+            }
+            if (settings.slots) {
+                const exact = nodes;
+                let next = 0;
+                nodes = settings.slots.map(slot => slot === null ? exact[next++] : this.elements[slot]);
+            }
             const rows = nodes.map((node, index) => {
-                const metadata = read.call(node, settings.testIdAttribute, secureSelector,
+                const ordinary = settings.bounded && settings.simpleNameInventory
+                    ? plain(node, settings.testIdAttribute, settings.protectedEditors[index], settings.focusedReceivers[index], batch)
+                    : null;
+                const metadata = ordinary ?? read.call(node, settings.testIdAttribute, secureSelector,
                     settings.bounded, settings.protectedEditors[index], settings.simpleNameInventory,
-                    settings.focusedReceivers[index], settings.localNameInventory[index]);
+                    settings.focusedReceivers[index], settings.localNameInventory[index], batch);
                 const entries = settings.folds[index];
                 if (entries.length > 0) {
                     metadata.__nativeFolded = entries.map(([position, prefix, length]) => {
@@ -5020,13 +5312,14 @@ fn observation_metadata_reader() -> &'static str {
                         if (value.length !== length || !value.startsWith(prefix)) {
                             return {__nativeStatus: 'fallback'};
                         }
+                        if (ordinary && batch.foldedLightText) return batch.foldedLightText(child,node,value);
                         return read.call(child, settings.testIdAttribute, secureSelector,
-                            true, false, false, false, false);
+                            true, false, false, false, false, batch, true);
                     });
                 }
-                return metadata;
+                return ordinary ?? sparse(metadata);
             });
-            return JSON.stringify(rows);
+            return pack(rows);
         }"#,
         ]
         .concat()
@@ -5037,10 +5330,33 @@ fn observation_metadata_reader() -> &'static str {
 #[cfg(test)]
 pub(crate) fn metadata_batch_test_reply(params: &Value, rows: Value) -> Value {
     if params["arguments"][0]["value"].is_object() {
-        json!({"result":{"type":"string","value":rows.to_string()}})
+        let indices = rows.as_array().unwrap().iter().enumerate().map(|(i,_)| vec![i]).collect::<Vec<_>>();
+        let encoded = json!({"templates":rows,"attributes":[],"rows":indices}).to_string();
+        json!({"result":{"type":"string","value":encoded}})
     } else {
         json!({"result":{"type":"object","value":rows}})
     }
+}
+
+/// This is an observation projection optimization only. A visible plain span
+/// whose only rendered child supplies nonempty text is retained and owns that
+/// text for either value of onclick. With no class or id there is also no
+/// click-dependent public attribute. Every anonymous control still needs the
+/// real guarded main-world read.
+fn text_owns_click_projection(
+    graph: &author_projection::Graph, backend: i64, row: &metadata_packet::Row,
+    folds: Option<&HashMap<i64, Vec<FoldedText>>>, boundaries: &HashSet<i64>,
+) -> bool {
+    let facts = &row.facts;
+    if facts["author"]["tag"] != "span" || facts["author"]["visible"] != true
+        || facts["author"]["skipsContent"] == true || facts["states"]["secure"] != false
+        || facts["secureDescendants"] == true || facts["redactName"] == true
+        || facts["attributes"].get("id").is_some() || facts["attributes"].get("class").is_some() {
+        return false;
+    }
+    let Some([child]) = folds.and_then(|p| p.get(&backend)).map(Vec::as_slice) else { return false; };
+    graph.uncovered_sole_text(backend, child.backend, boundaries) && matches!(row.folded.as_deref(),
+        Some([metadata_packet::Fold::Text { visible: true, secure: false, text }]) if !text.trim().is_empty())
 }
 
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
@@ -5054,7 +5370,7 @@ async fn read_batch(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
-    pseudos: &PseudoObservation<'_>,
+    pseudos: &PseudoObservation<'_, '_>,
     execution_context: Option<i64>,
     text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
 ) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
@@ -5085,7 +5401,7 @@ async fn read_batch_with_refs(
     lease: &OperationLease,
     bounded: bool,
     acquisition_policy: &SecurityInventory,
-    pseudos: Option<&PseudoObservation<'_>>,
+    pseudos: Option<&PseudoObservation<'_, '_>>,
     execution_context: Option<i64>,
     text_folds: Option<&HashMap<i64, Vec<FoldedText>>>,
 ) -> Result<(Vec<SemanticNode>, Vec<(i64, SemanticNode)>), ObservationError> {
@@ -5117,19 +5433,51 @@ async fn read_batch_with_refs(
             }
         };
         metadata_stage!(Resolve);
-        let backend_ids:Vec<Option<i64>>=nodes.iter().map(|ax|ax.backend_d_o_m_node_id).collect();
-        let resolved:Vec<Result<Value,ObservationError>>=stream::iter(backend_ids.into_iter().map(|backend| {
+        let backend_ids = nodes.iter().map(|ax| ax.backend_d_o_m_node_id.ok_or(ObservationError::StaleReference))
+            .collect::<Result<Vec<_>, _>>()?;
+        let root = pseudos.and_then(|p| p.dom_root["nodeId"].as_i64().filter(|id| *id > 0)
+            .zip(p.dom_root["backendNodeId"].as_i64()));
+        let mut origin_receivers = vec![None; nodes.len()];
+        let light = if let Some((root, doc)) = root.filter(|_| text_folds.is_some() && frame.parent_frame_id.is_none() && nodes.len() >= 64) {
+            let origins = pseudos.ok_or(ObservationError::BackendFailure)?.origins()?;
+            let receivers = backend_ids.iter().enumerate().map(|(index, backend)| {
+                if let Some(origin) = origins.get(backend).filter(|source| matches!(source.pseudo_type.as_str(), "before" | "after" | "marker")) {
+                    origin_receivers[index] = Some(origin.backend);
+                    origin.backend
+                } else { *backend }
+            }).collect::<Vec<_>>();
+            let source = pseudos.ok_or(ObservationError::BackendFailure)?;
+            light_document::LightReceivers::collect(client, frame, context, source.dom_root, &source.light_index, source.inventory.as_ref(), root, doc, &receivers, &group, lease).await?
+        } else { None };
+        // A changing or non-light document can decline the table. Bound
+        // individually resolved handles by the original batch size in that
+        // case, including mixed author/shadow shapes.
+        if nodes.len() > OBSERVATION_METADATA_BATCH_SIZE &&
+            light.as_ref().is_none_or(|table| table.slots.iter().filter(|slot| slot.is_none()).count() > OBSERVATION_METADATA_BATCH_SIZE) {
+            let mut all = Vec::with_capacity(nodes.len()); let mut folded = Vec::new();
+            for chunk in nodes.chunks(OBSERVATION_METADATA_BATCH_SIZE) {
+                let (batch, text) = Box::pin(read_batch_with_refs(client, frame, chunk, refs.as_deref_mut(),
+                    revision, options, lease, bounded, acquisition_policy, pseudos, Some(context), text_folds)).await?;
+                all.extend(batch); folded.extend(text);
+            }
+            return Ok((all, folded));
+        }
+        let resolved:Vec<Result<Option<Value>,ObservationError>>=stream::iter(backend_ids.clone().into_iter().enumerate().map(|(index,backend)| {
+            let known = light.as_ref().is_some_and(|light| light.slots[index].is_some());
             let group=&group;
             async move {
                 // Every candidate carries the backend id its tree listed. A
                 // missing one is the same lost node as an unresolvable id.
-                let backend = backend.ok_or(ObservationError::StaleReference)?;
-                resolve_page_object(client,session,backend,Some(context),group,lease).await
+                if known { return Ok(None); }
+                resolve_page_object(client,session,backend,Some(context),group,lease).await.map(Some)
             }
         })).buffered(16).collect().await;
         let resolved=collect_hint_results(resolved)?;
         metadata_stage!(PseudoInventory);
-        let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
+        let has_pseudo = resolved.iter().enumerate().any(|(index, value)| match value {
+            Some(value) => value["object"]["subtype"] != "node",
+            None => origin_receivers[index].is_some(),
+        });
         let owned_origins;
         let origins = match (has_pseudo, pseudos) {
             (true, Some(pseudos)) => pseudos.origins()?,
@@ -5148,7 +5496,7 @@ async fn read_batch_with_refs(
         // resolve them in bounded batches; a per-receiver sequence paid two
         // serialized round trips each, so a pseudo-heavy page spent much of its
         // metadata time waiting rather than reading.
-        let pseudo_indices:Vec<usize>=nodes.iter().enumerate().filter(|(index,_)|resolved[*index]["object"]["subtype"]!="node").map(|(index,_)|index).collect();
+        let pseudo_indices:Vec<usize>=nodes.iter().enumerate().filter(|(index,_)|resolved[*index].as_ref().is_some_and(|value|value["object"]["subtype"]!="node")).map(|(index,_)|index).collect();
         let mut described=Vec::with_capacity(pseudo_indices.len());
         for chunk in pseudo_indices.chunks(16){
             let futures=chunk.iter().map(|index|{
@@ -5164,7 +5512,7 @@ async fn read_batch_with_refs(
         let described=collect_hint_results(described)?;
         let mut proven=Vec::with_capacity(pseudo_indices.len());
         for (index,described) in pseudo_indices.iter().zip(&described){
-            let remote=&resolved[*index]["object"];
+            let remote=&resolved[*index].as_ref().ok_or(ObservationError::BackendFailure)?["object"];
             let backend=nodes[*index].backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
             #[cfg(test)]
             eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&nodes[*index].role).as_deref()==Some("ListMarker"));
@@ -5187,14 +5535,15 @@ async fn read_batch_with_refs(
         for ((index,origin),owner) in pseudo_indices.iter().zip(proven).zip(owners){by_index.insert(*index,(origin,owner));}
         let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
         for (index,value) in resolved.iter().enumerate(){
+            let Some(value) = value else { objects.push(None); pseudo.push(origin_receivers[index]); continue };
             let remote=&value["object"];
-            if remote["subtype"]=="node" { objects.push(remote["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(None);continue; }
+            if remote["subtype"]=="node" { objects.push(Some(remote["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned()));pseudo.push(None);continue; }
             let (origin,owner)=by_index.remove(&index).ok_or(ObservationError::BackendFailure)?;
-            objects.push(owner);pseudo.push(Some(origin));
+            objects.push(Some(owner));pseudo.push(Some(origin));
         }
         metadata_stage!(ReceiverPolicy);
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
-        arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
+        arguments.extend(objects.iter().flatten().map(|o|json!({"objectId":o})));
         let protected_editors = metadata_receiver_protection(nodes, &pseudo, acquisition_policy)?;
         let focused_receivers = metadata_receiver_focus(nodes, &pseudo, acquisition_policy)?;
         let simple_name_inventory = acquisition_policy.simple_name_inventory;
@@ -5230,6 +5579,7 @@ async fn read_batch_with_refs(
                 "focusedReceivers": focused_receivers,
                 "localNameInventory": local_name_inventory,
                 "folds": plans,
+                "slots": light.as_ref().map(|receivers| &receivers.slots),
             }});
             observation_metadata_reader().to_owned()
         } else {
@@ -5239,45 +5589,117 @@ async fn read_batch_with_refs(
             format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; const localNameInventory={local_name_inventory}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index],localNameInventory[index])); }}")
         };
         metadata_stage!(ReadCall);
-        let mut result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
+        let receiver = light.as_ref().map(|l| &l.handle).or_else(||objects.first()?.as_ref())
+            .ok_or(ObservationError::BackendFailure)?;
+        if let Some(start) = pseudos.and_then(|p| p.start_ax) { start.notify_one(); }
+        let mut result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":receiver,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
-            diagnostic_receivers(client,session,&objects,lease).await;
+            diagnostic_receivers(client,session,&objects.iter().flatten().cloned().collect::<Vec<_>>(),lease).await;
             return Err(ObservationError::BackendFailure);
         }
         metadata_stage!(ReadResult);
         check(lease)?;
-        let mut values: Vec<Value> = match (text_folds.is_some(), result["result"]["value"].take()) {
+        let mut values = match (text_folds.is_some(), result["result"]["value"].take()) {
             // Encode in the verified isolated realm so DevTools transfers one
             // value instead of serializing every field of every metadata row.
-            (true, Value::String(encoded)) => serde_json::from_str(&encoded)
-                .map_err(|_| ObservationError::BackendFailure)?,
-            (false, Value::Array(values)) => values,
+            (true, Value::String(encoded)) => metadata_packet::decode(&encoded, nodes.len())?,
+            (false, Value::Array(values)) => values.into_iter().map(metadata_packet::plain).collect::<Result<_,_>>()?,
             _ => return Err(ObservationError::BackendFailure),
         };
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
+        let axes = match pseudos.and_then(|source| source.ax.as_ref()) {
+            Some(read) => Some(read.clone().await?),
+            None => None,
+        };
+        let current_axes: Vec<_> = nodes.iter().map(|ax| {
+            ax.backend_d_o_m_node_id.and_then(|id| axes.as_ref()?.get(&id)).unwrap_or(*ax)
+        }).collect();
+        let nodes = current_axes.as_slice();
         // Own the bounded descriptors before entering the async stream. Nested
         // borrowed filter/zip iterators are not sufficiently general for the
         // Send future required by the spawned operation dispatcher.
         metadata_stage!(HandlerHints);
         let mut hint_candidates = Vec::new();
+        let mut light_candidates = Vec::new();
+        let mut light_members = Vec::new();
+        // A block cannot be covered from above. If it also has no rendered
+        // text child it cannot consume a descendant's direct text line.
+        let graph = pseudos.and_then(|p|p.graph).filter(|_| acquisition_policy.simple_name_inventory
+            && acquisition_policy.ancestors.is_empty() && acquisition_policy.label_ids.is_empty());
+        let boundaries = graph.map(|graph| backend_ids.iter().copied().zip(&values).filter_map(|(id, row)| {
+            let author = &row.facts["author"];
+            (author["nodeType"] == 1 && author["inline"] != true && !graph.has_rendered_text_child(id)).then_some(id)
+        }).collect::<HashSet<_>>()).unwrap_or_default();
         for index in 0..nodes.len() {
-            if pseudo[index].is_none() && values[index]["handlerProbe"] == true {
+            if pseudo[index].is_none() && values[index].facts["handlerProbe"] == true {
                 let backend = nodes[index].backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
-                hint_candidates.push((index,backend,objects[index].clone()));
+                if let Some(graph) = graph {
+                    if text_owns_click_projection(graph, backend, &values[index], text_folds, &boundaries) {
+                        continue;
+                    }
+                }
+                if let Some(member) = light.as_ref().and_then(|held| held.member(index)) {
+                    light_candidates.push((index, backend));
+                    light_members.push((backend, member));
+                } else {
+                    hint_candidates.push((index, backend, objects[index].clone().ok_or(ObservationError::BackendFailure)?));
+                }
             }
         }
         // One native batch proves every hinted receiver, reads every main-world
         // onclick hint and re-proves the receivers. A per-node sequence would
         // pay seven renderer round trips for each hinted inline element.
-        let hints = if hint_candidates.is_empty() {
-            Vec::new()
-        } else {
-            main_onclick_hints(client, frame, hint_candidates, lease).await?
-        };
-        // A proved main-world handler is the same action evidence the direct
-        // snapshot reads from `onclick`; keep such a node addressable too.
-        for (index,hint) in hints { if hint { values[index]["author"]["action"]=json!(true); values[index]["author"]["clickable"]=json!(true); } }
+        // Native projection has no browser side effects. On a dense batch it
+        // can consume the immutable values on a CPU thread while the renderer
+        // confirms onclick on the exact main-world nodes. No authority is
+        // issued until every read (including cleanup) has settled.
+        let task = if text_folds.is_some() && values.len() >= 128 && (!light_candidates.is_empty() || !hint_candidates.is_empty()) {
+            let values = std::mem::take(&mut values);
+            let backends = backend_ids;
+            let source = axes.clone();
+            let fallback = source.is_none().then(|| nodes.iter().map(|ax|(**ax).clone()).collect::<Vec<_>>());
+            let origins = pseudo.clone();
+            let frame = frame.clone();
+            Some(tokio::task::spawn_blocking(move || {
+                let mut memo = HashMap::new();
+                let projected = backends.iter().enumerate().map(|(i, backend)| {
+                    let synthetic;
+                    let ax = match source.as_ref().and_then(|map|map.get(backend)).or_else(||fallback.as_ref().map(|rows|&rows[i])) {
+                        Some(ax) => ax,
+                        None => {synthetic=synthetic_ax(*backend); &synthetic}
+                    };
+                    prepare_projection(&frame, ax, &values[i], origins[i], revision, bounded, &mut memo)
+                }).collect::<Result<Vec<_>, ObservationError>>();
+                (values, projected)
+            }))
+        } else { None };
+        let hint_result = async {
+            let mut hints = if hint_candidates.is_empty() { Vec::new() } else {
+                main_onclick_hints(client, frame, hint_candidates, lease).await?
+            };
+            if !light_candidates.is_empty() {
+                let doc = &light.as_ref().ok_or(ObservationError::BackendFailure)?.document;
+                hints.extend(read_onclick_hints(client, frame, light_candidates, HintMembership::Light(doc, light_members), lease).await?);
+            }
+            Ok::<_, ObservationError>(hints)
+        }.await;
+        let computed = if let Some(task) = task { Some(task.await) } else { None };
+        let mut positive = HashSet::new();
+        let hints = hint_result?;
+        let mut prepared = if let Some(computed) = computed {
+            let (original, nodes) = computed.map_err(|_| ObservationError::BackendFailure)?;
+            values = original;
+            Some(nodes?)
+        } else { None };
+        for (index, hint) in hints {
+            if hint {
+                let facts = std::sync::Arc::make_mut(&mut values[index].facts);
+                facts["author"]["action"] = json!(true);
+                facts["author"]["clickable"] = json!(true);
+                positive.insert(index);
+            }
+        }
         metadata_stage!(PseudoRevalidation);
         // An observation-supplied inventory already proves this document's
         // secure ancestry and labels; the per-batch inventory would re-read the
@@ -5311,7 +5733,7 @@ async fn read_batch_with_refs(
                     if let Some(origin)=origin {
                         let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
                         let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
-                        if verified_pseudo_origin(&remote["object"],&described,backend,&current)?!=*origin{return Err(ObservationError::StaleReference);}
+                        if verified_pseudo_origin(&remote.as_ref().ok_or(ObservationError::BackendFailure)?["object"],&described,backend,&current)?!=*origin{return Err(ObservationError::StaleReference);}
                     }
                 }
             }
@@ -5319,34 +5741,48 @@ async fn read_batch_with_refs(
         // The originating element supplies security policy only. Identity stays
         // the native pseudo backend, never the origin's DOM reference.
         metadata_stage!(Projection);
-        let main_nodes = nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
-            let pseudo_metadata;
-            let readonly = if origin.is_some() {
-                pseudo_metadata = readonly_pseudo_metadata(data, ax);
-                &pseudo_metadata
+        let mut projections = HashMap::new();
+        let mut main_nodes = Vec::with_capacity(nodes.len());
+        for (i, ((ax, data), origin)) in nodes.iter().zip(&values).zip(pseudo).enumerate() {
+            let backend = ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+            let mut node = if let Some(prepared) = prepared.as_mut().filter(|_| !positive.contains(&i)) {
+                std::mem::take(&mut prepared[i])
             } else {
-                data
+                prepare_projection(frame, ax, data, origin, revision, bounded, &mut projections)?
             };
-            let mut node=match refs.as_deref_mut() {
-                Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,readonly,bounded),
-                None=>project_node_with_refs(frame,ax.backend_d_o_m_node_id.unwrap(),ax,None,revision,readonly,bounded),
-            }?;
-            if let (Some(origin),Some(policy))=(origin,policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
-            Ok(node)
-        }).collect::<Result<Vec<_>,ObservationError>>()?;
+            if let Some(refs) = refs.as_deref_mut() {
+                node.reference = issue_projection_ref(frame, backend, node.role.as_deref(), node.author.as_ref(), refs, origin.is_some())?;
+            }
+            if let (Some(origin), Some(policy)) = (origin, policy) {
+                apply_security(&mut node, origin, policy);
+                if node.states.get("secure") == Some(&true) { scrub_content(&mut node); }
+            }
+            main_nodes.push(node);
+        }
         let mut folded_nodes = Vec::new();
         if let Some(folds) = text_folds {
             for (index, ax) in nodes.iter().enumerate() {
                 let backend = ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
                 let Some(list) = folds.get(&backend) else { continue };
-                let data = values[index]
-                    .get("__nativeFolded")
-                    .and_then(Value::as_array)
-                    .ok_or(ObservationError::BackendFailure)?;
-                if data.len() != list.len() {
-                    return Err(ObservationError::BackendFailure);
-                }
-                for (fold, value) in list.iter().zip(data) {
+                let data = values[index].folded.as_ref().ok_or(ObservationError::BackendFailure)?;
+                if data.len()!=list.len() {return Err(ObservationError::BackendFailure);}
+                for (fold, row) in list.iter().zip(data) {
+                    if pseudos.is_some_and(|p|p.ax.is_some()) {
+                        if let metadata_packet::Fold::Text {visible,secure,text} = row {
+                            let author = author_projection::Facts {node_type:3, visible:*visible, text:text.clone(), ..Default::default()};
+                            let mut leaf = SemanticNode {author:Some(author), ..Default::default()};
+                            if *secure {leaf.states.insert("secure".into(),true);}
+                            if let Some(refs) = refs.as_deref_mut() {
+                                leaf.reference = issue_projection_ref(frame, fold.backend, Some("text"), leaf.author.as_ref(), refs, false)?;
+                            }
+                            if let Some(policy) = policy {apply_security(&mut leaf,fold.backend,policy);}
+                            folded_nodes.push((fold.backend,leaf));
+                            continue;
+                        }
+                    }
+                    let storage = row.full();
+                    let value = storage.as_ref();
+                    let actual_ax = axes.as_ref().and_then(|rows|rows.get(&fold.backend)).unwrap_or(&fold.ax);
                     match value["__nativeStatus"].as_str() {
                         Some("fallback") => {
                             // A changed childNodes position or value is read
@@ -5356,7 +5792,7 @@ async fn read_batch_with_refs(
                                 client,
                                 session,
                                 frame,
-                                fold,
+                                fold, actual_ax,
                                 refs.as_deref_mut(),
                                 revision,
                                 options,
@@ -5380,10 +5816,7 @@ async fn read_batch_with_refs(
                         Some(_) => return Err(ObservationError::BackendFailure),
                         None => {}
                     }
-                    let mut node = match refs.as_deref_mut() {
-                        Some(refs)=>project_node(frame, fold.backend, &fold.ax, refs, revision, value, bounded),
-                        None=>project_node_with_refs(frame, fold.backend, &fold.ax, None, revision, value, bounded),
-                    }?;
+                    let mut node=project_node_with_refs(frame,fold.backend,actual_ax,refs.as_deref_mut(),revision,value,bounded)?;
                     if let Some(policy) = policy {
                         apply_security(&mut node, fold.backend, policy);
                         if node.states.get("secure") == Some(&true) {
@@ -5420,6 +5853,7 @@ async fn read_folded_text_fallback(
     session: &str,
     frame: &ObservationFrame,
     fold: &FoldedText,
+    actual_ax: &AXNode,
     refs: Option<&mut RefMap>,
     revision: u64,
     options: &ObservationOptions,
@@ -5458,9 +5892,9 @@ async fn read_folded_text_fallback(
         None => {}
     }
     match refs {
-        Some(refs) => project_node(frame, fold.backend, &fold.ax, refs, revision, data, bounded),
+        Some(refs) => project_node(frame, fold.backend, actual_ax, refs, revision, data, bounded),
         None => {
-            project_node_with_refs(frame, fold.backend, &fold.ax, None, revision, data, bounded)
+            project_node_with_refs(frame, fold.backend, actual_ax, None, revision, data, bounded)
         }
     }
 }
@@ -5548,7 +5982,7 @@ async fn root_document_dom(
     )
     .await?;
     let backend = document_backend(&document["root"])?;
-    let described = command(
+    let mut described = command(
         client,
         &frame.binding.session,
         "DOM.describeNode",
@@ -5565,7 +5999,9 @@ async fn root_document_dom(
     if !root["children"].is_array() {
         return Err(ObservationError::BackendFailure);
     }
-    Ok(json!({"root":root}))
+    let mut result = serde_json::Map::new();
+    result.insert("root".into(), described["node"].take());
+    Ok(Value::Object(result))
 }
 
 fn document_backend(node: &Value) -> Result<i64, ObservationError> {
@@ -6842,10 +7278,36 @@ async fn security_inventory_for_roots(
     ids: Vec<i64>,
     execution_context: Option<i64>,
 ) -> Result<SecurityInventory, ObservationError> {
+    let domains = SecurityDomains::read(&dom["root"], &ids)?;
+    live_security_inventory(client, frame, options, lease, &ids, &domains, execution_context).await
+}
+
+/// Only these facts are a function of the native structural document. Focus,
+/// secret-bearing receivers and names remain live and operation-scoped.
+struct SecurityDomains {
+    internal: HashSet<i64>,
+    simple: bool,
+    local_names: HashSet<i64>,
+}
+
+impl SecurityDomains {
+    fn read(root: &Value, ids: &[i64]) -> Result<Self, ObservationError> {
+        let internal = browser_internal_ids(root)?;
+        let simple = simple_name_inventory(root, ids, &internal);
+        let local_names = local_name_inventory(root)?;
+        Ok(Self {
+            internal,
+            simple,
+            local_names,
+        })
+    }
+}
+
+async fn live_security_inventory(client: &CdpClient, frame: &ObservationFrame, options: &ObservationOptions,
+    lease: &OperationLease, ids: &[i64], domains: &SecurityDomains, execution_context: Option<i64>)
+    -> Result<SecurityInventory, ObservationError> {
     use futures_util::{stream, StreamExt};
-    let browser_internal = browser_internal_ids(&dom["root"])?;
-    let simple_name_inventory = simple_name_inventory(&dom["root"], &ids, &browser_internal);
-    let local_name_inventory = local_name_inventory(&dom["root"])?;
+    let browser_internal = &domains.internal;
     let author_roots: Vec<bool> = ids
         .iter()
         .map(|id| !browser_internal.contains(id))
@@ -6863,7 +7325,7 @@ async fn security_inventory_for_roots(
                 world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?
             }
         };
-        let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
+        let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend|{let group=&group;async move{
             let object=resolve_page_object(client,session,backend,Some(context),group,lease).await?;
             object["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)
         }})).buffered(16).collect().await;
@@ -6877,7 +7339,7 @@ async fn security_inventory_for_roots(
         let handles=focused.into_iter().map(|object|(true,object)).chain(ancestors.into_iter().map(|object|(false,object)));
         let descriptions:Vec<Result<(bool,Value),ObservationError>>=stream::iter(handles.map(|(focused,object)|async move{Ok((focused,command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await?))})).buffered(16).collect().await;
         let descriptions=collect_hint_results(descriptions)?;
-        let mut security=SecurityInventory { browser_internal, simple_name_inventory, local_name_inventory, ..Default::default() };
+        let mut security=SecurityInventory { browser_internal: domains.internal.clone(), simple_name_inventory: domains.simple, local_name_inventory: domains.local_names.clone(), ..Default::default() };
         for (focused,description) in descriptions{
             let node=&description["node"];
             let backend=node["backendNodeId"].as_i64().filter(|id|*id>0).ok_or(ObservationError::BackendFailure)?;
@@ -7142,6 +7604,48 @@ pub(crate) async fn project_observe_geometry(
         origin: NodeGeometryOrigin::ReferenceBinding,
         negatives: vec![],
     })?;
+    // A native document query names connected elements in its light tree. Read
+    // their exact CDP border boxes by backend ID and prove the same native
+    // membership afterwards. This removes a separate JS handle, two receiver
+    // calls, a frame check and a group release for every ordinary box.
+    let mut batched = HashMap::new();
+    let mut requests = requests;
+    let main = requests.first().and_then(|(_, frame, _, _)| {
+        (requests.len() >= 16 && frame.parent_frame_id.is_none() &&
+            requests.iter().all(|(_, other, _, _)| other.binding == frame.binding)).then(|| frame.clone())
+    });
+    let root_backend = nodes.first().filter(|node| nodes.len() == 1 && node.role.as_deref() == Some("document"))
+        .and_then(|node| super::element::parse_ref(&node.reference.id)).and_then(|id| refs.get(&id))
+        .and_then(|entry| entry.backend_node_id);
+    if let Some((frame, backend)) = main.zip(root_backend) {
+        let failure = |error| ObserveGeometryFailure {
+            error: super::client_geometry::hidden_proof_error(error),
+            origin: NodeGeometryOrigin::FrameBinding,
+            negatives: vec![],
+        };
+        let document = light_document::LightDocument::for_backend(client, &frame, backend, refs.observed_dom.as_ref(), lease).await.map_err(failure)?;
+        let backends: Vec<_> = requests.iter().map(|(_, _, backend, _)| *backend).collect();
+        let frontend = document.connected_elements(client, &frame, &backends, lease).await.map_err(failure)?;
+        let light: Vec<_> = requests.iter().zip(&frontend).filter_map(|((id, _, backend, _), member)| {
+            member.map(|member| (id.clone(), *backend, member))
+        }).collect();
+        let members = light.iter().map(|(_, backend, member)| (*backend, *member)).collect::<Vec<_>>();
+        let results = stream::iter(light.into_iter().map(|(id, backend, _)| {
+            let frame = &frame;
+            async move {
+                let b = geometry.light_semantic_bounds(client, frame, backend, lease).await?.bounds();
+                Ok::<_, GeometryError>((id, Rect { x: b.x, y: b.y, width: b.width, height: b.height }))
+            }
+        })).buffered(16).collect::<Vec<_>>().await;
+        for result in results {
+            let (id, rect) = result.map_err(|error| ObserveGeometryFailure {
+                error, origin: NodeGeometryOrigin::BoxRead, negatives: vec![],
+            })?;
+            batched.insert(id, rect);
+        }
+        document.confirm(client, &frame, &members, lease).await.map_err(failure)?;
+        requests.retain(|(id, _, _, _)| !batched.contains_key(id));
+    }
     let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend, realm)| async move {
         let mut evidence = SemanticNodeReadEvidence {
             realm: Some(realm),
@@ -7178,7 +7682,8 @@ pub(crate) async fn project_observe_geometry(
     .buffered(SEMANTIC_GEOMETRY_FANOUT)
     .collect::<Vec<_>>()
     .await;
-    let rectangles = merge_observe_rectangles(rectangles)?;
+    let mut rectangles = merge_observe_rectangles(rectangles)?;
+    rectangles.extend(batched);
     fn apply(nodes: &mut [SemanticNode], rectangles: &HashMap<String, Rect>) {
         for node in nodes {
             if let Some(rect) = rectangles.get(&node.reference.id) {
@@ -12932,6 +13437,7 @@ mod tests {
                                     "focusedReceivers":[false,true],
                                     "localNameInventory":[false,false],
                                     "folds":[[],[[1,"folded",6]]],
+                                    "slots":Value::Null,
                                 }},
                                 {"value":"input[type=\"password\" i]"},
                                 {"objectId":"native-42"},{"objectId":"native-43"}
@@ -12940,8 +13446,7 @@ mod tests {
                         assert_eq!(diagnostic_site(&request["params"]), "metadata-batch");
                         let mut second = metadata();
                         second["__nativeFolded"] = json!([metadata()]);
-                        let encoded = serde_json::to_string(&[metadata(), second]).unwrap();
-                        json!({"result":{"type":"string","value":encoded}})
+                        metadata_batch_test_reply(&request["params"], json!([metadata(), second]))
                     }
                     "Runtime.releaseObjectGroup" => json!({}),
                     _ => panic!("unexpected metadata command"),
@@ -13896,8 +14401,13 @@ mod tests {
             }]
         });
         let pseudos = PseudoObservation {
+            ax: None,
+            start_ax: None,
+            graph: None,
+            inventory: None,
             dom_root: &dom_root,
-            origins: std::sync::OnceLock::new(),
+            origins: Default::default(),
+            light_index: Default::default(),
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let options = ObservationOptions::default();
@@ -13997,8 +14507,13 @@ mod tests {
         let (lease, _sender) = lease();
         let mut refs = observed_refs();
         let pseudos = PseudoObservation {
+            ax: None,
+            start_ax: None,
+            graph: None,
+            inventory: None,
             dom_root: &Value::Null,
-            origins: std::sync::OnceLock::new(),
+            origins: Default::default(),
+            light_index: Default::default(),
             deferred: std::sync::Mutex::new(Vec::new()),
         };
         let options = ObservationOptions::default();
@@ -14079,7 +14594,7 @@ mod tests {
             });
             let client = CdpClient::connect(&endpoint).await.unwrap();
             let (lease, _sender) = lease();
-            let result = revalidate_deferred_pseudos(&client, &frame(), &[(3, 2)], &lease).await;
+            let result = revalidate_deferred_pseudos(&client, &frame(), &[(3, 2)], None, None, None, &lease).await;
             assert_eq!(result, expected, "{mode}");
             drop(client);
             tokio::time::timeout(std::time::Duration::from_secs(2), server)

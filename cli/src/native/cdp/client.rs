@@ -72,6 +72,7 @@ struct DisposalWork {
 }
 
 struct PendingResponse {
+    observation_ax: Option<super::observation_ax::Capture>,
     sender: oneshot::Sender<CommandReply>,
     session: Option<String>,
 }
@@ -889,6 +890,7 @@ type OwnedCdpSocket = Arc<socket2::Socket>;
 type OwnedCdpSocket = socket2::Socket;
 
 struct CdpTransport {
+    frontend_dom_epoch: Arc<super::dom_epoch::DomEpoch>,
     ws_tx: WsTx,
     socket: OwnedCdpSocket,
     #[cfg(all(test, target_os = "linux"))]
@@ -1043,6 +1045,8 @@ impl CdpClient {
         let debt_owner: DebtOwner = Arc::default();
         let tracked_reader = tracked_responses.clone();
         let debt_reader = debt_owner.clone();
+        let frontend_dom_epoch = Arc::new(super::dom_epoch::DomEpoch::default());
+        let reader_dom_epoch = Arc::clone(&frontend_dom_epoch);
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
         let closed = Arc::new(AtomicBool::new(false));
@@ -1156,6 +1160,7 @@ impl CdpClient {
                     Ok(Message::Binary(data)) => match String::from_utf8(data) {
                         Ok(text) => text,
                         Err(_) => {
+                            reader_dom_epoch.stop();
                             if let Some(ledger) = debt_reader
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
@@ -1211,7 +1216,17 @@ impl CdpClient {
                     });
                 }
 
-                let parsed: CdpMessage = match serde_json::from_str(&msg) {
+                // Native observation alone asks for typed AX. A canonical
+                // successful unowned-data reply goes through the normal ACK
+                // ledger and waiter before the typed rows can be consumed.
+                let typed = if msg.len() >= 4096 {
+                    if let Some(id)=super::observation_ax::leading_id(&msg) {
+                        let target=pending_clone.lock().await.get(&id).and_then(|waiter|
+                            Some((waiter.observation_ax.clone()?,waiter.session.clone()?)));
+                        target.and_then(|(capture,session)|capture.decode(&msg,id,&session))
+                    } else {None}
+                } else {None};
+                let parsed: CdpMessage = match typed.map(Ok).unwrap_or_else(||serde_json::from_str(&msg)) {
                     Ok(parsed) => parsed,
                     Err(_) => {
                         let repaired = sanitize_lone_surrogates(&msg);
@@ -1219,6 +1234,7 @@ impl CdpClient {
                         match serde_json::from_str(candidate) {
                             Ok(parsed) => parsed,
                             Err(error) => {
+                                reader_dom_epoch.stop();
                                 // Even an uncorrelated malformed frame damages
                                 // the stream. A missing/unknown ID is no pardon.
                                 if let Some(ledger) = debt_reader
@@ -1281,6 +1297,7 @@ impl CdpClient {
                         && parsed.params.as_ref().is_none_or(Value::is_object)
                 };
                 if !valid_envelope {
+                    reader_dom_epoch.stop();
                     if let Some(ledger) = debt_reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
@@ -1332,6 +1349,7 @@ impl CdpClient {
                         }
                     }
                 } else if let Some(ref method) = parsed.method {
+                    reader_dom_epoch.event(method);
                     // Event
                     let event = CdpEvent {
                         method: method.clone(),
@@ -1375,6 +1393,7 @@ impl CdpClient {
                 }
             }
 
+            reader_dom_epoch.stop();
             // Reader loop exited (connection closed or error). Drop all pending
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
@@ -1439,6 +1458,7 @@ impl CdpClient {
         Ok(Self {
             owner: None,
             transport: Arc::new(CdpTransport {
+                frontend_dom_epoch,
                 ws_tx,
                 socket,
                 #[cfg(all(test, target_os = "linux"))]
@@ -3170,6 +3190,7 @@ impl CdpClient {
         stop: &mut AdmissionObservation,
     ) -> Result<CommandResponse, String> {
         use crate::native::client_observation::query_diagnostic::commands::Timer;
+        self.transport.frontend_dom_epoch.command(method);
         let mut timing = Timer::start(method);
         let id = self.next_command_id()?;
 
@@ -3210,6 +3231,7 @@ impl CdpClient {
             pending.insert(
                 id,
                 PendingResponse {
+                    observation_ax: super::observation_ax::Capture::for_command(&cmd.method),
                     sender: tx,
                     session: cmd.session_id.clone(),
                 },
@@ -3333,6 +3355,10 @@ impl CdpClient {
                 Err(CommandWaitFailure::Deadline)
             }
         }
+    }
+
+    pub(crate) fn frontend_dom_epoch(&self) -> Arc<super::dom_epoch::DomEpoch> {
+        Arc::clone(&self.transport.frontend_dom_epoch)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
@@ -3510,6 +3536,7 @@ impl CdpClient {
     /// Create a lightweight handle for the inspect WebSocket proxy.
     /// Contains only what's needed to forward messages bidirectionally.
     pub fn inspect_handle(&self) -> InspectProxyHandle {
+        self.transport.frontend_dom_epoch.stop();
         InspectProxyHandle {
             ws_tx: self.transport.ws_tx.clone(),
             raw_tx: self.transport.raw_tx.clone(),
@@ -3652,6 +3679,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
+        self.transport.frontend_dom_epoch.command(method);
         let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
         let budget = reservation
             .as_ref()
@@ -3683,6 +3711,7 @@ impl CdpClient {
     /// Send raw JSON through the WebSocket without tracking a response.
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
+        self.transport.frontend_dom_epoch.invalidate();
         if self.debt_ledger().is_some() {
             return Err("Raw CDP writes are not admitted by the native owner".to_string());
         }
@@ -7816,6 +7845,7 @@ mod tests {
             pending.lock().await.insert(
                 id,
                 PendingResponse {
+                    observation_ax: None,
                     sender,
                     session: session.map(str::to_owned),
                 },

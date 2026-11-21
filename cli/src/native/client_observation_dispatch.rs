@@ -2621,7 +2621,11 @@ impl ObservationDispatch {
                 same_frames(&frames, &current).map_err(failure)?;
                 Ok::<_, DispatchFailure>(values)
             };
-            let values = if let Some((frame, realm)) = single {
+            let values = if let Some((frame, mut realm)) = single {
+                {
+                    let refs=self.refs.lock().map_err(|_|failure(ProtocolError::ScopeUnavailable))?;
+                    realm.use_inventory(&refs,&identity);
+                }
                 let sample = observation::query_diagnostic::field_command_scope(
                     field_witness.as_ref(),
                     realm.fields(&read.options, &read.fields, field_witness.as_ref()),
@@ -2879,7 +2883,7 @@ impl ObservationDispatch {
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                     let root = exact_root(tree.roots, &staged, &frozen)?;
-                    verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
+                    verify_document_root(&capture_context.page, &root, &staged, &operation, &map_observation).await?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticFinalViewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     Ok((json!({"identityScope":identity,"revision":revision.to_string(),"root":root,
@@ -2962,7 +2966,7 @@ impl ObservationDispatch {
                             witness.enter(ObserveFailureStage::DocumentRoot);
                             screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                             let root = exact_root(tree.roots, &staged, &frozen)?;
-                            verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
+                            verify_document_root(&capture_context.page, &root, &staged, &operation, &map_observation).await?;
                             (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
                         }
                         Err(ObservationError::DeadlineExceeded) if request.options.pixel_fallback => {
@@ -4889,11 +4893,16 @@ async fn verify_document_root(
     root: &SemanticNode,
     refs: &RefMap,
     operation: &OperationLease,
+    map_observation: impl Fn(ObservationError) -> ProtocolError,
 ) -> Result<(), ProtocolError> {
-    let backend = parse_ref(&root.reference.id)
-        .and_then(|id| refs.get(&id))
-        .and_then(|entry| entry.backend_node_id)
-        .ok_or(ProtocolError::StaleReference)?;
+    let entry = parse_ref(&root.reference.id).and_then(|id| refs.get(&id)).ok_or(ProtocolError::StaleReference)?;
+    let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
+    if let Some(binding) = entry.exact_binding.as_ref().filter(|binding| {
+        refs.observed_dom.as_ref().is_some_and(|inventory|
+            inventory.bound_root(&page.client, &page.identity_scope, operation.generation, binding, backend))
+    }) {
+        return observation::document_inventory::verify_active_root(&page.client, binding, backend, operation).await.map_err(map_observation);
+    }
     let value = command(
         page,
         operation,

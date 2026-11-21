@@ -179,7 +179,7 @@ pub struct ViewportReference {
 struct DocumentRefs {
     session: String,
     loader: String,
-    refs: HashMap<DurableRefKey, DurableRef>,
+    refs: Arc<HashMap<DurableRefKey, DurableRef>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,8 @@ pub(crate) const MAX_RETAINED_QUERY_ORIGIN_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RefMap {
-    map: HashMap<String, RefEntry>,
+    pub(super) observed_dom: Option<super::client_observation::document_inventory::DocumentInventory>,
+    map: Arc<HashMap<String, RefEntry>>,
     exact_ref_limit: usize,
     query_origin_byte_limit: usize,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
@@ -229,7 +230,7 @@ impl LocatedBatch<'_> {
         let id = self.refs.try_allocate_ref()?;
         self.remaining_entries -= 1;
         self.remaining_source_bytes -= bytes;
-        self.refs.map.insert(
+        Arc::make_mut(&mut self.refs.map).insert(
             id.clone(),
             RefEntry {
                 lifetime: RefLifetime::Located(issuance),
@@ -254,7 +255,8 @@ impl LocatedBatch<'_> {
 impl RefMap {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            observed_dom: None,
+            map: Default::default(),
             exact_ref_limit: MAX_EXACT_REFERENCES,
             query_origin_byte_limit: MAX_RETAINED_QUERY_ORIGIN_BYTES,
             documents: HashMap::new(),
@@ -284,7 +286,7 @@ impl RefMap {
         nth: Option<usize>,
         frame_id: Option<&str>,
     ) {
-        self.map.insert(
+        Arc::make_mut(&mut self.map).insert(
             ref_id,
             RefEntry {
                 lifetime: RefLifetime::Observed,
@@ -308,7 +310,7 @@ impl RefMap {
     /// used for actions that select a concrete DOM node before interacting;
     /// falling back by role/name could silently target a different element.
     pub fn add_exact_backend_node(&mut self, ref_id: String, backend_node_id: i64) {
-        self.map.insert(
+        Arc::make_mut(&mut self.map).insert(
             ref_id,
             RefEntry {
                 lifetime: RefLifetime::Observed,
@@ -382,41 +384,29 @@ impl RefMap {
             live_query.as_ref(),
             kind,
         )?;
-        self.observe_document(
-            &binding.page_session,
-            Some(&binding.frame),
-            &binding.session,
-            Some(&binding.loader),
-        );
-        let key = (backend_node_id, live_query.clone());
         let document_key = (binding.page_session.clone(), Some(binding.frame.clone()));
-        let existing = self
-            .documents
-            .get(&document_key)
-            .and_then(|document| document.refs.get_key_value(&key));
-        let publication = self.observed_publication.as_ref();
-        let compatible = existing.filter(|(_, prior)| prior.compatible(kind, publication));
-        let (identity, live_query) = match compatible {
-            Some(((_, origin), identity)) => (identity.clone(), origin.clone()),
-            None => (
-                DurableRef {
-                    id: self.try_allocate_ref()?,
-                    issuance: publication.cloned(),
-                    kind,
-                },
-                live_query,
-            ),
-        };
-        let id = identity.id.clone();
-        let observed_issuance = identity.issuance.clone();
-        let observed_membership = publication.map(|publication| publication.revision);
+        if self.documents.get(&document_key).is_none_or(|doc|
+            doc.session != binding.session || doc.loader != binding.loader) {
+            self.observe_document(&binding.page_session, Some(&binding.frame),
+                &binding.session, Some(&binding.loader));
+        }
         let key = (backend_node_id, live_query.clone());
-        self.documents
-            .get_mut(&document_key)
-            .expect("observed document")
-            .refs
-            .insert(key, identity);
-        self.map.insert(
+        let publication = self.observed_publication.as_ref();
+        let retained = self.documents.get(&document_key).and_then(|doc| doc.refs.get_key_value(&key))
+            .filter(|(_, prior)| prior.compatible(kind, publication));
+        let (id, observed_issuance, live_query) = match retained {
+            Some(((_, origin), identity)) => (identity.id.clone(), identity.issuance.clone(), origin.clone()),
+            None => {
+                let id = self.try_allocate_ref()?;
+                let issuance = publication.cloned();
+                let document = self.documents.get_mut(&document_key).expect("observed document");
+                Arc::make_mut(&mut document.refs).insert(
+                    key, DurableRef {id: id.clone(), issuance: issuance.clone(), kind});
+                (id, issuance, live_query)
+            }
+        };
+        let observed_membership = publication.map(|p| p.revision);
+        Arc::make_mut(&mut self.map).insert(
             id.clone(),
             RefEntry {
                 lifetime: RefLifetime::Observed,
@@ -542,7 +532,7 @@ impl RefMap {
         name: &str,
         nth: Option<usize>,
     ) {
-        self.map.insert(
+        Arc::make_mut(&mut self.map).insert(
             ref_id,
             RefEntry {
                 lifetime: RefLifetime::Observed,
@@ -588,7 +578,7 @@ impl RefMap {
     }
 
     pub fn remove(&mut self, ref_id: &str) {
-        self.map.remove(ref_id);
+        Arc::make_mut(&mut self.map).remove(ref_id);
     }
 
     pub(crate) fn retained_identity_counts(&self) -> (usize, usize) {
@@ -639,7 +629,7 @@ impl RefMap {
         let mut new_map = 0usize;
         let mut seen = std::collections::HashSet::new();
         for backend in backends {
-            if !seen.insert(*backend) {
+            if backends.len() > 1 && !seen.insert(*backend) {
                 continue;
             }
             match document.and_then(|d| d.refs.get(&(*backend, origin.cloned()))) {
@@ -695,11 +685,14 @@ impl RefMap {
         baseline: &Self,
         matched: &std::collections::HashSet<String>,
     ) {
-        self.map
+        Arc::make_mut(&mut self.map)
             .retain(|id, _| baseline.map.contains_key(id) || matched.contains(id));
         for (key, document) in &mut self.documents {
             let previous = baseline.documents.get(key);
-            document.refs.retain(|backend, id| {
+            if previous.is_some_and(|old| Arc::ptr_eq(&old.refs, &document.refs)) {
+                continue;
+            }
+            Arc::make_mut(&mut document.refs).retain(|backend, id| {
                 matched.contains(&id.id) || previous.and_then(|d| d.refs.get(backend)) == Some(id)
             });
         }
@@ -714,7 +707,7 @@ impl RefMap {
         published: &std::collections::HashSet<String>,
     ) {
         self.retain_query_additions(baseline, published);
-        self.map.retain(|id, entry| {
+        Arc::make_mut(&mut self.map).retain(|id, entry| {
             matches!(&entry.lifetime, RefLifetime::Located(_)) || published.contains(id)
         });
     }
@@ -733,8 +726,37 @@ impl RefMap {
     /// handles (including pinned exact ones) keep their original issuance.
     pub fn begin_snapshot(&mut self) {
         self.observed_publication = None;
-        self.map
+        Arc::make_mut(&mut self.map)
             .retain(|_, entry| matches!(&entry.lifetime, RefLifetime::Located(_)));
+    }
+
+    /// Start a private snapshot with the same durable identities, located
+    /// handles and shared allocator. Superseded observed entries have no
+    /// membership in the new snapshot and never need to be copied.
+    pub(super) fn stage_observation(
+        &self,
+        identity_scope: &str,
+        generation: u64,
+        revision: u64,
+    ) -> Self {
+        let map = self
+            .map
+            .iter()
+            .filter(|(_, entry)| matches!(entry.lifetime, RefLifetime::Located(_)))
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect();
+        let mut staged = Self {
+            map: Arc::new(map),
+            documents: self.documents.clone(),
+            next_ref: Arc::clone(&self.next_ref),
+            exact_ref_limit: self.exact_ref_limit,
+            query_origin_byte_limit: self.query_origin_byte_limit,
+            observed_dom: self.observed_dom.clone(),
+            viewport_ref: self.viewport_ref.clone(),
+            observed_publication: None,
+        };
+        staged.begin_observation(identity_scope, generation, revision);
+        staged
     }
 
     /// Set trusted issuance and membership for a cloned observation transaction.
@@ -764,8 +786,9 @@ impl RefMap {
     /// quotas; only fresh exact observation evidence can restore membership.
     /// Viewport capability lifetime is separate, as with retire_all_references.
     pub(crate) fn retire_semantic_authority(&mut self) {
+        self.observed_dom = None;
         self.observed_publication = None;
-        self.map.clear();
+        self.map = Default::default();
     }
 
     /// Retire both reference populations and their durable document identities.
@@ -802,7 +825,7 @@ impl RefMap {
                 DocumentRefs {
                     session: session.to_string(),
                     loader: loader.to_string(),
-                    refs: HashMap::new(),
+                    refs: Arc::new(HashMap::new()),
                 },
             );
         }
@@ -843,7 +866,7 @@ impl RefMap {
             .documents
             .get_mut(&(page_session.to_string(), frame.map(str::to_string)))
         {
-            document.refs.insert(
+            Arc::make_mut(&mut document.refs).insert(
                 (backend_node_id, None),
                 DurableRef {
                     id: ref_id.to_string(),
@@ -855,16 +878,18 @@ impl RefMap {
     }
 
     pub fn invalidate_page(&mut self, page_session: &str) {
+        self.observed_dom = None;
         self.documents
             .retain(|(entry_page, _), _| entry_page != page_session);
-        self.map.clear();
+        self.map = Default::default();
     }
 
     /// Drop all document identities while preserving the monotonic ref counter.
     pub fn invalidate_all_documents(&mut self) {
+        self.observed_dom = None;
         self.observed_publication = None;
         self.documents.clear();
-        self.map.clear();
+        self.map = Default::default();
     }
 
     /// Reserve a globally unique ref in this client's lifetime. Cloned staging

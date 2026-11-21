@@ -1,5 +1,5 @@
 //! Sparse fixture fields for a plain CSS selector. Every native author receiver
-//! is still bound in the isolated realm. Only the matched elements need the
+//! is still identified in the isolated realm. Only the matched elements need the
 //! full metadata reader, including when a field needs its native AX role.
 use super::*;
 
@@ -11,7 +11,7 @@ pub(super) fn eligible(
     count > 64
         && security.simple_name_inventory
         && security.ancestors.is_empty()
-        && single_css(expression)
+        && structural(expression)
 }
 
 /// The shared renderer parser decides whether the CSS uses a metadata-dependent extension.
@@ -24,6 +24,26 @@ pub(super) fn single_css(expression: &LocatorExpression) -> bool {
     })
 }
 
+/// A text predicate depends on the real DOM matcher. Explicit role, state,
+/// visibility and name predicates continue to require the complete projection.
+pub(super) fn structural(expression: &LocatorExpression) -> bool {
+    match expression {
+        LocatorExpression::Selector { .. } => single_css(expression),
+        LocatorExpression::Query { query, scope: Some(scope) } =>
+            matches!(query.kind, QueryKind::Text) && query.visible != Some(true) && structural(scope),
+        LocatorExpression::Filter { source, has, .. } =>
+            structural(source) && has.as_deref().is_none_or(structural),
+        LocatorExpression::Index { source, .. } => structural(source),
+        LocatorExpression::Union { left, right } => structural(left) && structural(right),
+        _ => false,
+    }
+}
+
+pub(super) enum Receivers<'a> {
+    Handles(&'a [String]),
+    Light { table: &'a str, slots: Vec<usize> },
+}
+
 /// Matching and sampling share one synchronous isolated-world call. The
 /// selected index only addresses the native receiver / AX pair already in
 /// custody. No input becomes a selector string or a published reference.
@@ -32,7 +52,7 @@ pub(super) async fn read(
     client: &CdpClient,
     frame: &ObservationFrame,
     candidates: &[AXNode],
-    handles: &[String],
+    receivers: Receivers<'_>,
     expression: &LocatorExpression,
     options: &ObservationOptions,
     security: &SecurityInventory,
@@ -41,8 +61,13 @@ pub(super) async fn read(
 ) -> Result<Option<QueryEvaluation>, ObservationError> {
     static SAMPLER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let function = SAMPLER.get_or_init(|| [
-        "function(expression,testId,secureSelector,focused,localNames,...nodes) { const match=",
+        "function(expression,testId,secureSelector,focused,localNames,slots,...nodes) { const match=",
         MATCH_QUERY,"; const read=", METADATA, r#";
+        if (slots !== null) {
+            nodes = slots.map(slot => this.elements[slot]);
+            if (nodes.some(node => !node || !node.isConnected || node.ownerDocument !== document))
+                return {error:'stale-reference'};
+        }
         if(nodes.some(node=>node.shadowRoot)||document.querySelector('input[type="password" i],'+secureSelector))return {ordinary:true};
         const result=match(expression, null, [], [], secureSelector, [], ...nodes);
         if(result.error)return result;
@@ -58,7 +83,6 @@ pub(super) async fn read(
         }
         return {indices:result.indices,rows};
     }"#].concat());
-    let first = handles.first().ok_or(ObservationError::BackendFailure)?;
     let focused = candidates.iter().position(|ax| {
         ax.backend_d_o_m_node_id.is_some() && ax.backend_d_o_m_node_id == security.focused_backend
     });
@@ -76,7 +100,17 @@ pub(super) async fn read(
         json!({"value":focused}),
         json!({"value":local_names}),
     ];
-    arguments.extend(handles.iter().map(|handle| json!({"objectId":handle})));
+    let first = match receivers {
+        Receivers::Handles(handles) => {
+            arguments.push(json!({"value":null}));
+            arguments.extend(handles.iter().map(|handle| json!({"objectId":handle})));
+            handles.first().ok_or(ObservationError::BackendFailure)?.as_str()
+        }
+        Receivers::Light { table, slots } => {
+            arguments.push(json!({"value":slots}));
+            table
+        }
+    };
     let reply = command(
         client,
         &frame.binding.session,
