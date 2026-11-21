@@ -135,6 +135,7 @@ pub(super) async fn acquire(
     scope: &str,
     layout: &AxRead<'_>,
     layout_ready: bool,
+    start_ax: &tokio::sync::Notify,
 ) -> Result<Arc<Snapshot>, ObservationError> {
     // Blink materializes CSS pseudo elements during style/layout. Even a valid
     // cached frontend root must see any resulting DOM events before reuse.
@@ -179,15 +180,47 @@ pub(super) async fn acquire(
         }
     }
     *prior = None;
-    if layout_ready {
-        // A lost binding must re-establish the full AX/layout barrier before
-        // building a new deep frontend inventory, exactly like a cold read.
-        layout.clone().await?;
-    }
+    let layout_root = if layout_ready {
+        // A shallow AX read completes Blink's layout lifecycle, including
+        // generated ::marker nodes. Keep the complete AX read for projection.
+        let shallow = command(
+            client,
+            &frame.binding.session,
+            "Accessibility.getFullAXTree",
+            json!({"frameId":frame.binding.frame,"depth":1}),
+            lease,
+        )
+        .await?;
+        let root = shallow["nodes"].as_array().and_then(|nodes| {
+            nodes.iter().find_map(|node| {
+                (node["role"]["value"] == "RootWebArea")
+                    .then(|| node["backendDOMNodeId"].as_i64().filter(|id| *id > 0))
+                    .flatten()
+            })
+        });
+        if root.is_none() {
+            layout.clone().await?;
+        }
+        // Start both complete reads after the layout fence. Neither grants
+        // authority until its own result and the final frame proof settle.
+        start_ax.notify_one();
+        root
+    } else {
+        None
+    };
     let before = monitor.stamp();
-    let value = Arc::new(Snapshot::new(
-        frame_dom_from_tree(client, frame, lease, frame_tree).await?,
-    ));
+    let document = frame_dom_from_tree(client, frame, lease, frame_tree).await?;
+    if layout_root.is_some_and(|id| document["root"]["backendNodeId"].as_i64() != Some(id)) {
+        return Err(ObservationError::StaleReference);
+    }
+    let snapshot = if layout_ready {
+        tokio::task::spawn_blocking(move || Snapshot::new(document))
+            .await
+            .map_err(|_| ObservationError::BackendFailure)?
+    } else {
+        Snapshot::new(document)
+    };
+    let value = Arc::new(snapshot);
     let root = &value["root"];
     // getDocument itself advances the epoch exactly once. A concurrent
     // reset or renderer event makes this a one-use full read.
@@ -213,34 +246,36 @@ pub(super) async fn acquire(
     Ok(value)
 }
 
-impl DocumentInventory {
-    /// On a previously proven dense top document, force current layout in
-    /// its isolated realm. Blink creates generated nodes during that layout.
-    /// The native root and DOM epoch must still agree afterwards in acquire().
-    pub(super) async fn fresh_layout(
-        &self,
-        client: &CdpClient,
-        frame: &ObservationFrame,
-        scope: &str,
-        lease: &OperationLease,
-    ) -> Result<Option<i64>, ObservationError> {
-        if frame.parent_frame_id.is_some()
-            || !self.matches(client, frame, scope, lease)
-            || self.value.structure()?.candidates.len() < 512
-        {
-            return Ok(None);
-        }
-        let realm = observation_realm(client, frame, lease).await?;
-        let reply = command(client, &frame.binding.session, "Runtime.evaluate", json!({
-            "contextId":realm,"returnByValue":true,"awaitPromise":false,
-            "expression":"!!document.documentElement && Number.isFinite(Element.prototype.getBoundingClientRect.call(document.documentElement).width)"
-        }),lease).await?;
-        Ok(
-            (reply.get("exceptionDetails").is_none() && reply["result"]["value"] == true)
-                .then_some(realm),
-        )
+/// Resolve the active isolated realm on a dense top document and flush its
+/// layout. A sparse, ineligible or unproven document keeps the ordered AX
+/// barrier. The live probe reads only a size threshold and the root box.
+pub(super) async fn prepare_layout(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    scope: &str,
+    lease: &OperationLease,
+    prior: Option<&DocumentInventory>,
+) -> Result<(Option<i64>, bool), ObservationError> {
+    if frame.parent_frame_id.is_some() || client.debt_ledger().is_none() {
+        return Ok((None, false));
     }
+    if let Some(saved) = prior.filter(|i| i.matches(client, frame, scope, lease)) {
+        if saved.value.structure()?.candidates.len() < 512 {
+            return Ok((None, false));
+        }
+    }
+    let realm = observation_realm(client, frame, lease).await?;
+    let reply = command(client, &frame.binding.session, "Runtime.evaluate", json!({
+        "contextId":realm,"returnByValue":true,"awaitPromise":false,
+        "expression":"!!document.documentElement && Document.prototype.getElementsByTagName.call(document,'*').item(511)!==null && Number.isFinite(Element.prototype.getBoundingClientRect.call(document.documentElement).width)"
+    }),lease).await?;
+    Ok((
+        Some(realm),
+        reply.get("exceptionDetails").is_none() && reply["result"]["value"] == true,
+    ))
+}
 
+impl DocumentInventory {
     pub(super) fn matches(
         &self,
         client: &CdpClient,

@@ -8,7 +8,7 @@ use crate::native::client_transport::ClientExecutor;
 use std::time::{Duration, Instant};
 
 const LARGE_PAGE: &str = r#"()=>{
-  const parts=['<main id="app">','<style>.label::before{content:"";display:inline-block;width:2px;height:2px}.card::after{content:"";display:block;height:1px}</style>','<h1>Account overview</h1>','<div id="toolbar"></div>'];
+  const parts=['<main id="app">','<style>.label::before{content:"";display:inline-block;width:2px;height:2px}.card::after{content:"";display:block;height:1px}</style>','<h1>Account overview</h1>','<style>li::marker{content:"Initial marker "}</style><ul><li>List entry</li></ul>','<div id="toolbar"></div>'];
   let buttons=0,wrappers=0;
   for(let s=0;s<20;s++){
     parts.push('<section class="card" aria-label="Section '+s+'"><h2>Section '+s+'</h2>');
@@ -222,6 +222,25 @@ async fn e2e_observe_pseudo_heavy_page_stays_within_budget() {
         .await
         .unwrap();
         let elapsed = start.elapsed();
+        // Blink materializes generated markers during layout. The first
+        // observation must include the marker as a separate readonly node.
+        if label == "tree" {
+            let mut pending = vec![&snapshot["root"]];
+            let mut markers = 0;
+            while let Some(node) = pending.pop() {
+                if node["role"] == "text"
+                    && ["name", "text"].iter().any(|key| {
+                        node[*key].as_str().is_some_and(|value| value.trim() == "Initial marker")
+                    })
+                {
+                    markers += 1;
+                }
+                if let Some(children) = node["children"].as_array() {
+                    pending.extend(children);
+                }
+            }
+            assert_eq!(markers, 1, "cold observation must retain the CSS list marker");
+        }
         let bytes = serde_json::to_vec(&snapshot).map(|value| value.len()).unwrap_or(0);
         eprintln!(
             "OBSERVE [{label}] elapsed_ms={} nodes={} bytes={}",

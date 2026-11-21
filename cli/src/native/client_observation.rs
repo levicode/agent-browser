@@ -2835,10 +2835,10 @@ pub async fn observe(
             frame_kind,
             validate_frame_tree(&frame_tree, frame, true)
         )?;
-        let layout_realm = match &staged.observed_dom {
-            Some(inventory) => inventory.fresh_layout(client, frame, identity_scope, lease).await?,
-            None => None,
-        };
+        let (layout_realm, layout_ready) = document_inventory::prepare_layout(
+            client, frame, identity_scope, lease, staged.observed_dom.as_ref(),
+        )
+        .await?;
         let start_ax = tokio::sync::Notify::new();
         // Both branches read the same admitted frame and settle before use.
         // Chromium can build accessibility while native prepares the author
@@ -2884,7 +2884,8 @@ pub async fn observe(
                     &mut staged.observed_dom,
                     identity_scope,
                     &accessibility,
-                    layout_realm.is_some(),
+                    layout_ready,
+                    &start_ax,
                 ),
                 async { match layout_realm {
                     Some(realm) => Ok(realm), None => observation_realm(client, frame, lease).await,
@@ -2962,7 +2963,7 @@ pub async fn observe(
             // fresh inventory after the final batch.
             let pseudos = PseudoObservation {
                 ax: Some(accessibility.clone()),
-                start_ax: layout_realm.map(|_| &start_ax),
+                start_ax: layout_ready.then_some(&start_ax),
                 graph: Some(graph),
                 inventory: staged.observed_dom.clone(),
                 dom_root: &dom["root"],
@@ -3086,9 +3087,9 @@ pub async fn observe(
             result
         };
         let ax = async {
-            // Let the renderer receive the exact metadata read first on a warm
-            // layout. Blink can build AX while native decodes that reply.
-            if layout_realm.is_some() { start_ax.notified().await; }
+            // Stable topology issues AX with the metadata batch. Cold topology
+            // issues it alongside the deep DOM read after its layout fence.
+            if layout_ready { start_ax.notified().await; }
             accessibility.clone().await
         };
         let (document, ax) = tokio::join!(document, ax);
