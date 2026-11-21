@@ -3573,7 +3573,11 @@ async fn fresh_fallback<'a>(
 
 fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(), ProtocolError> {
     if let DispatchRequest::TraceSemantic(request) = request {
-        if request.options.pixels || request.options.pixel_fallback || request.options.comparable || request.options.sample_replay_form {
+        if request.options.pixels
+            || request.options.pixel_fallback
+            || request.options.comparable
+            || request.options.sample_replay_form
+        {
             return Err(ProtocolError::InvalidArguments);
         }
     }
@@ -3674,7 +3678,13 @@ fn fit_observation_result(value: &mut Value) -> Result<(), ProtocolError> {
         return Ok(());
     }
     // Advisory replay facts must never cost a formerly complete tree a node.
-    if value.as_object_mut().is_some_and(|v| v.remove("replayControls").is_some()) && fits(value) { return Ok(()); }
+    if value
+        .as_object_mut()
+        .is_some_and(|v| v.remove("replayControls").is_some())
+        && fits(value)
+    {
+        return Ok(());
+    }
     let Some(root) = value.get("root").filter(|root| root.is_object()) else {
         return Err(ProtocolError::CapacityExceeded);
     };
