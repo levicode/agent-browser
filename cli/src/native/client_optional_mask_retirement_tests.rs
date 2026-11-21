@@ -278,6 +278,7 @@ async fn optional_mask_retirement(case: Case) {
             options: ObserveFlags {
                 pixels: true,
                 pixel_fallback: false,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

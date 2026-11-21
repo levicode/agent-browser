@@ -455,6 +455,8 @@ pub struct ObserveFlags {
     pub pixel_fallback: bool,
     #[serde(default)]
     pub comparable: bool,
+    #[serde(default)]
+    pub sample_replay_form: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2915,7 +2917,8 @@ impl ObservationDispatch {
                     Ok((value, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
-                    let options = context.policy.observation_options();
+                    let mut options = context.policy.observation_options();
+                    options.sample_replay_form = request.options.sample_replay_form;
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
                     screenshot_stage(screenshot, ScreenshotStage::SemanticViewport);
@@ -2967,7 +2970,10 @@ impl ObservationDispatch {
                             screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                             let root = exact_root(tree.roots, &staged, &frozen)?;
                             verify_document_root(&capture_context.page, &root, &staged, &operation, &map_observation).await?;
-                            (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
+                            let controls = observation::replay_controls::published(&root, tree.truncated);
+                            let mut value = json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated});
+                            if let Some(controls) = controls { value["replayControls"] = controls; }
+                            (value, false)
                         }
                         Err(ObservationError::DeadlineExceeded) if request.options.pixel_fallback => {
                             check(&capture_context.page, &operation)?;
@@ -3567,7 +3573,7 @@ async fn fresh_fallback<'a>(
 
 fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(), ProtocolError> {
     if let DispatchRequest::TraceSemantic(request) = request {
-        if request.options.pixels || request.options.pixel_fallback || request.options.comparable {
+        if request.options.pixels || request.options.pixel_fallback || request.options.comparable || request.options.sample_replay_form {
             return Err(ProtocolError::InvalidArguments);
         }
     }
@@ -3667,6 +3673,8 @@ fn fit_observation_result(value: &mut Value) -> Result<(), ProtocolError> {
     if fits(value) {
         return Ok(());
     }
+    // Advisory replay facts must never cost a formerly complete tree a node.
+    if value.as_object_mut().is_some_and(|v| v.remove("replayControls").is_some()) && fits(value) { return Ok(()); }
     let Some(root) = value.get("root").filter(|root| root.is_object()) else {
         return Err(ProtocolError::CapacityExceeded);
     };
@@ -6894,6 +6902,7 @@ mod tests {
                     options: ObserveFlags {
                         pixels,
                         pixel_fallback: fallback,
+                        sample_replay_form: false,
                         comparable: false,
                     },
                     test_id_attribute: "data-testid".into(),
@@ -7988,6 +7997,7 @@ mod tests {
                 options: ObserveFlags {
                     pixels: false,
                     pixel_fallback,
+                    sample_replay_form: false,
                     comparable: false,
                 },
                 test_id_attribute: "data-testid".into(),
@@ -8131,6 +8141,7 @@ mod tests {
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

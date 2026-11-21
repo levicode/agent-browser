@@ -443,6 +443,7 @@ async fn semantic_deadline_then_mask_failure(reply: ProbeReply, sequence: u64) {
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) mod document_inventory;
 #[path = "client_observation/metadata_packet.rs"]
 mod metadata_packet;
+pub(crate) mod replay_controls;
 #[path = "client_observation/light_document.rs"]
 mod light_document;
 #[path = "client_observation/author_projection.rs"]
@@ -130,6 +131,10 @@ pub struct SemanticNode {
     #[serde(skip)]
     author: Option<author_projection::Facts>,
     #[serde(skip)]
+    replay_sample: Option<replay_controls::Sample>,
+    #[serde(skip)]
+    replay_control: Option<replay_controls::Control>,
+    #[serde(skip)]
     pub labels: Vec<String>,
     #[serde(skip)]
     pub(crate) safe_public_name: Option<String>,
@@ -231,6 +236,8 @@ pub struct ObservationOptions {
     pub(crate) frame_policy: ObservationFramePolicy,
     #[serde(default = "default_nodes")]
     pub max_nodes: usize,
+    #[serde(skip)]
+    pub(super) sample_replay_form: bool,
     #[serde(default = "default_test_id")]
     pub test_id_attribute: String,
     #[serde(default = "default_secure_selector")]
@@ -249,6 +256,7 @@ impl Default for ObservationOptions {
     fn default() -> Self {
         Self {
             max_nodes: default_nodes(),
+            sample_replay_form: false,
             frame_policy: ObservationFramePolicy::default(),
             test_id_attribute: default_test_id(),
             secure_field_selector: default_secure_selector(),
@@ -1583,8 +1591,24 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  else if(e&&e.hasAttribute('aria-checked'))controlStates.checked=e.getAttribute('aria-checked')==='true';
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
+ // Only the visible native form receiver contributes a replay witness. No
+ // selector, arbitrary DOM value or reference is accepted from the caller.
+ let replayForm=null;
+ if(batch?.receiverIndex&&boundedObservation&&selfBox&&!hidden&&!secure&&!secureDescendants&&!unsafeLabel&&!protectedEditor&&
+    (tag==='label'||tag==='button'||tag==='input')&&e.getRootNode()===doc&&!e.assignedSlot){
+   const radio=e instanceof HTMLLabelElement?e.control:null;
+   const kind=radio instanceof HTMLInputElement&&radio.type==='radio'&&e.contains(radio)&&!composedSecure(radio)&&
+     !radio.matches(':disabled')&&e.querySelectorAll('input').length===1?'radio':
+     e instanceof HTMLButtonElement?'button':e instanceof HTMLInputElement&&e.type==='text'?'field':null;
+   const form=kind==='radio'?radio.form:e.form;
+   if(kind&&form instanceof HTMLFormElement&&e.closest('form')===form&&!e.matches(':disabled,[aria-disabled="true"]')&&
+      !form.hasAttribute('aria-busy')&&!e.closest('[inert],[aria-busy="true"]')){
+     const owner=batch.receiverIndex(form),control=batch.receiverIndex(kind==='radio'?radio:e);
+     if(owner>=0&&control>=0)replayForm={kind,owner,control,...(kind==='radio'?{checked:radio.checked,hovered:e.matches(':hover')}:{})};
+   }
+ }
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,clickable,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:''};
- return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,safePublicNameFromContent,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {...(replayForm?{replayForm}:{}),author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,safePublicNameFromContent,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:nativeValueControl?e.value:editingHost?editorValue:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -2049,6 +2073,7 @@ fn project_node_with_refs(
         NodeReference { id: String::new(), revision: revision.to_string() }
     };
     let mut node = SemanticNode {
+        replay_sample: data.get("replayForm").and_then(|v| serde_json::from_value(v.clone()).ok()),
         author,
         reference,
         role,
@@ -3017,6 +3042,7 @@ pub async fn observe(
                     nodes.insert(id, node);
                 }
             }
+            replay_controls::bind(frame, identity_scope, &staged, &mut nodes);
             // compact still needs every graph id in the facts map. Suppressed
             // subtrees get a suppress-only stub with no public reference, since
             // emit never reaches them; the duplicate assignment/shadow graph
@@ -5250,7 +5276,8 @@ fn observation_metadata_reader() -> &'static str {
         [
             "function(testId,secureSelector,...nodes) { const settings = testId; const read=",
             METADATA, "; const plain = ", include_str!("client_observation/plain_metadata.js"),
-            "; const pack = ", include_str!("client_observation/pack_metadata.js"), r#";
+            "; const pack = ", include_str!("client_observation/pack_metadata.js"),
+            "; const sampleForm = ", include_str!("client_observation/replay_form_sample.js"), r#";
             try { Element.prototype.matches.call(document.documentElement,secureSelector); }
             catch { return pack(settings.protectedEditors.map(() => ({__nativeStatus:'invalid-arguments'}))); }
             // These caches are local to this one synchronous call. A light-tree
@@ -5297,13 +5324,28 @@ fn observation_metadata_reader() -> &'static str {
                 let next = 0;
                 nodes = settings.slots.map(slot => slot === null ? exact[next++] : this.elements[slot]);
             }
-            const rows = nodes.map((node, index) => {
+            // A CSS pseudo receiver is resolved through its originating element.
+            // Only the real DOM slots count when proving a control's identity.
+            const replayPseudo = new Set(settings.replayPseudo ?? []);
+            let receiverIndices;
+            batch.receiverIndex = object => {
+                if (!receiverIndices) {
+                    receiverIndices = new WeakMap();
+                    nodes.forEach((value, index) => {
+                        if (value && !replayPseudo.has(index)) receiverIndices.set(value, receiverIndices.has(value) ? -1 : index);
+                    });
+                }
+                return receiverIndices.get(object) ?? -1;
+            };
+            const project = stable => pack(nodes.map((node, index) => {
                 const ordinary = settings.bounded && settings.simpleNameInventory
                     ? plain(node, settings.testIdAttribute, settings.protectedEditors[index], settings.focusedReceivers[index], batch)
                     : null;
                 const metadata = ordinary ?? read.call(node, settings.testIdAttribute, secureSelector,
                     settings.bounded, settings.protectedEditors[index], settings.simpleNameInventory,
                     settings.focusedReceivers[index], settings.localNameInventory[index], batch);
+                if (stable && metadata.replayForm && stable(node, metadata))
+                    metadata.replayForm.stable = true;
                 const entries = settings.folds[index];
                 if (entries.length > 0) {
                     metadata.__nativeFolded = entries.map(([position, prefix, length]) => {
@@ -5319,8 +5361,15 @@ fn observation_metadata_reader() -> &'static str {
                     });
                 }
                 return ordinary ?? sparse(metadata);
-            });
-            return pack(rows);
+            }));
+            if (!settings.sampleReplayForm) return project();
+            // A second style cache cannot reuse the first sample's answers.
+            const early = { ...batch, depths: new WeakMap(), textRange: document.createRange(),
+                styleOf: (node, pseudo) => getComputedStyle(node, pseudo) };
+            const capture = (node, i) => batch.receiverIndex(node) !== i ? undefined
+                : read.call(node, settings.testIdAttribute, secureSelector, true, settings.protectedEditors[i],
+                    settings.simpleNameInventory, settings.focusedReceivers[i], settings.localNameInventory[i], early);
+            return sampleForm(nodes, capture, project);
         }"#,
         ]
         .concat()
@@ -5558,6 +5607,9 @@ async fn read_batch_with_refs(
                         .is_some_and(|id| acquisition_policy.local_name_inventory.contains(&id))
             })
             .collect();
+        let sample_replay_form = options.sample_replay_form && bounded && text_folds.is_some()
+            && frame.parent_frame_id.is_none()
+            && lease.deadline.saturating_duration_since(std::time::Instant::now()).as_millis() > 250;
         let function = if let Some(folds) = text_folds {
             let plans: Vec<Vec<Value>> = nodes
                 .iter()
@@ -5582,6 +5634,14 @@ async fn read_batch_with_refs(
                 "folds": plans,
                 "slots": light.as_ref().map(|receivers| &receivers.slots),
             }});
+            if sample_replay_form {
+                arguments[0]["value"]["sampleReplayForm"] = Value::Bool(true);
+            }
+            let pseudo_slots: Vec<_> = pseudo.iter().enumerate()
+                .filter_map(|(index, origin)| origin.map(|_| index)).collect();
+            if !pseudo_slots.is_empty() {
+                arguments[0]["value"]["replayPseudo"] = json!(pseudo_slots);
+            }
             observation_metadata_reader().to_owned()
         } else {
             let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
@@ -5593,7 +5653,9 @@ async fn read_batch_with_refs(
         let receiver = light.as_ref().map(|l| &l.handle).or_else(||objects.first()?.as_ref())
             .ok_or(ObservationError::BackendFailure)?;
         if let Some(start) = pseudos.and_then(|p| p.start_ax) { start.notify_one(); }
-        let mut result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":receiver,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
+        let mut args=json!({"objectId":receiver,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group});
+        if sample_replay_form { args["awaitPromise"] = Value::Bool(true); }
+        let mut result=command(client,session,"Runtime.callFunctionOn",args,lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
             diagnostic_receivers(client,session,&objects.iter().flatten().cloned().collect::<Vec<_>>(),lease).await;
@@ -5601,6 +5663,9 @@ async fn read_batch_with_refs(
         }
         metadata_stage!(ReadResult);
         check(lease)?;
+        if sample_replay_form && result["result"]["value"]["replaySampleChanged"] == true {
+            return Err(ObservationError::StaleReference);
+        }
         let mut values = match (text_folds.is_some(), result["result"]["value"].take()) {
             // Encode in the verified isolated realm so DevTools transfers one
             // value instead of serializing every field of every metadata row.
@@ -5744,13 +5809,16 @@ async fn read_batch_with_refs(
         metadata_stage!(Projection);
         let mut projections = HashMap::new();
         let mut main_nodes = Vec::with_capacity(nodes.len());
-        for (i, ((ax, data), origin)) in nodes.iter().zip(&values).zip(pseudo).enumerate() {
+        for (i, ((ax, data), origin)) in nodes.iter().zip(&values).zip(pseudo.iter().copied()).enumerate() {
             let backend = ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
             let mut node = if let Some(prepared) = prepared.as_mut().filter(|_| !positive.contains(&i)) {
                 std::mem::take(&mut prepared[i])
             } else {
                 prepare_projection(frame, ax, data, origin, revision, bounded, &mut projections)?
             };
+            if let Some(sample) = &mut node.replay_sample {
+                if origin.is_none() { sample.bind_receivers(nodes, &pseudo); }
+            }
             if let Some(refs) = refs.as_deref_mut() {
                 node.reference = issue_projection_ref(frame, backend, node.role.as_deref(), node.author.as_ref(), refs, origin.is_some())?;
             }
@@ -6080,6 +6148,8 @@ fn publish_content_names(node: &mut SemanticNode) {
     }
 }
 fn scrub_content(node: &mut SemanticNode) {
+    node.replay_sample = None;
+    node.replay_control = None;
     node.name = None;
     node.public_content_name = None;
     node.text = None;
