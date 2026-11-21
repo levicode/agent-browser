@@ -1793,6 +1793,9 @@ impl GeometrySnapshot {
     }
     /// Native box for an exact backend whose root-document membership is
     /// fenced by the observation caller. This result grants no action authority.
+    /// Only the hosted equivalence measurement reads it now; production keeps
+    /// the rectangle the metadata receiver already measured.
+    #[cfg(test)]
     pub(super) async fn light_semantic_bounds(
         &self, client: &CdpClient, frame: &ObservationFrame, backend: i64, operation: &OperationLease,
     ) -> Result<SemanticBounds, GeometryError> {

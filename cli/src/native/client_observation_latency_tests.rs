@@ -321,31 +321,86 @@ async fn e2e_observe_dense_light_page_prints_phase_baseline() {
     eprintln!("OBSERVE dense page={}", built["value"]);
     assert_eq!(built["value"]["objects"], 3, "the dense page must keep the three opaque plugin frames");
 
-    let (snapshot, attempts, elapsed) = observe_settled(
-        &browser,
-        &mut operations,
-        &sink,
-        json!({
-            "identityScope":scope,
-            "testIdAttribute":"data-testid",
-            "secureFieldSelector":FIXTURE_SECURE_SELECTOR,
-            "options":{}
-        }),
-        4,
-    )
-    .await;
-    let bytes = serde_json::to_vec(&snapshot).map(|value| value.len()).unwrap_or(0);
-    eprintln!(
-        "OBSERVE [dense-light] attempts={attempts} elapsed_ms={} nodes={} bytes={} phases={}",
-        elapsed.as_millis(),
-        semantic_node_count(&snapshot["root"]),
-        bytes,
-        snapshot["phases"]
-    );
+    // One cold read and three settled reads. The settled reads must publish the
+    // same nodes, text, states and rectangles; only reference ids are allowed
+    // to differ because every observation reallocates them.
+    let mut observed = Vec::new();
+    for round in 0..4 {
+        let (snapshot, attempts, elapsed) = observe_settled(
+            &browser,
+            &mut operations,
+            &sink,
+            json!({
+                "identityScope":scope,
+                "testIdAttribute":"data-testid",
+                "secureFieldSelector":FIXTURE_SECURE_SELECTOR,
+                "options":{}
+            }),
+            4,
+        )
+        .await;
+        let nodes = semantic_node_count(&snapshot["root"]);
+        let fingerprint = normalised_tree_fingerprint(&snapshot["root"]);
+        eprintln!(
+            "OBSERVE [dense-light] round={round} attempts={attempts} elapsed_ms={} nodes={nodes} fingerprint={fingerprint:016x} phases={}",
+            elapsed.as_millis(),
+            snapshot["phases"]
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "dense light observation round {round} took {elapsed:?}"
+        );
+        observed.push((nodes, fingerprint));
+    }
     assert!(
-        elapsed < Duration::from_secs(10),
-        "dense light observation took {elapsed:?}"
+        observed.windows(2).all(|pair| pair[0] == pair[1]),
+        "settled reads must reproduce the cold tree, got {observed:?}"
     );
     let cleanup = browser.shutdown().await;
     assert!(cleanup.is_ok(), "cleanup: {cleanup:?}");
+}
+
+/// A stable fingerprint of one published tree. Reference ids are excluded
+/// because each observation reallocates them; every other field, including the
+/// published rectangle, is part of the comparison.
+fn normalised_tree_fingerprint(value: &Value) -> u64 {
+    fn feed(hasher: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hasher ^= u64::from(*byte);
+            *hasher = hasher.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn walk(value: &Value, hasher: &mut u64) {
+        match value {
+            Value::Object(map) => {
+                feed(hasher, b"{");
+                for (key, child) in map {
+                    if key == "ref" {
+                        continue;
+                    }
+                    feed(hasher, key.as_bytes());
+                    feed(hasher, b"=");
+                    walk(child, hasher);
+                    feed(hasher, b";");
+                }
+                feed(hasher, b"}");
+            }
+            Value::Array(children) => {
+                feed(hasher, b"[");
+                for child in children {
+                    walk(child, hasher);
+                    feed(hasher, b",");
+                }
+                feed(hasher, b"]");
+            }
+            Value::String(text) => {
+                feed(hasher, b"s");
+                feed(hasher, text.as_bytes());
+            }
+            other => feed(hasher, other.to_string().as_bytes()),
+        }
+    }
+    let mut hasher = 0xcbf29ce484222325u64;
+    walk(value, &mut hasher);
+    hasher
 }

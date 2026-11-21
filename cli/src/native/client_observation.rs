@@ -7605,11 +7605,15 @@ pub(crate) async fn project_observe_geometry(
         origin: NodeGeometryOrigin::ReferenceBinding,
         negatives: vec![],
     })?;
-    // A native document query names connected elements in its light tree. Read
-    // their exact CDP border boxes by backend ID and prove the same native
-    // membership afterwards. This removes a separate JS handle, two receiver
-    // calls, a frame check and a group release for every ordinary box.
+    // A native document query names connected elements in its light tree and
+    // proves their membership in the current document below. Each published
+    // rectangle already came from the synchronous metadata receiver read that
+    // measured the same border box, and top-frame projection is the identity;
+    // a second per-node box read repeats that work without adding a proof.
+    #[cfg(test)]
     let mut batched = HashMap::new();
+    #[cfg(not(test))]
+    let batched: HashMap<String, Rect> = HashMap::new();
     let mut requests = requests;
     let main = requests.first().and_then(|(_, frame, _, _)| {
         (requests.len() >= 16 && frame.parent_frame_id.is_none() &&
@@ -7631,21 +7635,64 @@ pub(crate) async fn project_observe_geometry(
             member.map(|member| (id.clone(), *backend, member))
         }).collect();
         let members = light.iter().map(|(_, backend, member)| (*backend, *member)).collect::<Vec<_>>();
-        let results = stream::iter(light.into_iter().map(|(id, backend, _)| {
-            let frame = &frame;
-            async move {
-                let b = geometry.light_semantic_bounds(client, frame, backend, lease).await?.bounds();
-                Ok::<_, GeometryError>((id, Rect { x: b.x, y: b.y, width: b.width, height: b.height }))
+        // A nonzero visual-viewport offset moves the renderer-root quad away
+        // from the layout viewport getBoundingClientRect reports. That moved
+        // (pinch-zoomed) case keeps the full exact read below.
+        let reusable = geometry.viewport.offset_x == 0.0 && geometry.viewport.offset_y == 0.0;
+        // The hosted equivalence measurement keeps the former per-node box read
+        // so a test can prove the published rectangles are unchanged; the
+        // production read never issues those round trips.
+        #[cfg(test)]
+        let reused: HashSet<String> = if !reusable {
+            HashSet::new()
+        } else if std::env::var_os("AGENT_BROWSER_OBSERVE_EXACT_GEOMETRY").is_some() {
+            // Reproduce the former parallel box read so the comparison keeps
+            // the same concurrency as the production read it replaces.
+            let exact_light: Vec<(String, i64)> = light
+                .iter()
+                .map(|(id, backend, _)| (id.clone(), *backend))
+                .collect();
+            let results = stream::iter(exact_light.into_iter().map(|(id, backend)| {
+                let frame = frame.clone();
+                async move {
+                    let b = geometry
+                        .light_semantic_bounds(client, &frame, backend, lease)
+                        .await?
+                        .bounds();
+                    Ok::<_, GeometryError>((
+                        id,
+                        Rect {
+                            x: b.x,
+                            y: b.y,
+                            width: b.width,
+                            height: b.height,
+                        },
+                    ))
+                }
+            }))
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await;
+            for result in results {
+                let (id, rect) = result.map_err(|error| ObserveGeometryFailure {
+                    error,
+                    origin: NodeGeometryOrigin::BoxRead,
+                    negatives: vec![],
+                })?;
+                batched.insert(id, rect);
             }
-        })).buffered(16).collect::<Vec<_>>().await;
-        for result in results {
-            let (id, rect) = result.map_err(|error| ObserveGeometryFailure {
-                error, origin: NodeGeometryOrigin::BoxRead, negatives: vec![],
-            })?;
-            batched.insert(id, rect);
-        }
+            HashSet::new()
+        } else {
+            light.iter().map(|(id, _, _)| id.clone()).collect()
+        };
+        #[cfg(not(test))]
+        let reused: HashSet<String> = if reusable {
+            light.iter().map(|(id, _, _)| id.clone()).collect()
+        } else {
+            HashSet::new()
+        };
         document.confirm(client, &frame, &members, lease).await.map_err(failure)?;
-        requests.retain(|(id, _, _, _)| !batched.contains_key(id));
+        requests.retain(|(id, _, _, _)| !reused.contains(id) && !batched.contains_key(id));
     }
     let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend, realm)| async move {
         let mut evidence = SemanticNodeReadEvidence {
