@@ -4,13 +4,15 @@
 //! selector fallback, raw pixels, or wire-visible renderer identifiers live here.
 use super::cdp::client::CdpClient;
 use super::client_observation::{
-    ObservationError, ObservationFrame, ObservationFramePolicy, SemanticFrameProof,
+    native_frame_url, ObservationError, ObservationFrame, ObservationFramePolicy,
+    SemanticFrameProof,
 };
 use super::client_session::{CancelSignal, OperationLease};
 use super::element;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A local cleanup-lane wait only stops on the operation's own cancellation,
@@ -130,6 +132,9 @@ pub(crate) enum NodeGeometryOrigin {
 pub(crate) struct SemanticNodeReadEvidence {
     pub(crate) negative: Option<NodeIdentityNegativeProof>,
     pub(crate) origin: NodeGeometryOrigin,
+    /// A frame-bound realm for this observation only. Each node still gets
+    /// its own exact binding and post-box proof.
+    pub(crate) realm: Option<Arc<tokio::sync::OnceCell<i64>>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -893,7 +898,7 @@ fn tree_frames(tree: &Value) -> Result<HashMap<String, TreeFrame>, GeometryError
                 id.to_owned(),
                 TreeFrame {
                     loader: loader.to_owned(),
-                    url: frame["url"].as_str().map(str::to_owned),
+                    url: native_frame_url(frame).map(|url| url.into_owned()),
                     parent,
                 },
             )
@@ -1212,9 +1217,10 @@ fn session_transform(
     built.insert(session.to_owned(), matrix);
     Ok(matrix)
 }
-fn hidden_proof_error(error: ObservationError) -> GeometryError {
+pub(super) fn hidden_proof_error(error: ObservationError) -> GeometryError {
     match error {
-        ObservationError::StaleReference
+        ObservationError::InventoryAdvanced(_)
+        | ObservationError::StaleReference
         | ObservationError::FrameNotFound(_)
         | ObservationError::FrameAmbiguous(_) => GeometryError::StaleIdentity,
         ObservationError::Cancelled => GeometryError::Cancelled,
@@ -1786,6 +1792,45 @@ impl GeometrySnapshot {
         self.node_semantic_bounds_impl(client, frame, backend, operation, None)
             .await
     }
+    /// Native box for an exact backend whose root-document membership is
+    /// fenced by the observation caller. This result grants no action authority.
+    pub(super) async fn light_semantic_bounds(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        backend: i64,
+        operation: &OperationLease,
+    ) -> Result<SemanticBounds, GeometryError> {
+        self.check_node_binding(frame)?;
+        let model = command(
+            client,
+            &frame.binding.session,
+            "DOM.getBoxModel",
+            json!({"backendNodeId":backend}),
+            operation,
+        )
+        .await?;
+        self.project_semantic_quad(
+            &frame.binding.frame,
+            quad_points(&model["model"]["border"])?,
+        )
+    }
+
+    fn check_node_binding(&self, frame: &ObservationFrame) -> Result<(), GeometryError> {
+        self.require_included(&frame.binding.frame)?;
+        let proof = self
+            .frames
+            .get(&frame.binding.frame)
+            .ok_or(GeometryError::IncompleteInventory)?;
+        if proof.session != frame.binding.session
+            || proof.loader != frame.binding.loader
+            || frame.binding.page_session != self.page_session
+        {
+            return Err(GeometryError::StaleIdentity);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn node_semantic_bounds_observed(
         &self,
         client: &CdpClient,
@@ -1808,17 +1853,7 @@ impl GeometrySnapshot {
         if let Some(evidence) = evidence.as_mut() {
             evidence.origin = NodeGeometryOrigin::FrameBinding;
         }
-        self.require_included(&frame.binding.frame)?;
-        let proof = self
-            .frames
-            .get(&frame.binding.frame)
-            .ok_or(GeometryError::IncompleteInventory)?;
-        if proof.session != frame.binding.session
-            || proof.loader != frame.binding.loader
-            || frame.binding.page_session != self.page_session
-        {
-            return Err(GeometryError::StaleIdentity);
-        }
+        self.check_node_binding(frame)?;
         let ExactBox::Model(model, _) = read_exact_box_with_evidence(
             client,
             &frame.binding,
@@ -2127,14 +2162,23 @@ async fn read_exact_box_inner(
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
     let observe_node = evidence.is_some();
+    let realm = evidence
+        .as_ref()
+        .and_then(|evidence| evidence.realm.clone());
     if let Some(evidence) = evidence.as_mut() {
         evidence.origin = NodeGeometryOrigin::ResolveOther;
     }
     let resolution = async {
         match readonly_group {
             Some(group) if observe_node => {
-                element::resolve_readonly_node_with_negative_proof(client, binding, backend, group)
-                    .await
+                element::resolve_readonly_node_with_negative_proof(
+                    client,
+                    binding,
+                    backend,
+                    group,
+                    realm.as_deref(),
+                )
+                .await
             }
             Some(group) => (
                 element::resolve_exact_object_in_readonly_group(client, binding, backend, group)

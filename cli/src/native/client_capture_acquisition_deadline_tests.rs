@@ -400,6 +400,7 @@ async fn acquisition_deadline(boundary: Boundary) {
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

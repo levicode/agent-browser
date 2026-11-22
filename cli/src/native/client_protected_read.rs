@@ -391,6 +391,12 @@ impl<'a> ProtectedReadJournal<'a> {
         }
         self.check()
     }
+    pub(super) fn global_barrier(&self) -> Option<&ProtectedTargetBarrier> {
+        match &self.barrier {
+            ReadBarrier::Global(barrier) => Some(barrier),
+            ReadBarrier::Selected(_) => None,
+        }
+    }
     pub fn contains_session(&self, session: &str) -> bool {
         self.sessions.iter().any(|value| value == session)
     }

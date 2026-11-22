@@ -1182,6 +1182,7 @@ fn live_query_error(
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
+        ObservationError::InventoryAdvanced(_) => ProtocolError::StaleScope,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference
         | ObservationError::Superseded
@@ -4504,6 +4505,7 @@ fn observation_action_error(
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
+        ObservationError::InventoryAdvanced(_) => ProtocolError::StaleScope,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::PolicyDenied => ProtocolError::PolicyDenied,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,

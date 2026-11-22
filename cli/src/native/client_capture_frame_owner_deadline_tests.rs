@@ -193,6 +193,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
                     options: ObserveFlags {
                         pixels: false,
                         pixel_fallback: true,
+                        sample_replay_form: false,
                         comparable: false,
                     },
                     test_id_attribute: "data-testid".into(),

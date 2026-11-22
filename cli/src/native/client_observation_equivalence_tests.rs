@@ -93,6 +93,23 @@ fn metadata_group_matches(group: &str, sequence: u64) -> bool {
     group == format!("native-metadata-{sequence}")
         || group.starts_with(&format!("native-metadata-{sequence}-"))
 }
+fn metadata_response_has_rows(value: &Value) -> bool {
+    if value.get("exceptionDetails").is_some() {
+        return false;
+    }
+    let rows = &value["result"]["value"];
+    rows.is_array()
+        || rows.as_str().is_some_and(|encoded| {
+            serde_json::from_str::<Value>(encoded)
+                .ok()
+                .is_some_and(|packet| {
+                    packet["rows"].as_array().is_some_and(|rows| {
+                        super::metadata_packet::decode(encoded, rows.len()).is_ok()
+                    })
+                })
+        })
+}
+
 pub(super) fn after_group_release(lease: &OperationLease, group: &str) {
     if metadata_group_matches(group, lease.sequence) {
         if let Some(hold) = metadata_hold(lease) {
@@ -119,7 +136,7 @@ async fn metadata_checkpoint(
     if site != "metadata-batch" || !exact_metadata {
         return Ok(());
     }
-    if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {
+    if !metadata_response_has_rows(value) {
         return Err(ObservationError::BackendFailure);
     }
     hold.calls.fetch_add(1, Ordering::SeqCst);
@@ -231,7 +248,16 @@ pub(super) fn instrument(method: &str, mut args: Value, lease: &OperationLease) 
                 .as_str()
                 .is_some_and(|s| s.starts_with("function(testId,secureSelector,...nodes)"))
         {
-            args["functionDeclaration"]=json!(format!("function(testId,secureSelector,...nodes){{const read={METADATA};const result=nodes.map(node=>read.call(node,testId,secureSelector));(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(result));return result;}}"));
+            let original = args["functionDeclaration"].as_str().unwrap();
+            let instrumented = if original.contains("return pack(rows);") {
+                original.replace(
+                    "return pack(rows);",
+                    "(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(rows));return pack(rows);",
+                )
+            } else {
+                format!("function(testId,secureSelector,...nodes){{const read={METADATA};const result=nodes.map(node=>read.call(node,testId,secureSelector));(globalThis.__nativeLifetimeWeak??=[]).push(new WeakRef(nodes),new WeakRef(result));return result;}}")
+            };
+            args["functionDeclaration"] = json!(instrumented);
         }
     }
     args
@@ -255,7 +281,7 @@ pub(super) async fn after_command(
     if site != "metadata-batch" {
         return Ok(());
     }
-    if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {
+    if !metadata_response_has_rows(value) {
         return Err(ObservationError::BackendFailure);
     }
     let call = h.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -567,6 +593,90 @@ async fn read_node_names_capture(
     .await
     .map_err(|error| format!("Original read-node producer failed: {error:?}"))?;
     Ok((observation, inventory))
+}
+
+#[tokio::test]
+#[ignore = "real Chromium: side-effect-checked main world hints for a dense stable list"]
+async fn chromium_dense_inline_handlers_survive_refresh_and_reorder() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let (op, _tx) = operation();
+        let registry = read_node_names_fixture(
+            &browser,
+            r#"(() => {
+            document.body.replaceChildren();
+            for (let i=0; i<96; i++) {
+                const span = document.createElement('span');
+                span.id = 'entry-' + i;
+                span.style.cssText = 'display:inline-block;width:12px;height:12px';
+                if (i === 37) span.onclick = () => {};
+                document.body.append(span);
+            }
+            const block = document.createElement('div');
+            const named = document.createElement('span');
+            named.className = 'marked-text';
+            named.textContent = 'named control';
+            named.onclick = () => {};
+            block.append(named);
+            const covered = document.createElement('span');
+            covered.textContent = 'nested control';
+            covered.onclick = () => {};
+            const owner = document.createElement('div');
+            owner.append('prefix ', covered);
+            document.body.append(block, owner);
+            return true;
+        })()"#,
+            &op,
+        )
+        .await?;
+        let mut refs = RefMap::new();
+        let (first, _) =
+            read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 512).await?;
+        assert!(flatten(&first.roots)
+            .iter()
+            .any(|n| n.text.as_deref() == Some("named control")
+                && n.attributes
+                    .get("class")
+                    .is_some_and(|s| s == "marked-text")));
+        assert!(flatten(&first.roots)
+            .iter()
+            .any(|n| n.text.as_deref() == Some("nested control")));
+        let first_clickable: Vec<_> = flatten(&first.roots)
+            .into_iter()
+            .filter(|n| n.states.get("clickable") == Some(&true))
+            .collect();
+        assert_eq!(first_clickable.len(), 1);
+        assert_eq!(first_clickable[0].selector.as_deref(), Some("#entry-37"));
+        let previous = first_clickable[0].reference.id.clone();
+        evaluate_on(
+            &browser.client,
+            browser.active_session_id()?,
+            r#"(() => {
+            const before = document.getElementById('entry-37');
+            const next = before.nextElementSibling;
+            before.onclick=null;
+            next.onclick=()=>{};
+            document.body.prepend(next);
+            return true;
+        })()"#,
+        )
+        .await?;
+        let (second, _) =
+            read_node_names_capture(&browser, &registry, &mut refs, &op, 2, 512).await?;
+        let second_clickable: Vec<_> = flatten(&second.roots)
+            .into_iter()
+            .filter(|n| n.states.get("clickable") == Some(&true))
+            .collect();
+        assert_eq!(second_clickable.len(), 1);
+        assert_eq!(second_clickable[0].selector.as_deref(), Some("#entry-38"));
+        assert_ne!(second_clickable[0].reference.id, previous);
+        Ok::<_, String>(())
+    }
+    .await;
+    browser.close().await.unwrap();
+    result.unwrap();
 }
 
 fn read_node_names_receipt(identity: &str, phase: &str, budget: usize, tree: &Observation) {
@@ -1293,7 +1403,6 @@ async fn metadata_acquisition_error_drains_started_sibling_before_group_release(
         &lease,
         false,
         &SecurityInventory::default(),
-        None,
         None,
         None,
         None,

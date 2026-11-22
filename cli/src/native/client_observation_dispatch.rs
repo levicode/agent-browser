@@ -455,6 +455,8 @@ pub struct ObserveFlags {
     pub pixel_fallback: bool,
     #[serde(default)]
     pub comparable: bool,
+    #[serde(default)]
+    pub sample_replay_form: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2621,7 +2623,14 @@ impl ObservationDispatch {
                 same_frames(&frames, &current).map_err(failure)?;
                 Ok::<_, DispatchFailure>(values)
             };
-            let values = if let Some((frame, realm)) = single {
+            let values = if let Some((frame, mut realm)) = single {
+                {
+                    let refs = self
+                        .refs
+                        .lock()
+                        .map_err(|_| failure(ProtocolError::ScopeUnavailable))?;
+                    realm.use_inventory(&refs, &identity);
+                }
                 let sample = observation::query_diagnostic::field_command_scope(
                     field_witness.as_ref(),
                     realm.fields(&read.options, &read.fields, field_witness.as_ref()),
@@ -2879,7 +2888,7 @@ impl ObservationDispatch {
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                     let root = exact_root(tree.roots, &staged, &frozen)?;
-                    verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
+                    verify_document_root(&capture_context.page, &root, &staged, &operation, &map_observation).await?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticFinalViewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     Ok((json!({"identityScope":identity,"revision":revision.to_string(),"root":root,
@@ -2911,7 +2920,8 @@ impl ObservationDispatch {
                     Ok((value, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
-                    let options = context.policy.observation_options();
+                    let mut options = context.policy.observation_options();
+                    options.sample_replay_form = request.options.sample_replay_form;
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
                     screenshot_stage(screenshot, ScreenshotStage::SemanticViewport);
@@ -2931,7 +2941,8 @@ impl ObservationDispatch {
                         context.faults.checkpoint(&identity, super::client_test_faults::Phase::SemanticAcquire, vec![], &semantic).await.map_err(fault_observation_error)?;
                         #[cfg(feature = "acceptance-faults")]
                         let prior_next_ref = staged.next_ref_num();
-                        let tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await?;
+                        let barrier = journal.as_ref().and_then(ProtectedReadJournal::global_barrier);
+                        let tree = observation::observe_with_barrier(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic, barrier).await?;
                         #[cfg(feature = "acceptance-faults")]
                         {
                             let mut allocated = staged.ref_ids().into_iter().filter(|id| id.strip_prefix('e').and_then(|number| number.parse::<usize>().ok()).is_some_and(|number| number >= prior_next_ref)).map(|id| format!("@{id}")).collect::<Vec<_>>();
@@ -2942,6 +2953,9 @@ impl ObservationDispatch {
                     }.await;
                     let (mut value, fallback) = match tree {
                         Ok(mut tree) => {
+                            observation::InventoryCheckpoint::Projection
+                                .check(journal.as_ref().and_then(ProtectedReadJournal::global_barrier), &operation)
+                                .map_err(map_observation)?;
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
@@ -2958,12 +2972,18 @@ impl ObservationDispatch {
                                 if let Some(witness) = screenshot { witness.read_failure(detail, &error); }
                                 return Err(error);
                             }
+                            observation::InventoryCheckpoint::Projection
+                                .check(journal.as_ref().and_then(ProtectedReadJournal::global_barrier), &operation)
+                                .map_err(map_observation)?;
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::DocumentRoot);
                             screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                             let root = exact_root(tree.roots, &staged, &frozen)?;
-                            verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
-                            (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
+                            verify_document_root(&capture_context.page, &root, &staged, &operation, &map_observation).await?;
+                            let controls = observation::replay_controls::published(&root, tree.truncated);
+                            let mut value = json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated});
+                            if let Some(controls) = controls { value["replayControls"] = controls; }
+                            (value, false)
                         }
                         Err(ObservationError::DeadlineExceeded) if request.options.pixel_fallback => {
                             check(&capture_context.page, &operation)?;
@@ -3563,7 +3583,11 @@ async fn fresh_fallback<'a>(
 
 fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(), ProtocolError> {
     if let DispatchRequest::TraceSemantic(request) = request {
-        if request.options.pixels || request.options.pixel_fallback || request.options.comparable {
+        if request.options.pixels
+            || request.options.pixel_fallback
+            || request.options.comparable
+            || request.options.sample_replay_form
+        {
             return Err(ProtocolError::InvalidArguments);
         }
     }
@@ -3661,6 +3685,14 @@ fn fit_observation_result(value: &mut Value) -> Result<(), ProtocolError> {
         Some(kept_node)
     }
     if fits(value) {
+        return Ok(());
+    }
+    // Advisory replay facts must never cost a formerly complete tree a node.
+    if value
+        .as_object_mut()
+        .is_some_and(|v| v.remove("replayControls").is_some())
+        && fits(value)
+    {
         return Ok(());
     }
     let Some(root) = value.get("root").filter(|root| root.is_object()) else {
@@ -4889,11 +4921,32 @@ async fn verify_document_root(
     root: &SemanticNode,
     refs: &RefMap,
     operation: &OperationLease,
+    map_observation: impl Fn(ObservationError) -> ProtocolError,
 ) -> Result<(), ProtocolError> {
-    let backend = parse_ref(&root.reference.id)
+    let entry = parse_ref(&root.reference.id)
         .and_then(|id| refs.get(&id))
-        .and_then(|entry| entry.backend_node_id)
         .ok_or(ProtocolError::StaleReference)?;
+    let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
+    if let Some(binding) = entry.exact_binding.as_ref().filter(|binding| {
+        refs.observed_dom.as_ref().is_some_and(|inventory| {
+            inventory.bound_root(
+                &page.client,
+                &page.identity_scope,
+                operation.generation,
+                binding,
+                backend,
+            )
+        })
+    }) {
+        return observation::document_inventory::verify_active_root(
+            &page.client,
+            binding,
+            backend,
+            operation,
+        )
+        .await
+        .map_err(map_observation);
+    }
     let value = command(
         page,
         operation,
@@ -5054,6 +5107,7 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
         ObservationError::FrameNotFound(index) => ProtocolError::FrameNotFound(index),
         ObservationError::FrameAmbiguous(facts) => ProtocolError::FrameAmbiguous(facts),
+        ObservationError::InventoryAdvanced(_) => ProtocolError::StaleScope,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference | ObservationError::Superseded => {
             ProtocolError::StaleReference
@@ -5083,6 +5137,7 @@ fn observation_read_failure(error: &ObservationError) -> (diagnostic::ReadError,
         ObservationError::FrameNotFound(_) => Kind::FrameNotFound,
         ObservationError::FrameAmbiguous(_) => Kind::FrameAmbiguous,
         ObservationError::UnsupportedCapability => Kind::UnsupportedCapability,
+        ObservationError::InventoryAdvanced(stage) => Kind::from(*stage),
         ObservationError::StaleReference => Kind::StaleReference,
         ObservationError::Superseded => Kind::Superseded,
         ObservationError::Cancelled => Kind::Cancelled,
@@ -5774,6 +5829,10 @@ mod tests {
             GeometryReadError as G, ObservationReadError as O, ReadError as R,
         };
         for (error, kind) in [
+            (
+                ObservationError::InventoryAdvanced(observation::InventoryCheckpoint::Metadata),
+                O::InventoryMetadata,
+            ),
             (ObservationError::StaleReference, O::StaleReference),
             (ObservationError::Superseded, O::Superseded),
             (ObservationError::Cancelled, O::Cancelled),
@@ -6885,6 +6944,7 @@ mod tests {
                     options: ObserveFlags {
                         pixels,
                         pixel_fallback: fallback,
+                        sample_replay_form: false,
                         comparable: false,
                     },
                     test_id_attribute: "data-testid".into(),
@@ -7694,7 +7754,10 @@ mod tests {
                         } else if declaration.starts_with("function(expression") {
                             json!({"result":{"value":{"indices":[0],"redacted":[]}}})
                         } else if declaration.contains("const read=") {
-                            json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]}})
+                            crate::native::client_observation::metadata_batch_test_reply(
+                                &request["params"],
+                                json!([{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]),
+                            )
                         } else if declaration.contains("frameOwner") {
                             json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                         } else {
@@ -7864,7 +7927,10 @@ mod tests {
                                     _ => panic!("unknown exact metadata receiver"),
                                 }
                             }).collect::<Vec<_>>();
-                            json!({"result":{"value":values}})
+                            crate::native::client_observation::metadata_batch_test_reply(
+                                &request["params"],
+                                json!(values),
+                            )
                         } else if declaration
                             .starts_with("function(testId,secureSelector,boundedObservation")
                         {
@@ -7979,6 +8045,7 @@ mod tests {
                 options: ObserveFlags {
                     pixels: false,
                     pixel_fallback,
+                    sample_replay_form: false,
                     comparable: false,
                 },
                 test_id_attribute: "data-testid".into(),
@@ -8122,6 +8189,7 @@ mod tests {
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

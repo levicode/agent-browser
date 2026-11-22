@@ -16,6 +16,14 @@ pub(super) fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> 
     }) {
         return false;
     }
+    if css_field_sample::structural(expression) {
+        return fields.iter().all(|field| {
+            matches!(
+                field,
+                ReadField::Text | ReadField::Value | ReadField::TestId
+            )
+        });
+    }
     fn dom_query(expression: &LocatorExpression) -> bool {
         match expression {
             LocatorExpression::Query { query, scope } => {
@@ -39,8 +47,17 @@ pub(super) type RootInventory = (Vec<i64>, Vec<bool>, Vec<usize>);
 
 pub(super) fn roots(root: &Value) -> Result<Option<RootInventory>, ObservationError> {
     let internal = browser_internal_ids(root)?;
-    let ids: Vec<i64> = security_root_ids(root)?
-        .into_iter()
+    roots_from_inventory(root, &security_root_ids(root)?, &internal)
+}
+
+pub(super) fn roots_from_inventory(
+    root: &Value,
+    roots: &[i64],
+    internal: &HashSet<i64>,
+) -> Result<Option<RootInventory>, ObservationError> {
+    let ids: Vec<i64> = roots
+        .iter()
+        .copied()
         .filter(|id| !internal.contains(id))
         .collect();
     let author = vec![true; ids.len()];
@@ -138,19 +155,18 @@ pub(super) async fn fields_impl(
     receipt: Option<&single_root_fields::RootRealm<'_>>,
 ) -> Result<single_root_fields::Sample, ObservationError> {
     use super::super::client_settlement_trace::QueryReadStage as Stage;
-    // Arbitrary CSS can match browser implementation nodes. Its policy keeps
-    // the complete native inventory path, never this UA-eliding proof.
+    // Only the built-in password policy has this author-root inventory proof.
+    // Custom policies keep the complete native inventory path.
     if !eligible(expression, fields) || options.secure_field_selector != default_secure_selector() {
         return Ok(single_root_fields::Sample::NotEligible);
     }
     witness.stage(Stage::FreshInventory);
-    let dom = if let Some(receipt) = receipt {
-        receipt.check(client, frame, lease)?;
-        root_document_dom(client, frame, lease).await?
+    let inventory = if let Some(receipt) = receipt {
+        receipt.roots(client, frame, lease).await?
     } else {
-        validated_frame_dom(client, frame, lease).await?
+        roots(&validated_frame_dom(client, frame, lease).await?["root"])?
     };
-    let Some((ids, author, domains)) = roots(&dom["root"])? else {
+    let Some((ids, author, domains)) = inventory else {
         return Ok(single_root_fields::Sample::NotEligible);
     };
     let session = &frame.binding.session;
@@ -202,20 +218,15 @@ pub(super) async fn fields_impl(
         let handles = collect_hint_results(handles)?;
         let first = handles.first().ok_or(ObservationError::BackendFailure)?;
         let function = format!("function(expression,fields,testId,secureSelector,authorRoots,domains,...roots) {{ const read={METADATA}; const matchQuery={MATCH_QUERY}; const security={SECURITY_INVENTORY}; const sample={FRESH_FIELDS}; return sample(expression,fields,testId,secureSelector,authorRoots,domains,read,matchQuery,security,...roots); }}");
-        let mut arguments = vec![json!({"value":expression}), json!({"value":fields}), json!({"value":options.test_id_attribute}), json!({"value":options.secure_field_selector}), json!({"value":author}), json!({"value":domains})];
+        let compiled = compile_selector_expression(expression)?;
+        let mut arguments = vec![json!({"value":compiled}), json!({"value":fields}), json!({"value":options.test_id_attribute}), json!({"value":options.secure_field_selector}), json!({"value":author}), json!({"value":domains})];
         arguments.extend(handles.iter().map(|object| json!({"objectId":object})));
         witness.stage(Stage::FreshSample);
         sample_started = true;
         let result = command(client, session, "Runtime.callFunctionOn", json!({"objectId":first,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}), lease).await?;
         if result.get("exceptionDetails").is_some() { return Err(ObservationError::BackendFailure); }
         let value = &result["result"]["value"];
-        match value["error"].as_str() {
-            Some("stale-reference") => return Err(ObservationError::StaleReference),
-            Some("invalid-arguments") => return Err(ObservationError::InvalidArguments),
-            Some("resource-limit") => return Err(ObservationError::ResourceLimit),
-            Some(_) => return Err(ObservationError::BackendFailure),
-            None => {}
-        }
+        check_query_match_reply(value)?;
         if value["requiresAx"] == true { return Ok(single_root_fields::Sample::RequiresAx); }
         let rows = value["values"].as_array().ok_or(ObservationError::BackendFailure)?;
         if rows.len() > super::super::element::MAX_EXACT_REFERENCES { return Err(ObservationError::ResourceLimit); }
@@ -251,12 +262,11 @@ pub(super) async fn fields_impl(
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     witness.stage(Stage::FreshRootsFinal);
     let current = if let Some(receipt) = receipt {
-        receipt.check(client, frame, lease)?;
-        root_document_dom(client, frame, lease).await?
+        receipt.roots(client, frame, lease).await?
     } else {
-        validated_frame_dom(client, frame, lease).await?
+        roots(&validated_frame_dom(client, frame, lease).await?["root"])?
     };
-    if roots(&current["root"])? != Some((ids, author, domains)) {
+    if current != Some((ids, author, domains)) {
         return Err(ObservationError::StaleReference);
     }
     check(lease)?;
@@ -274,8 +284,18 @@ const FRESH_FIELDS: &str = r#"function(expression,fields,testId,secureSelector,a
  const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
  const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
  for(const root of roots)if(!connected.call(root)||(root!==document&&owner.call(root)!==document))return {error:'stale-reference'};
+ // Rust admitted only structural CSS leaves and DOM text predicates for
+ // this path. Keep every author candidate available to the shared matcher.
+ function hasSelector(x) {
+   if(x.kind==='selector') return true;
+   if(x.kind==='query') return !!x.scope && hasSelector(x.scope);
+   if(x.kind==='union') return hasSelector(x.left)||hasSelector(x.right);
+   return hasSelector(x.source)||!!x.has&&hasSelector(x.has);
+ }
+ const css=hasSelector(expression);
+ if(css&&(roots.length!==1||roots[0]!==document))return {requiresAx:true};
  const kinds=new Set();
- function collect(x){if(x.kind==='query'){kinds.add(x.query.kind);if(x.scope)collect(x.scope);}else if(x.kind==='union'){collect(x.left);collect(x.right);}else{collect(x.source);if(x.has)collect(x.has);}}
+ function collect(x){if(x.kind==='selector')return;if(x.kind==='query'){kinds.add(x.query.kind);if(x.scope)collect(x.scope);}else if(x.kind==='union'){collect(x.left);collect(x.right);}else{collect(x.source);if(x.has)collect(x.has);}}
  collect(expression);
  const relevant=e=>kinds.has('text')||kinds.has('testId')&&e.hasAttribute(testId)||kinds.has('placeholder')&&e.hasAttribute('placeholder')||
    kinds.has('label')&&(e.hasAttribute('aria-label')||e.hasAttribute('aria-labelledby')||e.labels?.length>0)||
@@ -292,7 +312,7 @@ const FRESH_FIELDS: &str = r#"function(expression,fields,testId,secureSelector,a
        if(node.nodeType===1){
          if(node.hasAttribute('aria-owns'))hasOwnedTree=true;
          if(node.shadowRoot){if(!knownRoots.has(node.shadowRoot))return {error:'stale-reference'};open.push([node.shadowRoot,nodeDepth+1]);}
-         if(!seen.has(node)){seen.add(node);if(relevant(node))elements.push(node);}
+         if(!seen.has(node)){seen.add(node);if(css||relevant(node))elements.push(node);}
        }
        const children=node.childNodes;
        if(light.length+pending.length+open.length+children.length>100000)return {error:'resource-limit'};
@@ -303,6 +323,23 @@ const FRESH_FIELDS: &str = r#"function(expression,fields,testId,secureSelector,a
  }
  const policy=security(secureSelector,authorRoots,...roots);
  if(policy.__nativeStatus)return {error:policy.__nativeStatus};
+ // This branch admits only text/value fields on a single structural CSS query.
+ // Both membership and field values come from this same isolated operation.
+ if(css){
+   if(policy.length||elements.length>4096)return {requiresAx:true};
+   const hits=matchQuery(expression,null,[],[],secureSelector,[],...elements);
+   if(hits.error)return hits;
+   if(hits.requiresMetadata||hits.indices.length>64||hits.redacted.length)return {requiresAx:true};
+   const values=[];
+   for(const i of hits.indices){
+     const node=elements[i];
+     const row=read.call(node,testId,secureSelector,false,false,false,policy.focused===node,false);
+     if(row.__nativeStatus)return {error:row.__nativeStatus};
+     if(row.states.secure||row.secureDescendants||row.redactName)return {requiresAx:true};
+     values.push(row);
+   }
+   return {values};
+ }
  const protectedNodes=new Set(policy),protectedIds=new Set(policy.map(node=>node.getAttribute('id')).filter(id=>id!==null));
  // The normal native projection applies normalize_public_label before the
  // matcher. Preserve all three Unicode private-use ranges and ECMAScript

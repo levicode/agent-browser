@@ -6789,6 +6789,7 @@ mod tests {
             options: ObserveFlags {
                 pixels,
                 pixel_fallback,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

@@ -140,7 +140,10 @@ async fn optional_mask_retirement(case: Case) {
                                 json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":100,"height":80},"author":{"nodeType":1,"tag":"button","visible":true}})
                             }
                         }).collect::<Vec<_>>();
-                        json!({"result":{"value":values}})
+                        crate::native::client_observation::metadata_batch_test_reply(
+                            &request["params"],
+                            json!(values),
+                        )
                     } else if declaration == crate::native::client_geometry::BOX_PROOF {
                         json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                     } else if declaration
@@ -278,6 +281,7 @@ async fn optional_mask_retirement(case: Case) {
             options: ObserveFlags {
                 pixels: true,
                 pixel_fallback: false,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

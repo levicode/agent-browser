@@ -201,6 +201,7 @@ fn classify(error: &ObservationError) -> ObservationReadError {
         ObservationError::FrameNotFound(_) => ObservationReadError::FrameNotFound,
         ObservationError::FrameAmbiguous(_) => ObservationReadError::FrameAmbiguous,
         ObservationError::UnsupportedCapability => ObservationReadError::UnsupportedCapability,
+        ObservationError::InventoryAdvanced(stage) => ObservationReadError::from(*stage),
         ObservationError::StaleReference => ObservationReadError::StaleReference,
         ObservationError::Superseded => ObservationReadError::Superseded,
         ObservationError::Cancelled => ObservationReadError::Cancelled,

@@ -210,7 +210,10 @@ impl MaskFailurePeer {
                                 }).collect::<Vec<_>>();
                                 assert_eq!(values.len(), 2);
                                 metadata_replied = true;
-                                json!({"result":{"value":values}})
+                                crate::native::client_observation::metadata_batch_test_reply(
+                                    &request["params"],
+                                    json!(values),
+                                )
                             }
                         }
                     }
@@ -443,6 +446,7 @@ async fn semantic_deadline_then_mask_failure(reply: ProbeReply, sequence: u64) {
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,
+                sample_replay_form: false,
                 comparable: false,
             },
             test_id_attribute: "data-testid".into(),

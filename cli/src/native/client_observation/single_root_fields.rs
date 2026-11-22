@@ -81,6 +81,7 @@ pub(crate) struct RootRealm<'a> {
     ledger: Arc<client_debt::OwnerDebtLedger>,
     frame: ObservationFrame,
     context: i64,
+    inventory: Option<document_inventory::DocumentInventory>,
 }
 impl<'a> RootRealm<'a> {
     pub(crate) async fn acquire(
@@ -131,6 +132,7 @@ impl<'a> RootRealm<'a> {
             ledger,
             frame: frame.clone(),
             context,
+            inventory: None,
         };
         receipt.check(client, frame, lease)?;
         Ok(receipt)
@@ -169,6 +171,29 @@ impl<'a> RootRealm<'a> {
         self.check(client, frame, lease)?;
         Ok(self.context)
     }
+    pub(crate) fn use_inventory(&mut self, refs: &RefMap, scope: &str) {
+        self.inventory = refs
+            .observed_dom
+            .as_ref()
+            .filter(|saved| saved.matches(self.client, &self.frame, scope, self.lease))
+            .cloned();
+    }
+
+    pub(super) async fn roots(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        lease: &OperationLease,
+    ) -> Result<Option<fresh_query::RootInventory>, ObservationError> {
+        self.check(client, frame, lease)?;
+        if let Some(saved) = &self.inventory {
+            if let Some(roots) = saved.field_roots(client, frame, lease).await? {
+                return Ok(Some(roots));
+            }
+        }
+        fresh_query::roots(&root_document_dom(client, frame, lease).await?["root"])
+    }
+
     pub(crate) async fn fields(
         &self,
         options: &QueryOptions,
